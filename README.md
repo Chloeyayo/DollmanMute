@@ -63,17 +63,3 @@ If the game receives an update, check this repository or the latest release page
 ## Future Plans
 
 - optional hiding of Dollman-only subtitles without affecting other subtitle lines
-
-## Building From Source
-
-Run this from the game root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\mods\DollmanMute\build.ps1
-```
-
-If `zig.exe` is not in `PATH`, pass it explicitly:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\mods\DollmanMute\build.ps1 -Zig C:\path\to\zig.exe
-```

@@ -1,0 +1,5 @@
+build/
+*.log
+
+release/DollmanMute-public-release-v1/
+release/DollmanMute-public-release-v1-with-loader/

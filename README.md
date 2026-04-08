@@ -60,6 +60,10 @@ If another mod already installed a working `version.dll`, you usually do not nee
 
 If the game receives an update, check this repository or the latest release page for the newest compatible version of the mod.
 
+## Future Plans
+
+- optional hiding of Dollman-only subtitles without affecting other subtitle lines
+
 ## Building From Source
 
 Run this from the game root:

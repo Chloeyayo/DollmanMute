@@ -56,23 +56,9 @@ If the mod does not seem to load:
 
 If another mod already installed a working `version.dll`, you usually do not need to replace it.
 
-## Known Limitation
-
-This mod relies on exact confirmed runtime voice paths.
-
-If a future game update changes those internal IDs or hashes, the mod may need an update.
-
 ## After Game Updates
 
-If the game receives an update, this mod may stop muting some or all Dollman voice lines until it is updated.
-
-Typical signs after a game update:
-
-- Dollman voice lines are audible again
-- only some Dollman lines are muted
-- the mod no longer loads correctly
-
-If that happens, the mod will need a compatibility update for the new game version.
+If the game receives an update, check this repository or the latest release page for the newest compatible version of the mod.
 
 ## Building From Source
 

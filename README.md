@@ -1,17 +1,80 @@
 # DollmanMute
 
-`DollmanMute` is a native `ASI + MinHook` mod for `DEATH STRANDING 2 - ON THE BEACH`.
-It mutes Dollman voice lines without modifying the original archive files.
+`DollmanMute` is an ASI mod for `DEATH STRANDING 2 - ON THE BEACH` that mutes Dollman voice lines.
 
-The release build keeps the implementation intentionally narrow:
+It does not replace game archives or modify packaged assets.
 
-- exact `Wwise PostEventID` blocking for confirmed Dollman voice events
-- exact `PlayerVoice` hash blocking for confirmed Dollman chatter paths
-- no timing windows
-- no hotkey-driven tracing
-- no runtime learning / heuristic muting
+## What It Does
 
-## Build
+- mutes Dollman voice lines
+- keeps ambient/world audio intact
+- works as a lightweight native ASI mod
+
+## Requirements
+
+- `DEATH STRANDING 2 - ON THE BEACH`
+- an ASI loader
+
+If you use the `with-loader` package, `version.dll` is already included.
+
+## Installation
+
+### Standard Package
+
+If you already have an ASI loader installed:
+
+1. Copy `DollmanMute.asi` to the game root folder
+2. Copy `DollmanMute.ini` to the same folder
+
+Game root example:
+
+`...\Steam\steamapps\common\DEATH STRANDING 2 - ON THE BEACH\`
+
+### Package With Loader
+
+If you do not already have an ASI loader installed:
+
+1. Copy `DollmanMute.asi` to the game root folder
+2. Copy `DollmanMute.ini` to the game root folder
+3. Copy `version.dll` to the game root folder
+
+## Configuration
+
+`DollmanMute.ini`
+
+- `Enabled=1` enables the mod
+- `VerboseLog=0` is recommended for normal use
+- `VerboseLog=1` enables extra logging for troubleshooting
+
+## Troubleshooting
+
+If the mod does not seem to load:
+
+1. Make sure the files are in the game root, not inside a subfolder
+2. Make sure an ASI loader is present
+3. Launch the game and check whether `DollmanMute.log` appears in the game root
+
+If another mod already installed a working `version.dll`, you usually do not need to replace it.
+
+## Known Limitation
+
+This mod relies on exact confirmed runtime voice paths.
+
+If a future game update changes those internal IDs or hashes, the mod may need an update.
+
+## After Game Updates
+
+If the game receives an update, this mod may stop muting some or all Dollman voice lines until it is updated.
+
+Typical signs after a game update:
+
+- Dollman voice lines are audible again
+- only some Dollman lines are muted
+- the mod no longer loads correctly
+
+If that happens, the mod will need a compatibility update for the new game version.
+
+## Building From Source
 
 Run this from the game root:
 
@@ -24,45 +87,3 @@ If `zig.exe` is not in `PATH`, pass it explicitly:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\mods\DollmanMute\build.ps1 -Zig C:\path\to\zig.exe
 ```
-
-## Installation Output
-
-The build script installs these files into the game root:
-
-- `DollmanMute.asi`
-- `DollmanMute.ini`
-
-If you are already using `Ultimate ASI Loader` through `version.dll`, no extra injector is required.
-Some release bundles may also include a matching `version.dll` for convenience. If you do not already have an ASI loader installed, copy that file to the game root as well.
-
-## Config
-
-`DollmanMute.ini` currently exposes:
-
-- `Enabled`
-- `VerboseLog`
-
-`VerboseLog=0` is recommended for normal use.
-Set `VerboseLog=1` only when collecting debug logs.
-
-## Log
-
-The mod writes to:
-
-- `DollmanMute.log`
-
-With default settings, the log stays minimal and mainly records startup information.
-
-## Scope
-
-This build is meant to be a clean public release, not a research build.
-
-It does not include:
-
-- hotkey markers
-- wide runtime tracing
-- string scans
-- heuristic recent-object muting
-- automatic runtime learning tables
-
-If a future game update changes the underlying voice routes, new exact IDs or hashes may need to be added.

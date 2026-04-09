@@ -16,6 +16,7 @@ typedef int32_t AKRESULT;
 typedef struct Config {
     BOOL enabled;
     BOOL verbose_log;
+    BOOL enable_player_voice_hooks;
 } Config;
 
 typedef AkPlayingID(__cdecl *PostEventIdFn)(
@@ -54,7 +55,7 @@ static GenericVoiceFn5 g_real_play_voice_impl = NULL;
 static GenericVoiceFn7 g_real_play_voice_with_sentence_impl = NULL;
 static GenericVoiceFn7 g_real_play_voice_with_sentence_randomly_impl = NULL;
 
-static const char *k_build_tag = "public-release-v1";
+static const char *k_build_tag = "public-release-v1.1";
 
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
@@ -92,10 +93,13 @@ static const char *k_default_ini =
     "; DollmanMute public release config\n"
     "; Enabled=1 keeps Dollman voice muted.\n"
     "; Set VerboseLog=1 only when gathering debugging info.\n"
+    "; PlayerVoice hooks are disabled by default on updated game builds\n"
+    "; because those internal offsets may change and cause crashes.\n"
     "\n"
     "[General]\n"
     "Enabled=1\n"
-    "VerboseLog=0\n";
+    "VerboseLog=0\n"
+    "EnablePlayerVoiceHooks=0\n";
 
 static void join_path(char *buffer, size_t buffer_size, const char *dir, const char *file_name)
 {
@@ -163,11 +167,13 @@ static void load_config(void)
     ZeroMemory(&g_cfg, sizeof(g_cfg));
     g_cfg.enabled = TRUE;
     g_cfg.verbose_log = FALSE;
+    g_cfg.enable_player_voice_hooks = FALSE;
 
     ensure_default_ini();
 
     g_cfg.enabled = GetPrivateProfileIntA("General", "Enabled", g_cfg.enabled, g_ini_path) != 0;
     g_cfg.verbose_log = GetPrivateProfileIntA("General", "VerboseLog", g_cfg.verbose_log, g_ini_path) != 0;
+    g_cfg.enable_player_voice_hooks = GetPrivateProfileIntA("General", "EnablePlayerVoiceHooks", g_cfg.enable_player_voice_hooks, g_ini_path) != 0;
 }
 
 static void write_log_v(const char *fmt, va_list args)
@@ -444,9 +450,10 @@ static DWORD WINAPI initialize_thread_proc(LPVOID parameter)
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line(
-        "DollmanMute init start: enabled=%d verbose=%d",
+        "DollmanMute init start: enabled=%d verbose=%d playerVoiceHooks=%d",
         g_cfg.enabled,
-        g_cfg.verbose_log);
+        g_cfg.verbose_log,
+        g_cfg.enable_player_voice_hooks);
 
     status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
@@ -457,14 +464,18 @@ static DWORD WINAPI initialize_thread_proc(LPVOID parameter)
     if (install_export_hook(k_export_post_event_id, hook_post_event_id, (void **)&g_real_post_event_id, "PostEventID")) {
         ++hook_count;
     }
-    if (install_rva_hook(k_rva_play_voice_impl, hook_play_voice_impl, (void **)&g_real_play_voice_impl, "PlayVoiceImpl")) {
-        ++hook_count;
-    }
-    if (install_rva_hook(k_rva_play_voice_with_sentence_impl, hook_play_voice_with_sentence_impl, (void **)&g_real_play_voice_with_sentence_impl, "PlayVoiceWithSentenceImpl")) {
-        ++hook_count;
-    }
-    if (install_rva_hook(k_rva_play_voice_with_sentence_randomly_impl, hook_play_voice_with_sentence_randomly_impl, (void **)&g_real_play_voice_with_sentence_randomly_impl, "PlayVoiceWithSentenceRandomlyImpl")) {
-        ++hook_count;
+    if (g_cfg.enable_player_voice_hooks) {
+        if (install_rva_hook(k_rva_play_voice_impl, hook_play_voice_impl, (void **)&g_real_play_voice_impl, "PlayVoiceImpl")) {
+            ++hook_count;
+        }
+        if (install_rva_hook(k_rva_play_voice_with_sentence_impl, hook_play_voice_with_sentence_impl, (void **)&g_real_play_voice_with_sentence_impl, "PlayVoiceWithSentenceImpl")) {
+            ++hook_count;
+        }
+        if (install_rva_hook(k_rva_play_voice_with_sentence_randomly_impl, hook_play_voice_with_sentence_randomly_impl, (void **)&g_real_play_voice_with_sentence_randomly_impl, "PlayVoiceWithSentenceRandomlyImpl")) {
+            ++hook_count;
+        }
+    } else {
+        log_line("PlayerVoice hooks disabled by config; using PostEventID compatibility mode");
     }
 
     g_hooks_installed = hook_count != 0;

@@ -13,30 +13,17 @@ It does not replace game archives or modify packaged assets.
 ## Requirements
 
 - `DEATH STRANDING 2 - ON THE BEACH`
-- an ASI loader
-
-If you use the `with-loader` package, `version.dll` is already included.
+- no additional tools required for the packaged release
 
 ## Installation
-
-### Standard Package
-
-If you already have an ASI loader installed:
-
-1. Copy `DollmanMute.asi` to the game root folder
-2. Copy `DollmanMute.ini` to the same folder
-
-Game root example:
-
-`...\Steam\steamapps\common\DEATH STRANDING 2 - ON THE BEACH\`
-
-### Package With Loader
-
-If you do not already have an ASI loader installed:
 
 1. Copy `DollmanMute.asi` to the game root folder
 2. Copy `DollmanMute.ini` to the game root folder
 3. Copy `version.dll` to the game root folder
+
+Game root example:
+
+`...\Steam\steamapps\common\DEATH STRANDING 2 - ON THE BEACH\`
 
 ## Configuration
 
@@ -45,13 +32,14 @@ If you do not already have an ASI loader installed:
 - `Enabled=1` enables the mod
 - `VerboseLog=0` is recommended for normal use
 - `VerboseLog=1` enables extra logging for troubleshooting
+- `EnablePlayerVoiceHooks=0` is the recommended default after game updates
 
 ## Troubleshooting
 
 If the mod does not seem to load:
 
 1. Make sure the files are in the game root, not inside a subfolder
-2. Make sure an ASI loader is present
+2. Make sure `version.dll` is present in the game root
 3. Launch the game and check whether `DollmanMute.log` appears in the game root
 
 If another mod already installed a working `version.dll`, you usually do not need to replace it.

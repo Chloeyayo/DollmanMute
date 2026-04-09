@@ -22,22 +22,7 @@ Open your game root folder:
 
 `...\Steam\steamapps\common\DEATH STRANDING 2 - ON THE BEACH\`
 
-Use one of these packages:
-
-### Standard Package
-
-Use this if you already have an ASI loader installed.
-
-Copy:
-
-- `DollmanMute.asi`
-- `DollmanMute.ini`
-
-### Package With Loader
-
-Use this if you do not already have an ASI loader installed.
-
-Copy:
+Copy these files:
 
 - `DollmanMute.asi`
 - `DollmanMute.ini`
@@ -58,11 +43,11 @@ Then launch the game.
 ## Requirements
 
 - `DEATH STRANDING 2 - ON THE BEACH`
-- An ASI loader
+- No other tools are required for the packaged release
 
 Notes:
 
-- The `with-loader` package already includes `version.dll`
+- The packaged release already includes `version.dll`
 - If another mod already installed a working `version.dll`, you usually do not need to replace it
 - No other mods are required
 

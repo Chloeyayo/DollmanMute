@@ -17,9 +17,13 @@ typedef struct Config {
     BOOL verbose_log;
     BOOL enable_dollman_radio_mute;
     BOOL enable_throw_recall_subtitle_mute;
+    uint32_t active_subtitle_strategy;
+    BOOL enable_subtitle_runtime_hooks;
+    BOOL enable_subtitle_family_tracking;
     BOOL enable_subtitle_producer_probe;
     BOOL enable_builder_probe;
     BOOL enable_selector_probe;
+    BOOL enable_talk_dispatcher_probe;
     uint32_t scanner_mode;
 } Config;
 
@@ -41,8 +45,37 @@ typedef uintptr_t(__fastcall *DollmanVoiceDispatcherFn)(
     uintptr_t param32,
     int mode,
     int *sentence_key);
+typedef uintptr_t(__fastcall *SubtitleRuntimeWrapperFn)(uintptr_t view, uintptr_t arg2);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
+typedef uintptr_t(__fastcall *RemoveSubtitleFn)(uintptr_t view, const uint64_t *key_pair, char mode);
 typedef uintptr_t(__fastcall *SubtitleProducerFn)(uintptr_t this_obj);
+typedef uintptr_t(__fastcall *StartTalkInitFn)(uintptr_t this_obj);
+typedef void(__fastcall *SubtitleRuntimePrepareFn)(
+    uintptr_t view,
+    uintptr_t arg2,
+    uint32_t token);
+typedef double(__fastcall *SubtitleRuntimeStageFn)(
+    uintptr_t view,
+    uintptr_t state,
+    uintptr_t queue_a,
+    uintptr_t queue_b,
+    uintptr_t queue_c,
+    uintptr_t queue_d);
+typedef uintptr_t(__fastcall *SubtitleRuntimePayloadGetterFn)(
+    uintptr_t state,
+    void *scratch,
+    void *meta);
+typedef void(__fastcall *SubtitleRuntimeRenderFn)(uintptr_t view);
+typedef uintptr_t(__fastcall *GameplaySinkFn)(
+    uintptr_t rcx,
+    uintptr_t rdx,
+    uintptr_t r8,
+    uintptr_t r9,
+    uintptr_t a5,
+    uintptr_t a6,
+    uintptr_t a7,
+    uintptr_t a8,
+    uintptr_t a9);
 
 static HMODULE g_self_module = NULL;
 static CRITICAL_SECTION g_log_lock;
@@ -57,15 +90,21 @@ static HANDLE g_hotkey_thread_handle = NULL;
 static PostEventIdFn g_real_post_event_id = NULL;
 static DollmanRadioPlayVoiceByControllerDelayFn g_real_dollman_radio_play_voice_by_controller_delay = NULL;
 static DollmanVoiceDispatcherFn g_real_dollman_voice_dispatcher = NULL;
+static SubtitleRuntimeWrapperFn g_real_subtitle_runtime_wrapper = NULL;
 static ShowSubtitleFn g_real_show_subtitle = NULL;
+static RemoveSubtitleFn g_real_remove_subtitle = NULL;
 static SubtitleProducerFn g_real_subtitle_producer = NULL;
+static StartTalkInitFn g_real_start_talk_init = NULL;
+static GameplaySinkFn g_real_gameplay_sink = NULL;
+static void **g_show_subtitle_vtable_slot = NULL;
+static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "public-release-v3.19-producer-prepost-snapshot";
+static const char *k_build_tag = "research-v3.25c-subtitle-decode-fix";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
 static uintptr_t g_image_size = 0;
-static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03448E48u;
+static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03448D38u;
 
 static const char *classify_builder_c_msg(
     uintptr_t msg_vtbl_rva,
@@ -92,33 +131,43 @@ static BOOL g_identity_lock_inited = FALSE;
 static uintptr_t g_identity_cache[PRODUCER_IDENTITY_CACHE_MAX];
 static int g_identity_cache_count = 0;
 static BOOL g_identity_cache_full_warned = FALSE;
+static CRITICAL_SECTION g_stf_probe_lock;
+static BOOL g_stf_probe_lock_inited = FALSE;
+#define STF_PROBE_CACHE_MAX 256
+static uint64_t g_stf_probe_cache[STF_PROBE_CACHE_MAX];
+static int g_stf_probe_cache_count = 0;
+static volatile LONG64 g_stf_probe_window_until_ms = 0;
 static CRITICAL_SECTION g_hotkey_lock;
 static BOOL g_hotkey_lock_inited = FALSE;
 static BOOL g_hotkey_throw_recall_mute = FALSE;
 static BOOL g_hotkey_dialogue_mute = FALSE;
-static BOOL g_hotkey_j_prev = FALSE;
-static BOOL g_hotkey_k_prev = FALSE;
-static BOOL g_hotkey_n_prev = FALSE;
-static BOOL g_hotkey_m_prev = FALSE;
-static BOOL g_hotkey_f12_prev = FALSE;
-static DWORD g_tls_muted_subtitle_family = TLS_OUT_OF_INDEXES;
+static DWORD g_tls_current_subtitle_family = TLS_OUT_OF_INDEXES;
+static volatile LONG g_subtitle_runtime_hits = 0;
+static volatile LONG g_subtitle_remove_hits = 0;
 
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
-static const uintptr_t k_rva_dollman_radio_play_voice_by_controller_delay = 0x00C73DF0u;
-static const uintptr_t k_rva_dollman_voice_dispatcher = 0x00DAC1B0u;
-static const uintptr_t k_rva_show_subtitle = 0x00780710u;
-static const uintptr_t k_rva_subtitle_producer = 0x003873E0u;
-static const uintptr_t k_rva_selector_dispatch = 0x00DAFAD0u;
-static const uintptr_t k_rva_talk_dispatcher = 0x003857E0u;
+static const uintptr_t k_rva_dollman_radio_play_voice_by_controller_delay = 0x00C73BF0u;
+static const uintptr_t k_rva_dollman_voice_dispatcher = 0x00DAA410u;
+static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780690u;
+static const uintptr_t k_rva_show_subtitle = 0x00780740u;
+static const uintptr_t k_rva_remove_subtitle = 0x00780840u;
+static const uintptr_t k_rva_subtitle_render = 0x007808A0u;
+static const uintptr_t k_rva_subtitle_prepare = 0x0025A940u;
+static const uintptr_t k_rva_subtitle_runtime_context = 0x062308B8u;
+static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x03188DE0u;
+static const uintptr_t k_rva_subtitle_producer = 0x003872C0u;
+static const uintptr_t k_rva_start_talk_init = 0x00387670u;
+static const uintptr_t k_rva_selector_dispatch = 0x00DAF8A0u;
+static const uintptr_t k_rva_talk_dispatcher = 0x00385720u;
+static const uintptr_t k_rva_gameplay_sink = 0u;
 
-/* v3.17 gameplay Dollman mute: observed (speaker tag, ShowSubtitle caller RVA)
- * pair for the chatter path. Cutscene Dollman uses the same speaker tag but
- * comes through caller RVA 0x202f16f, and anonymous Dollman (pre-naming) uses
- * speaker tag 0x12b70 — both must NOT match this pair. */
+/* Current build gameplay Dollman mute: observed (speaker tag, ShowSubtitle
+ * caller RVA) pair for the chatter path. Older 0x38598B is stale on this
+ * build; live sender now lands at 0x385C1B. */
 static const uint32_t k_dollman_gameplay_speaker_tag = 0x12b6fu;
-static const uintptr_t k_dollman_gameplay_caller_rva = 0x38598bu;
+static const uintptr_t k_dollman_gameplay_caller_rva = 0x385c1bu;
 
 static const AkUniqueID k_scanner_event_id_1 = 4235852663u;
 static const AkUniqueID k_scanner_event_id_2 = 4094913469u;
@@ -136,18 +185,70 @@ enum {
     SUBTITLE_FAMILY_DIALOGUE = 2u
 };
 
-static const uint32_t k_speaker_tag_throw_recall = 0x01F4u;
-static const uint32_t k_speaker_tag_dialogue_a = 0x222Cu;
-static const uint32_t k_speaker_tag_dialogue_b = 0x4377u;
+enum {
+    SUBTITLE_STRATEGY_OBSERVE = 0u,
+    SUBTITLE_STRATEGY_GAMEPLAY_PAIR = 1u,
+    SUBTITLE_STRATEGY_CALLER_ONLY = 2u,
+    SUBTITLE_STRATEGY_SPEAKER_ONLY = 3u,
+    SUBTITLE_STRATEGY_SELECTED_FAMILY = 4u,
+    SUBTITLE_STRATEGY_PAIR_OR_SELECTED_FAMILY = 5u,
+    SUBTITLE_STRATEGY_COUNT = 6u
+};
+
+enum {
+    HOTKEY_CONTROL_THROW_RECALL_ON = 0u,
+    HOTKEY_CONTROL_THROW_RECALL_OFF = 1u,
+    HOTKEY_CONTROL_DIALOGUE_ON = 2u,
+    HOTKEY_CONTROL_DIALOGUE_OFF = 3u,
+    HOTKEY_CONTROL_CLEAR_ALL = 4u,
+    HOTKEY_CONTROL_SESSION_MARK = 5u,
+    HOTKEY_CONTROL_CLEAR_LOG = 6u,
+    HOTKEY_CONTROL_COUNT = 7u
+};
+
+typedef struct ShowStrategyContext {
+    uintptr_t caller_rva;
+    uint32_t current_family;
+    uint32_t speaker_tag;
+    BOOL speaker_tag_valid;
+    uint32_t last_builder;
+} ShowStrategyContext;
+
+typedef struct SubtitleStrategyStats {
+    volatile LONG evaluated;
+    volatile LONG would_mute;
+    volatile LONG actual_mute;
+} SubtitleStrategyStats;
+
+typedef struct SubtitleStrategyMeta {
+    const char *name;
+    const char *desc;
+    int vk;
+} SubtitleStrategyMeta;
+
+static const uint32_t k_identity_tag_throw_recall = 0x01F4u;
+static const uint32_t k_identity_tag_dialogue_a = 0x222Cu;
+static const uint32_t k_identity_tag_dialogue_b = 0x4377u;
+static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COUNT] = {
+    { "observe", "never mute; log-only baseline", VK_F1 },
+    { "pair", "mute only when caller 0x385C1B and speaker tag 0x12B6F both match", VK_F2 },
+    { "callerOnly", "mute everything from caller 0x385C1B", VK_F3 },
+    { "speakerOnly", "mute everything with speaker tag 0x12B6F", VK_F4 },
+    { "selectedFamily", "mute only the subtitle families currently enabled by J/K/N/M", VK_F5 },
+    { "pairOrSelectedFamily", "mute when the gameplay pair matches or the selected family matches", VK_F6 }
+};
+static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = {
+    'J', 'K', 'N', 'M', VK_F12, VK_F8, VK_F9
+};
 
 /* --- Builder probe (v3.14): log-only hooks on gameplay subtitle builders --- */
 enum {
     BUILDER_ID_NONE = 0u,
-    BUILDER_ID_A    = 1u, /* sub_140350050 — single candidate pool */
-    BUILDER_ID_B    = 2u, /* sub_140350460 — primary entry + variant array */
-    BUILDER_ID_C    = 3u, /* sub_140350960 — pre-built entry array */
-    BUILDER_ID_U1   = 4u, /* sub_140B5BC70 — unclassified 0x388950 caller */
-    BUILDER_ID_U2   = 5u, /* sub_140B5CC30 — unclassified 0x388950 caller */
+    BUILDER_ID_A    = 1u, /* current build: unresolved, quarantined */
+    BUILDER_ID_B    = 2u, /* sub_140350380 — MsgStartTalk handler */
+    BUILDER_ID_C    = 3u, /* sub_140350790 — MsgDSStartTalk handler */
+    BUILDER_ID_U1   = 4u, /* sub_140B5BC60 — unclassified 0x388950 caller */
+    BUILDER_ID_U2   = 5u, /* sub_140B5CC20 — unclassified 0x388950 caller */
     BUILDER_ID_COUNT = 6u
 };
 
@@ -155,11 +256,11 @@ static const char *k_builder_names[BUILDER_ID_COUNT] = {
     "none", "A", "B", "C", "U1", "U2"
 };
 
-static const uintptr_t k_rva_builder_a  = 0x00350050u;
-static const uintptr_t k_rva_builder_b  = 0x00350460u;
-static const uintptr_t k_rva_builder_c  = 0x00350960u;
-static const uintptr_t k_rva_builder_u1 = 0x00B5BC70u;
-static const uintptr_t k_rva_builder_u2 = 0x00B5CC30u;
+static const uintptr_t k_rva_builder_a  = 0u;
+static const uintptr_t k_rva_builder_b  = 0x00350380u;
+static const uintptr_t k_rva_builder_c  = 0x00350790u;
+static const uintptr_t k_rva_builder_u1 = 0x00B5BC60u;
+static const uintptr_t k_rva_builder_u2 = 0x00B5CC20u;
 
 typedef uintptr_t (__fastcall *BuilderFn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 typedef uintptr_t (__fastcall *SelectorDispatchFn)(uintptr_t, uintptr_t);
@@ -175,9 +276,10 @@ static TalkDispatcherFn g_real_talk_dispatcher = NULL;
 
 static volatile LONG g_builder_hit_counts[BUILDER_ID_COUNT] = {0};
 static DWORD g_tls_last_builder = TLS_OUT_OF_INDEXES;
-
-static BOOL g_hotkey_f8_prev = FALSE;
-static BOOL g_hotkey_f9_prev = FALSE;
+static uint32_t g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+static SubtitleStrategyStats g_strategy_stats[SUBTITLE_STRATEGY_COUNT];
+static BOOL g_hotkey_strategy_prev[SUBTITLE_STRATEGY_COUNT] = {FALSE};
+static BOOL g_hotkey_control_prev[HOTKEY_CONTROL_COUNT] = {FALSE};
 static volatile LONG g_session_counter = 0;
 
 static const AkUniqueID k_blocked_event_ids[] = {
@@ -190,13 +292,54 @@ static const AkUniqueID k_blocked_event_ids[] = {
 };
 
 static uintptr_t safe_deref_qword(uintptr_t addr);
+static const char *subtitle_strategy_name(uint32_t strategy);
+static const char *subtitle_strategy_desc(uint32_t strategy);
 static BOOL read_localized_text_resource(
     uintptr_t ptr,
     uint32_t *tag_out,
     char *text_buffer,
     size_t text_buffer_size);
+static void log_localized_text_resource_candidate(
+    const char *label,
+    uintptr_t ptr);
 static void log_builder_c_post_probe(uintptr_t rcx, uintptr_t result);
 static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_obj);
+static BOOL is_stf_probe_window_open(void);
+static void reset_stf_probe_cache(void);
+static BOOL stf_probe_seen_or_mark(uint64_t key);
+static void reset_builder_hit_counts(void);
+static void reset_strategy_stats(void);
+static void reset_hotkey_runtime_state(void);
+static void reset_session_probe_state(void);
+static void log_hotkey_mute_state(const char *key_name);
+static void log_localized_hits_in_block(
+    uintptr_t caller_rva,
+    const char *label,
+    uintptr_t base,
+    size_t size);
+static void log_sentence_desc_probe(
+    const char *tag,
+    uintptr_t caller_rva,
+    unsigned int index,
+    uintptr_t desc);
+static void *resolve_rva(uintptr_t rva);
+static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy);
+static BOOL is_subtitle_runtime_mute_enabled(void);
+static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag);
+static uint32_t read_subtitle_runtime_prepare_token(void);
+static void log_subtitle_identity_probe(
+    const char *surface,
+    uintptr_t caller_rva,
+    const uint64_t *words,
+    size_t word_count);
+static void log_remove_subtitle_probe(
+    uintptr_t caller_rva,
+    const uint64_t *key_pair,
+    char mode);
+static BOOL process_subtitle_payload(
+    const char *surface,
+    uintptr_t caller_rva,
+    const uint64_t *payload);
 
 static const char *k_default_ini =
     "; DollmanMute runtime config.\n"
@@ -205,17 +348,37 @@ static const char *k_default_ini =
     ";   Keep 0 while testing the new subtitle-family hotkeys.\n"
     ";   (hat/glasses reactions etc) together with their subtitles.\n"
     "; EnableThrowRecallSubtitleMute=1 sets startup default for throw/recall mute.\n"
+    "; ActiveSubtitleStrategy selects which subtitle strategy actually mutes.\n"
+    ";   0=observe, 1=pair, 2=callerOnly, 3=speakerOnly,\n"
+    ";   4=selectedFamily, 5=pairOrSelectedFamily.\n"
+    ";   observe=never mute, pair=must match caller+speaker,\n"
+    ";   callerOnly=only caller match, speakerOnly=only speaker match,\n"
+    ";   selectedFamily=respect J/K/N/M family toggles only,\n"
+    ";   pairOrSelectedFamily=either pair match or selected family match.\n"
+    "; EnableSubtitleRuntimeHooks=1 arms ShowSubtitle-side runtime muting.\n"
+    ";   Current research default keeps this ON.\n"
+    "; EnableSubtitleFamilyTracking=1 keeps the older producer-side family probe\n"
+    ";   available for research. Runtime family muting can classify directly from\n"
+    ";   ShowSubtitle payload line identity tags on this build.\n"
+    "; Current default profile keeps SelectorDispatch ON, but leaves\n"
+    "; TalkDispatcher OFF because it currently causes runtime crashes.\n"
+    "; Producer/builder hooks are also OFF by default.\n"
     "; EnableBuilderProbe=1 installs log-only hooks on gameplay subtitle builders\n"
-    ";   A=sub_140350050, B=sub_140350460, C=sub_140350960,\n"
-    ";   U1=sub_140B5BC70, U2=sub_140B5CC30, and emits [show]/[builder] log lines.\n"
+    ";   A=quarantined on current build, B=sub_140350380, C=sub_140350790,\n"
+    ";   U1=sub_140B5BC60, U2=sub_140B5CC20.\n"
+    ";   and emits windowed [show]/[builder]/[350c70] log lines.\n"
     ";   Used for mapping dollman behaviours to builder paths.\n"
+    "; EnableSubtitleProducerProbe=1 additionally enables the newer\n"
+    ";   StartTalk/init/shared-sink deep research hooks.\n"
+    "; EnableTalkDispatcherProbe=1 is currently unsafe on this build.\n"
     "; Runtime hotkeys:\n"
     ";   J = throw/recall mute ON\n"
     ";   K = throw/recall mute OFF\n"
     ";   N = dollman dialogue mute ON\n"
     ";   M = dollman dialogue mute OFF\n"
     ";   F12 = clear all runtime subtitle mutes\n"
-    ";   F8  = mark session boundary in log (builder probe aid)\n"
+    ";   F1..F6 = switch active subtitle strategy\n"
+    ";   F8  = mark session boundary + open 5s deep-probe window\n"
     ";   F9  = truncate DollmanMute.log (fresh capture)\n"
     ";   F10 = reload core (proxy feature, not handled here)\n"
     "; EnableSubtitleProducerProbe is kept only for offline research builds.\n"
@@ -226,10 +389,15 @@ static const char *k_default_ini =
     "[General]\n"
     "Enabled=1\n"
     "VerboseLog=0\n"
-    "EnableDollmanRadioMute=0\n"
-    "EnableThrowRecallSubtitleMute=1\n"
-    "EnableSubtitleProducerProbe=1\n"
-    "EnableBuilderProbe=1\n"
+    "EnableDollmanRadioMute=1\n"
+    "EnableThrowRecallSubtitleMute=0\n"
+    "ActiveSubtitleStrategy=1\n"
+    "EnableSubtitleRuntimeHooks=1\n"
+    "EnableSubtitleFamilyTracking=0\n"
+    "EnableSubtitleProducerProbe=0\n"
+    "EnableBuilderProbe=0\n"
+    "EnableSelectorProbe=1\n"
+    "EnableTalkDispatcherProbe=0\n"
     "ScannerMode=0\n";
 
 static void join_path(char *buffer, size_t buffer_size, const char *dir, const char *file_name)
@@ -316,11 +484,15 @@ static void load_config(void)
     ZeroMemory(&g_cfg, sizeof(g_cfg));
     g_cfg.enabled = TRUE;
     g_cfg.verbose_log = FALSE;
-    g_cfg.enable_dollman_radio_mute = FALSE;
-    g_cfg.enable_throw_recall_subtitle_mute = TRUE;
+    g_cfg.enable_dollman_radio_mute = TRUE;
+    g_cfg.enable_throw_recall_subtitle_mute = FALSE;
+    g_cfg.active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+    g_cfg.enable_subtitle_runtime_hooks = TRUE;
+    g_cfg.enable_subtitle_family_tracking = FALSE;
     g_cfg.enable_subtitle_producer_probe = FALSE;
     g_cfg.enable_builder_probe = FALSE;
     g_cfg.enable_selector_probe = TRUE;
+    g_cfg.enable_talk_dispatcher_probe = FALSE;
     g_cfg.scanner_mode = SCANNER_MODE_OFF;
 
     ensure_default_ini();
@@ -337,6 +509,21 @@ static void load_config(void)
         "EnableThrowRecallSubtitleMute",
         g_cfg.enable_throw_recall_subtitle_mute,
         g_ini_path) != 0;
+    g_cfg.active_subtitle_strategy = (uint32_t)GetPrivateProfileIntA(
+        "General",
+        "ActiveSubtitleStrategy",
+        (int)g_cfg.active_subtitle_strategy,
+        g_ini_path);
+    g_cfg.enable_subtitle_runtime_hooks = GetPrivateProfileIntA(
+        "General",
+        "EnableSubtitleRuntimeHooks",
+        g_cfg.enable_subtitle_runtime_hooks,
+        g_ini_path) != 0;
+    g_cfg.enable_subtitle_family_tracking = GetPrivateProfileIntA(
+        "General",
+        "EnableSubtitleFamilyTracking",
+        g_cfg.enable_subtitle_family_tracking,
+        g_ini_path) != 0;
     g_cfg.enable_subtitle_producer_probe = GetPrivateProfileIntA(
         "General",
         "EnableSubtitleProducerProbe",
@@ -352,6 +539,11 @@ static void load_config(void)
         "EnableSelectorProbe",
         g_cfg.enable_selector_probe,
         g_ini_path) != 0;
+    g_cfg.enable_talk_dispatcher_probe = GetPrivateProfileIntA(
+        "General",
+        "EnableTalkDispatcherProbe",
+        g_cfg.enable_talk_dispatcher_probe,
+        g_ini_path) != 0;
     {
         int scanner_mode_value = GetPrivateProfileIntA(
             "General",
@@ -365,6 +557,9 @@ static void load_config(void)
             scanner_mode_value = (int)SCANNER_MODE_MUTE_ALL;
         }
         g_cfg.scanner_mode = (uint32_t)scanner_mode_value;
+    }
+    if (g_cfg.active_subtitle_strategy >= SUBTITLE_STRATEGY_COUNT) {
+        g_cfg.active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
     }
 }
 
@@ -490,15 +685,111 @@ static BOOL is_vk_down(int vk)
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
+static BOOL is_stf_probe_window_open(void)
+{
+    LONG64 until_ms = InterlockedCompareExchange64(&g_stf_probe_window_until_ms, 0, 0);
+
+    if (until_ms == 0) {
+        return FALSE;
+    }
+    return GetTickCount64() <= (ULONGLONG)until_ms;
+}
+
+static void reset_stf_probe_cache(void)
+{
+    if (!g_stf_probe_lock_inited) {
+        return;
+    }
+
+    EnterCriticalSection(&g_stf_probe_lock);
+    ZeroMemory(g_stf_probe_cache, sizeof(g_stf_probe_cache));
+    g_stf_probe_cache_count = 0;
+    LeaveCriticalSection(&g_stf_probe_lock);
+}
+
+static BOOL stf_probe_seen_or_mark(uint64_t key)
+{
+    int i;
+    BOOL seen = FALSE;
+
+    if (key == 0 || !g_stf_probe_lock_inited) {
+        return FALSE;
+    }
+
+    EnterCriticalSection(&g_stf_probe_lock);
+    for (i = 0; i < g_stf_probe_cache_count; ++i) {
+        if (g_stf_probe_cache[i] == key) {
+            seen = TRUE;
+            break;
+        }
+    }
+    if (!seen && g_stf_probe_cache_count < STF_PROBE_CACHE_MAX) {
+        g_stf_probe_cache[g_stf_probe_cache_count++] = key;
+    }
+    LeaveCriticalSection(&g_stf_probe_lock);
+
+    return seen;
+}
+
+static void reset_builder_hit_counts(void)
+{
+    size_t i;
+
+    for (i = 0; i < BUILDER_ID_COUNT; ++i) {
+        InterlockedExchange(&g_builder_hit_counts[i], 0);
+    }
+}
+
+static void reset_strategy_stats(void)
+{
+    size_t i;
+
+    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
+        InterlockedExchange(&g_strategy_stats[i].evaluated, 0);
+        InterlockedExchange(&g_strategy_stats[i].would_mute, 0);
+        InterlockedExchange(&g_strategy_stats[i].actual_mute, 0);
+    }
+}
+
+static void reset_hotkey_runtime_state(void)
+{
+    ZeroMemory(g_hotkey_control_prev, sizeof(g_hotkey_control_prev));
+    ZeroMemory(g_hotkey_strategy_prev, sizeof(g_hotkey_strategy_prev));
+}
+
+static void reset_session_probe_state(void)
+{
+    InterlockedExchange(&g_session_counter, 0);
+    InterlockedExchange64(&g_stf_probe_window_until_ms, 0);
+    reset_stf_probe_cache();
+}
+
+static void log_hotkey_mute_state(const char *key_name)
+{
+    log_line(
+        "HotkeyMute throwRecall=%d dialogue=%d key='%s'",
+        g_hotkey_throw_recall_mute ? 1 : 0,
+        g_hotkey_dialogue_mute ? 1 : 0,
+        key_name != NULL ? key_name : "?");
+}
+
 static void seed_hotkey_state_from_config(void)
 {
     EnterCriticalSection(&g_hotkey_lock);
     g_hotkey_throw_recall_mute = g_cfg.enable_throw_recall_subtitle_mute;
     g_hotkey_dialogue_mute = FALSE;
+    if (g_cfg.active_subtitle_strategy < SUBTITLE_STRATEGY_COUNT) {
+        g_active_subtitle_strategy = g_cfg.active_subtitle_strategy;
+    } else {
+        g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+    }
     LeaveCriticalSection(&g_hotkey_lock);
 }
 
-static void get_hotkey_mute_state(BOOL *throw_recall_mute, BOOL *dialogue_mute)
+static void get_hotkey_mute_state(
+    BOOL *throw_recall_mute,
+    BOOL *dialogue_mute,
+    uint32_t *active_strategy)
 {
     EnterCriticalSection(&g_hotkey_lock);
     if (throw_recall_mute != NULL) {
@@ -507,15 +798,18 @@ static void get_hotkey_mute_state(BOOL *throw_recall_mute, BOOL *dialogue_mute)
     if (dialogue_mute != NULL) {
         *dialogue_mute = g_hotkey_dialogue_mute;
     }
+    if (active_strategy != NULL) {
+        *active_strategy = g_active_subtitle_strategy;
+    }
     LeaveCriticalSection(&g_hotkey_lock);
 }
 
-static BOOL should_mute_subtitle_family(uint32_t family)
+static BOOL is_selected_subtitle_family(uint32_t family)
 {
     BOOL throw_recall_mute = FALSE;
     BOOL dialogue_mute = FALSE;
 
-    get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute);
+    get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, NULL);
 
     if (family == SUBTITLE_FAMILY_THROW_RECALL) {
         return throw_recall_mute;
@@ -526,20 +820,20 @@ static BOOL should_mute_subtitle_family(uint32_t family)
     return FALSE;
 }
 
-static uintptr_t tls_get_muted_subtitle_family(void)
+static uintptr_t tls_get_current_subtitle_family(void)
 {
-    if (g_tls_muted_subtitle_family == TLS_OUT_OF_INDEXES) {
+    if (g_tls_current_subtitle_family == TLS_OUT_OF_INDEXES) {
         return SUBTITLE_FAMILY_NONE;
     }
-    return (uintptr_t)TlsGetValue(g_tls_muted_subtitle_family);
+    return (uintptr_t)TlsGetValue(g_tls_current_subtitle_family);
 }
 
-static void tls_set_muted_subtitle_family(uintptr_t family)
+static void tls_set_current_subtitle_family(uintptr_t family)
 {
-    if (g_tls_muted_subtitle_family == TLS_OUT_OF_INDEXES) {
+    if (g_tls_current_subtitle_family == TLS_OUT_OF_INDEXES) {
         return;
     }
-    TlsSetValue(g_tls_muted_subtitle_family, (LPVOID)family);
+    TlsSetValue(g_tls_current_subtitle_family, (LPVOID)family);
 }
 
 static uint32_t tls_get_last_builder(void)
@@ -564,84 +858,469 @@ static uint32_t read_identity_hi32(uintptr_t ptr)
     return (uint32_t)(word1 >> 32);
 }
 
-static uint32_t classify_subtitle_family(uintptr_t pre_p200_field72)
+static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag)
 {
-    uint32_t speaker_tag = read_identity_hi32(pre_p200_field72);
-
-    if (speaker_tag == k_speaker_tag_throw_recall) {
+    if (identity_tag == k_identity_tag_throw_recall) {
         return SUBTITLE_FAMILY_THROW_RECALL;
     }
-    if (speaker_tag == k_speaker_tag_dialogue_a || speaker_tag == k_speaker_tag_dialogue_b) {
+    if (identity_tag == k_identity_tag_dialogue_a ||
+        identity_tag == k_identity_tag_dialogue_b) {
         return SUBTITLE_FAMILY_DIALOGUE;
     }
     return SUBTITLE_FAMILY_NONE;
 }
 
+static uint32_t classify_subtitle_family(uintptr_t pre_p200_field72)
+{
+    return classify_subtitle_family_from_identity_tag(read_identity_hi32(pre_p200_field72));
+}
+
+static BOOL is_gameplay_dollman_pair(
+    uintptr_t caller_rva,
+    uint32_t speaker_tag,
+    BOOL speaker_tag_valid)
+{
+    return speaker_tag_valid &&
+           caller_rva == k_dollman_gameplay_caller_rva &&
+           speaker_tag == k_dollman_gameplay_speaker_tag;
+}
+
+static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy)
+{
+    return strategy == SUBTITLE_STRATEGY_SELECTED_FAMILY ||
+           strategy == SUBTITLE_STRATEGY_PAIR_OR_SELECTED_FAMILY;
+}
+
+static BOOL is_subtitle_runtime_mute_enabled(void)
+{
+    return g_cfg.enabled && g_cfg.enable_subtitle_runtime_hooks;
+}
+
+static uint32_t read_subtitle_runtime_prepare_token(void)
+{
+    uintptr_t runtime_ctx = safe_deref_qword((uintptr_t)resolve_rva(k_rva_subtitle_runtime_context));
+
+    if (runtime_ctx == 0 ||
+        IsBadReadPtr((const void *)(runtime_ctx + 48936), sizeof(uint32_t))) {
+        return 0;
+    }
+    return *(const uint32_t *)(runtime_ctx + 48936);
+}
+
+static void log_subtitle_identity_probe(
+    const char *surface,
+    uintptr_t caller_rva,
+    const uint64_t *words,
+    size_t word_count)
+{
+    uint32_t tag0 = 0;
+    uint32_t tag1 = 0;
+    uint32_t tag6 = 0;
+    uint32_t tag7 = 0;
+    char text0[96];
+    char text1[96];
+    char text6[96];
+    char text7[96];
+    BOOL ok0 = FALSE;
+    BOOL ok1 = FALSE;
+    BOOL ok6 = FALSE;
+    BOOL ok7 = FALSE;
+
+    if (words == NULL || word_count == 0) {
+        return;
+    }
+
+    ZeroMemory(text0, sizeof(text0));
+    ZeroMemory(text1, sizeof(text1));
+    ZeroMemory(text6, sizeof(text6));
+    ZeroMemory(text7, sizeof(text7));
+
+    if (word_count > 0 && words[0] != 0) {
+        ok0 = read_localized_text_resource((uintptr_t)words[0], &tag0, text0, sizeof(text0));
+    }
+    if (word_count > 1 && words[1] != 0) {
+        ok1 = read_localized_text_resource((uintptr_t)words[1], &tag1, text1, sizeof(text1));
+    }
+    if (word_count > 6 && words[6] != 0) {
+        ok6 = read_localized_text_resource((uintptr_t)words[6], &tag6, text6, sizeof(text6));
+    }
+    if (word_count > 7 && words[7] != 0) {
+        ok7 = read_localized_text_resource((uintptr_t)words[7], &tag7, text7, sizeof(text7));
+    }
+
+    log_line(
+        "SubtitleKey surface=%s caller_rva=0x%llx key0=0x%llx key1=0x%llx q2=0x%llx q3=0x%llx p6=0x%llx p7=0x%llx "
+        "k0_ok=%d k0_tag=0x%x k0_text=\"%s\" k1_ok=%d k1_tag=0x%x k1_text=\"%s\" "
+        "p6_ok=%d p6_tag=0x%x p6_text=\"%s\" p7_ok=%d p7_tag=0x%x p7_text=\"%s\"",
+        surface != NULL ? surface : "?",
+        (unsigned long long)caller_rva,
+        (unsigned long long)((word_count > 0) ? words[0] : 0),
+        (unsigned long long)((word_count > 1) ? words[1] : 0),
+        (unsigned long long)((word_count > 2) ? words[2] : 0),
+        (unsigned long long)((word_count > 3) ? words[3] : 0),
+        (unsigned long long)((word_count > 6) ? words[6] : 0),
+        (unsigned long long)((word_count > 7) ? words[7] : 0),
+        ok0 ? 1 : 0,
+        (unsigned int)tag0,
+        text0,
+        ok1 ? 1 : 0,
+        (unsigned int)tag1,
+        text1,
+        ok6 ? 1 : 0,
+        (unsigned int)tag6,
+        text6,
+        ok7 ? 1 : 0,
+        (unsigned int)tag7,
+        text7);
+
+    if (!ok6 && word_count > 6 && words[6] != 0) {
+        log_localized_text_resource_candidate("sender.p6", (uintptr_t)words[6]);
+    }
+    if (!ok7 && word_count > 7 && words[7] != 0) {
+        log_localized_text_resource_candidate("sender.p7", (uintptr_t)words[7]);
+    }
+}
+
+static void log_remove_subtitle_probe(
+    uintptr_t caller_rva,
+    const uint64_t *key_pair,
+    char mode)
+{
+    uint64_t words[2] = {0};
+    uint32_t tag0 = 0;
+    uint32_t tag1 = 0;
+    char text0[96];
+    char text1[96];
+    BOOL ok0 = FALSE;
+    BOOL ok1 = FALSE;
+
+    if (key_pair == NULL || IsBadReadPtr(key_pair, sizeof(words))) {
+        log_line(
+            "SubtitleRemove caller_rva=0x%llx unreadable=1 mode=%u",
+            (unsigned long long)caller_rva,
+            (unsigned int)(uint8_t)mode);
+        return;
+    }
+
+    ZeroMemory(text0, sizeof(text0));
+    ZeroMemory(text1, sizeof(text1));
+    memcpy(words, key_pair, sizeof(words));
+
+    if (words[0] != 0) {
+        ok0 = read_localized_text_resource((uintptr_t)words[0], &tag0, text0, sizeof(text0));
+    }
+    if (words[1] != 0) {
+        ok1 = read_localized_text_resource((uintptr_t)words[1], &tag1, text1, sizeof(text1));
+    }
+
+    log_line(
+        "SubtitleRemove caller_rva=0x%llx key0=0x%llx key1=0x%llx mode=%u "
+        "k0_ok=%d k0_tag=0x%x k0_text=\"%s\" k1_ok=%d k1_tag=0x%x k1_text=\"%s\"",
+        (unsigned long long)caller_rva,
+        (unsigned long long)words[0],
+        (unsigned long long)words[1],
+        (unsigned int)(uint8_t)mode,
+        ok0 ? 1 : 0,
+        (unsigned int)tag0,
+        text0,
+        ok1 ? 1 : 0,
+        (unsigned int)tag1,
+        text1);
+}
+
+static BOOL should_mute_show_ctx(const ShowStrategyContext *ctx, uint32_t strategy)
+{
+    if (ctx == NULL) {
+        return FALSE;
+    }
+
+    switch (strategy) {
+    case SUBTITLE_STRATEGY_OBSERVE:
+        return FALSE;
+    case SUBTITLE_STRATEGY_GAMEPLAY_PAIR:
+        return is_gameplay_dollman_pair(ctx->caller_rva, ctx->speaker_tag, ctx->speaker_tag_valid);
+    case SUBTITLE_STRATEGY_CALLER_ONLY:
+        return ctx->caller_rva == k_dollman_gameplay_caller_rva;
+    case SUBTITLE_STRATEGY_SPEAKER_ONLY:
+        return ctx->speaker_tag_valid && ctx->speaker_tag == k_dollman_gameplay_speaker_tag;
+    case SUBTITLE_STRATEGY_SELECTED_FAMILY:
+        return is_selected_subtitle_family(ctx->current_family);
+    case SUBTITLE_STRATEGY_PAIR_OR_SELECTED_FAMILY:
+        return is_gameplay_dollman_pair(ctx->caller_rva, ctx->speaker_tag, ctx->speaker_tag_valid) ||
+               is_selected_subtitle_family(ctx->current_family);
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL process_subtitle_payload(
+    const char *surface,
+    uintptr_t caller_rva,
+    const uint64_t *payload)
+{
+    uintptr_t raw_current_family = tls_get_current_subtitle_family();
+    uint32_t last_builder = tls_get_last_builder();
+    uint32_t active_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+    uint64_t words[8] = {0};
+    BOOL payload_readable = FALSE;
+    BOOL speaker_tag_valid = FALSE;
+    BOOL line_tag_valid = FALSE;
+    uint32_t speaker_tag = 0;
+    uint32_t line_tag = 0;
+    uint32_t derived_family = SUBTITLE_FAMILY_NONE;
+    ShowStrategyContext strategy_ctx;
+    BOOL strategy_results[SUBTITLE_STRATEGY_COUNT];
+    BOOL actual_mute = FALSE;
+    LONG hit_index = 0;
+    uint32_t i;
+
+    get_hotkey_mute_state(NULL, NULL, &active_strategy);
+
+    if (payload != NULL && !IsBadReadPtr(payload, sizeof(words))) {
+        memcpy(words, payload, sizeof(words));
+        payload_readable = TRUE;
+        if (words[6] != 0) {
+            line_tag_valid = read_localized_text_resource(
+                (uintptr_t)words[6],
+                &line_tag,
+                NULL,
+                0);
+        }
+        if (line_tag_valid) {
+            derived_family = classify_subtitle_family_from_identity_tag(line_tag);
+        }
+        if (words[7] != 0) {
+            speaker_tag_valid = read_localized_text_resource(
+                (uintptr_t)words[7],
+                &speaker_tag,
+                NULL,
+                0);
+        }
+    }
+
+    strategy_ctx.caller_rva = caller_rva;
+    strategy_ctx.current_family =
+        (derived_family != SUBTITLE_FAMILY_NONE)
+            ? derived_family
+            : (uint32_t)raw_current_family;
+    strategy_ctx.speaker_tag = speaker_tag;
+    strategy_ctx.speaker_tag_valid = speaker_tag_valid;
+    strategy_ctx.last_builder = last_builder;
+
+    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
+        BOOL would_mute = should_mute_show_ctx(&strategy_ctx, i);
+        strategy_results[i] = would_mute;
+        InterlockedIncrement(&g_strategy_stats[i].evaluated);
+        if (would_mute) {
+            InterlockedIncrement(&g_strategy_stats[i].would_mute);
+        }
+    }
+
+    hit_index = InterlockedIncrement(&g_subtitle_runtime_hits);
+    if (hit_index <= 24) {
+        log_line(
+            "SubtitleHit surface=%s caller_rva=0x%llx speaker_ok=%d speaker_tag=0x%x line_ok=%d line_tag=0x%x family=%s builder=%s",
+            surface != NULL ? surface : "?",
+            (unsigned long long)caller_rva,
+            speaker_tag_valid ? 1 : 0,
+            (unsigned int)speaker_tag,
+            line_tag_valid ? 1 : 0,
+            (unsigned int)line_tag,
+            subtitle_family_name(strategy_ctx.current_family),
+            (last_builder < BUILDER_ID_COUNT) ? k_builder_names[last_builder] : "none");
+        log_subtitle_identity_probe(surface, caller_rva, words, sizeof(words) / sizeof(words[0]));
+    }
+
+    if (is_subtitle_runtime_mute_enabled() &&
+        active_strategy < SUBTITLE_STRATEGY_COUNT &&
+        strategy_results[active_strategy]) {
+        actual_mute = TRUE;
+        InterlockedIncrement(&g_strategy_stats[active_strategy].actual_mute);
+        log_line(
+            "Muted subtitle surface=%s strategy=%s caller_rva=0x%llx speaker_ok=%d speaker_tag=0x%x line_ok=%d line_tag=0x%x family=%s builder=%s",
+            surface != NULL ? surface : "?",
+            subtitle_strategy_name(active_strategy),
+            (unsigned long long)caller_rva,
+            speaker_tag_valid ? 1 : 0,
+            (unsigned int)speaker_tag,
+            line_tag_valid ? 1 : 0,
+            (unsigned int)line_tag,
+            subtitle_family_name(strategy_ctx.current_family),
+            (last_builder < BUILDER_ID_COUNT) ? k_builder_names[last_builder] : "none");
+    }
+
+    if (is_stf_probe_window_open() &&
+        (g_cfg.enable_subtitle_producer_probe ||
+         g_cfg.enable_builder_probe ||
+         g_cfg.enable_selector_probe)) {
+        uint64_t p6_data[8] = {0};
+        uint64_t p7_data[8] = {0};
+        uintptr_t vtbl_rva = 0;
+        uintptr_t p6_vtbl_rva = 0;
+        uintptr_t p7_vtbl_rva = 0;
+        if (payload_readable) {
+            if (g_image_base != 0 && (uintptr_t)words[0] > g_image_base) {
+                vtbl_rva = (uintptr_t)words[0] - g_image_base;
+            }
+            if (words[6] != 0 &&
+                !IsBadReadPtr((const void *)(uintptr_t)words[6], sizeof(p6_data))) {
+                memcpy(p6_data, (const void *)(uintptr_t)words[6], sizeof(p6_data));
+                if (g_image_base != 0 && (uintptr_t)p6_data[0] > g_image_base) {
+                    p6_vtbl_rva = (uintptr_t)p6_data[0] - g_image_base;
+                }
+            }
+            if (words[7] != 0 &&
+                !IsBadReadPtr((const void *)(uintptr_t)words[7], sizeof(p7_data))) {
+                memcpy(p7_data, (const void *)(uintptr_t)words[7], sizeof(p7_data));
+                if (g_image_base != 0 && (uintptr_t)p7_data[0] > g_image_base) {
+                    p7_vtbl_rva = (uintptr_t)p7_data[0] - g_image_base;
+                }
+            }
+        }
+        log_line(
+            "[show] surface=%s tid=%lu caller_rva=0x%llx r=%d vtbl_rva=0x%llx p=[0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx] p6v=0x%llx p6=[0x%llx,0x%llx,0x%llx,0x%llx] p7v=0x%llx p7=[0x%llx,0x%llx,0x%llx,0x%llx]",
+            surface != NULL ? surface : "?",
+            (unsigned long)GetCurrentThreadId(),
+            (unsigned long long)caller_rva,
+            payload_readable ? 1 : 0,
+            (unsigned long long)vtbl_rva,
+            (unsigned long long)words[0],
+            (unsigned long long)words[1],
+            (unsigned long long)words[2],
+            (unsigned long long)words[3],
+            (unsigned long long)words[4],
+            (unsigned long long)words[5],
+            (unsigned long long)words[6],
+            (unsigned long long)words[7],
+            (unsigned long long)p6_vtbl_rva,
+            (unsigned long long)p6_data[0],
+            (unsigned long long)p6_data[1],
+            (unsigned long long)p6_data[2],
+            (unsigned long long)p6_data[3],
+            (unsigned long long)p7_vtbl_rva,
+            (unsigned long long)p7_data[0],
+            (unsigned long long)p7_data[1],
+            (unsigned long long)p7_data[2],
+            (unsigned long long)p7_data[3]);
+
+        log_line(
+            "[strategy] surface=%s tid=%lu active=%s builder=%s family=%s speaker_ok=%d speaker_tag=0x%x caller_rva=0x%llx "
+            "obs=%d pair=%d caller=%d speaker=%d selected=%d hybrid=%d actual=%d",
+            surface != NULL ? surface : "?",
+            (unsigned long)GetCurrentThreadId(),
+            subtitle_strategy_name(active_strategy),
+            (last_builder < BUILDER_ID_COUNT) ? k_builder_names[last_builder] : "none",
+            subtitle_family_name(strategy_ctx.current_family),
+            speaker_tag_valid ? 1 : 0,
+            (unsigned int)speaker_tag,
+            (unsigned long long)caller_rva,
+            strategy_results[SUBTITLE_STRATEGY_OBSERVE] ? 1 : 0,
+            strategy_results[SUBTITLE_STRATEGY_GAMEPLAY_PAIR] ? 1 : 0,
+            strategy_results[SUBTITLE_STRATEGY_CALLER_ONLY] ? 1 : 0,
+            strategy_results[SUBTITLE_STRATEGY_SPEAKER_ONLY] ? 1 : 0,
+            strategy_results[SUBTITLE_STRATEGY_SELECTED_FAMILY] ? 1 : 0,
+            strategy_results[SUBTITLE_STRATEGY_PAIR_OR_SELECTED_FAMILY] ? 1 : 0,
+            actual_mute ? 1 : 0);
+    }
+
+    log_verbose(
+        "[show] surface=%s strategy=%s family=%s speaker_ok=%d speaker=0x%x caller=0x%llx builder=%s actual=%d",
+        surface != NULL ? surface : "?",
+        subtitle_strategy_name(active_strategy),
+        subtitle_family_name(strategy_ctx.current_family),
+        speaker_tag_valid ? 1 : 0,
+        (unsigned int)speaker_tag,
+        (unsigned long long)caller_rva,
+        (last_builder < BUILDER_ID_COUNT) ? k_builder_names[last_builder] : "none",
+        actual_mute ? 1 : 0);
+
+    return actual_mute;
+}
+
 static void update_hotkey_mute_state(void)
 {
-    BOOL key_j_down = is_vk_down('J');
-    BOOL key_k_down = is_vk_down('K');
-    BOOL key_n_down = is_vk_down('N');
-    BOOL key_m_down = is_vk_down('M');
-    BOOL key_f12_down = is_vk_down(VK_F12);
-    BOOL key_f8_down = is_vk_down(VK_F8);
-    BOOL key_f9_down = is_vk_down(VK_F9);
+    BOOL key_control_down[HOTKEY_CONTROL_COUNT];
+    BOOL key_strategy_down[SUBTITLE_STRATEGY_COUNT];
+    uint32_t i;
 
-    if (key_f8_down && !g_hotkey_f8_prev) {
-        LONG counter = InterlockedIncrement(&g_session_counter);
-        log_line("=== session boundary F8 count=%ld ===", (long)counter);
+    for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
+        key_control_down[i] = is_vk_down(k_hotkey_control_vks[i]);
     }
-    g_hotkey_f8_prev = key_f8_down;
+    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
+        key_strategy_down[i] = is_vk_down(k_subtitle_strategy_meta[i].vk);
+    }
 
-    if (key_f9_down && !g_hotkey_f9_prev) {
+    if (key_control_down[HOTKEY_CONTROL_SESSION_MARK] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_SESSION_MARK]) {
+        BOOL throw_recall_mute = FALSE;
+        BOOL dialogue_mute = FALSE;
+        uint32_t active_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+        LONG counter = InterlockedIncrement(&g_session_counter);
+        ULONGLONG until_ms = GetTickCount64() + 5000ull;
+        InterlockedExchange64(&g_stf_probe_window_until_ms, (LONG64)until_ms);
+        reset_stf_probe_cache();
+        get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &active_strategy);
+        log_line("=== session boundary F8 count=%ld ===", (long)counter);
+        log_line(
+            "StrategySession active=%s desc='%s' throwRecall=%d dialogue=%d",
+            subtitle_strategy_name(active_strategy),
+            subtitle_strategy_desc(active_strategy),
+            throw_recall_mute ? 1 : 0,
+            dialogue_mute ? 1 : 0);
+    }
+
+    if (key_control_down[HOTKEY_CONTROL_CLEAR_LOG] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_CLEAR_LOG]) {
         clear_log_file();
         log_line("=== log cleared by F9 ===");
     }
-    g_hotkey_f9_prev = key_f9_down;
 
     EnterCriticalSection(&g_hotkey_lock);
 
-    if (key_j_down && !g_hotkey_j_prev) {
+    if (key_control_down[HOTKEY_CONTROL_THROW_RECALL_ON] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_THROW_RECALL_ON]) {
         g_hotkey_throw_recall_mute = TRUE;
-        log_line(
-            "HotkeyMute throwRecall=%d dialogue=%d key='J'",
-            g_hotkey_throw_recall_mute ? 1 : 0,
-            g_hotkey_dialogue_mute ? 1 : 0);
+        log_hotkey_mute_state("J");
     }
-    if (key_k_down && !g_hotkey_k_prev) {
+    if (key_control_down[HOTKEY_CONTROL_THROW_RECALL_OFF] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_THROW_RECALL_OFF]) {
         g_hotkey_throw_recall_mute = FALSE;
-        log_line(
-            "HotkeyMute throwRecall=%d dialogue=%d key='K'",
-            g_hotkey_throw_recall_mute ? 1 : 0,
-            g_hotkey_dialogue_mute ? 1 : 0);
+        log_hotkey_mute_state("K");
     }
-    if (key_n_down && !g_hotkey_n_prev) {
+    if (key_control_down[HOTKEY_CONTROL_DIALOGUE_ON] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_DIALOGUE_ON]) {
         g_hotkey_dialogue_mute = TRUE;
-        log_line(
-            "HotkeyMute throwRecall=%d dialogue=%d key='N'",
-            g_hotkey_throw_recall_mute ? 1 : 0,
-            g_hotkey_dialogue_mute ? 1 : 0);
+        log_hotkey_mute_state("N");
     }
-    if (key_m_down && !g_hotkey_m_prev) {
+    if (key_control_down[HOTKEY_CONTROL_DIALOGUE_OFF] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_DIALOGUE_OFF]) {
         g_hotkey_dialogue_mute = FALSE;
-        log_line(
-            "HotkeyMute throwRecall=%d dialogue=%d key='M'",
-            g_hotkey_throw_recall_mute ? 1 : 0,
-            g_hotkey_dialogue_mute ? 1 : 0);
+        log_hotkey_mute_state("M");
     }
-    if (key_f12_down && !g_hotkey_f12_prev) {
+    if (key_control_down[HOTKEY_CONTROL_CLEAR_ALL] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_CLEAR_ALL]) {
         g_hotkey_throw_recall_mute = FALSE;
         g_hotkey_dialogue_mute = FALSE;
-        log_line("HotkeyMute throwRecall=0 dialogue=0 key='F12'");
+        log_hotkey_mute_state("F12");
     }
-
-    g_hotkey_j_prev = key_j_down;
-    g_hotkey_k_prev = key_k_down;
-    g_hotkey_n_prev = key_n_down;
-    g_hotkey_m_prev = key_m_down;
-    g_hotkey_f12_prev = key_f12_down;
-
+    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
+        if (key_strategy_down[i] && !g_hotkey_strategy_prev[i]) {
+            g_active_subtitle_strategy = i;
+            log_line(
+                "HotkeyStrategy active=%s key='F%u' desc='%s'",
+                subtitle_strategy_name(i),
+                (unsigned int)(i + 1u),
+                subtitle_strategy_desc(i));
+        }
+    }
     LeaveCriticalSection(&g_hotkey_lock);
+
+    for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
+        g_hotkey_control_prev[i] = key_control_down[i];
+    }
+    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
+        g_hotkey_strategy_prev[i] = key_strategy_down[i];
+    }
 }
 
 static DWORD WINAPI hotkey_thread_proc(LPVOID parameter)
@@ -713,7 +1392,14 @@ static BOOL install_hook(void *target, void *detour, void **original, const char
     }
 
     status = MH_CreateHook(target, detour, original);
-    if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED) {
+    if (status == MH_ERROR_ALREADY_CREATED) {
+        if (original == NULL || *original == NULL) {
+            log_line(
+                "Failed to create hook %s: already created but original trampoline is unavailable",
+                label != NULL ? label : "(unknown)");
+            return FALSE;
+        }
+    } else if (status != MH_OK) {
         log_line("Failed to create hook %s: %d", label != NULL ? label : "(unknown)", (int)status);
         return FALSE;
     }
@@ -738,6 +1424,83 @@ static BOOL install_rva_hook(uintptr_t rva, void *detour, void **original, const
     return install_hook(resolve_rva(rva), detour, original, label);
 }
 
+static BOOL patch_pointer_slot(
+    uintptr_t slot_rva,
+    void *replacement,
+    void *expected_original,
+    void **original_out,
+    void ***slot_out,
+    const char *label)
+{
+    void **slot = (void **)resolve_rva(slot_rva);
+    void *original = NULL;
+    DWORD old_protect = 0;
+
+    if (slot == NULL || replacement == NULL) {
+        log_line("Skip pointer patch %s: slot or replacement missing", label != NULL ? label : "(unknown)");
+        return FALSE;
+    }
+
+    if (IsBadReadPtr(slot, sizeof(void *))) {
+        log_line("Skip pointer patch %s: slot unreadable at %p", label != NULL ? label : "(unknown)", slot);
+        return FALSE;
+    }
+
+    original = *slot;
+    if (expected_original != NULL && original != expected_original) {
+        log_line(
+            "Skip pointer patch %s: live original=%p expected=%p slot=%p",
+            label != NULL ? label : "(unknown)",
+            original,
+            expected_original,
+            slot);
+        return FALSE;
+    }
+    if (original_out != NULL) {
+        *original_out = original;
+    }
+
+    if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old_protect)) {
+        log_line("Failed to reprotect pointer slot %s: %lu", label != NULL ? label : "(unknown)", (unsigned long)GetLastError());
+        return FALSE;
+    }
+
+    *slot = replacement;
+    VirtualProtect(slot, sizeof(void *), old_protect, &old_protect);
+    FlushProcessWriteBuffers();
+
+    if (slot_out != NULL) {
+        *slot_out = slot;
+    }
+
+    log_line(
+        "Patched %s slot=%p original=%p replacement=%p",
+        label != NULL ? label : "(unknown)",
+        slot,
+        original,
+        replacement);
+    return TRUE;
+}
+
+static void restore_pointer_slot(void **slot, void *original, const char *label)
+{
+    DWORD old_protect = 0;
+
+    if (slot == NULL || original == NULL) {
+        return;
+    }
+
+    if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old_protect)) {
+        log_line("Failed to reprotect pointer slot for restore %s: %lu", label != NULL ? label : "(unknown)", (unsigned long)GetLastError());
+        return;
+    }
+
+    *slot = original;
+    VirtualProtect(slot, sizeof(void *), old_protect, &old_protect);
+    FlushProcessWriteBuffers();
+    log_line("Restored %s slot=%p original=%p", label != NULL ? label : "(unknown)", slot, original);
+}
+
 static AkPlayingID __cdecl hook_post_event_id(
     AkUniqueID event_id,
     AkGameObjectID game_object_id,
@@ -750,7 +1513,13 @@ static AkPlayingID __cdecl hook_post_event_id(
 {
     BOOL blocked = g_cfg.enabled && should_block_event_id(event_id);
 
-    if (g_cfg.verbose_log) {
+    if (blocked) {
+        log_line(
+            "Blocked PostEventID eventId=%u gameObject=0x%llx externalSources=%u",
+            (unsigned int)event_id,
+            (unsigned long long)game_object_id,
+            (unsigned int)external_source_count);
+    } else if (g_cfg.verbose_log) {
         log_verbose(
             "%s PostEventID eventId=%u gameObject=0x%llx externalSources=%u",
             blocked ? "Blocked" : "Seen",
@@ -784,7 +1553,7 @@ static uintptr_t __fastcall hook_dollman_radio_play_voice_by_controller_delay(
     int controller_index)
 {
     if (g_cfg.enabled && g_cfg.enable_dollman_radio_mute) {
-        log_verbose(
+        log_line(
             "Muted DollmanRadio.PlayVoiceByControllerDelay instance=%p controller=%d",
             (void *)instance,
             controller_index);
@@ -802,7 +1571,7 @@ static uintptr_t __fastcall hook_dollman_voice_dispatcher(
     int *sentence_key)
 {
     if (g_cfg.enabled && g_cfg.enable_dollman_radio_mute) {
-        log_verbose(
+        log_line(
             "Muted DollmanVoiceDispatcher radio=%p mode=%d key=0x%x param=%p",
             (void *)radio_instance,
             mode,
@@ -823,7 +1592,7 @@ static uintptr_t __fastcall hook_talk_dispatcher(uintptr_t *a1, uintptr_t *i)
      *   *(*(a1[3] + 376) + 0)      -> line_data->vtbl (speaker class)
      * The vtbl RVA uniquely identifies dollman vs Sam/NPC/cutscene talk nodes.
      * Probe-only: logs the chain, always calls the real dispatcher. */
-    if (g_cfg.enabled && g_cfg.enable_selector_probe &&
+    if (g_cfg.enabled && g_cfg.enable_selector_probe && is_stf_probe_window_open() &&
         a1 != NULL && !IsBadReadPtr(a1, 4 * sizeof(uintptr_t))) {
         uintptr_t a1_0 = a1[0];
         uintptr_t a1_1 = a1[1];
@@ -858,107 +1627,113 @@ static uintptr_t __fastcall hook_talk_dispatcher(uintptr_t *a1, uintptr_t *i)
     return g_real_talk_dispatcher(a1, i);
 }
 
-static uintptr_t __fastcall hook_show_subtitle(uintptr_t view, const uint64_t *payload)
+static uintptr_t __fastcall hook_subtitle_runtime_wrapper(uintptr_t view, uintptr_t arg2)
 {
     uintptr_t caller_ra = (uintptr_t)__builtin_return_address(0);
-    uintptr_t muted_family = tls_get_muted_subtitle_family();
-    uint32_t last_builder = tls_get_last_builder();
     uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
                                ? (caller_ra - g_image_base)
                                : 0;
+    SubtitleRuntimePrepareFn prepare_fn = (SubtitleRuntimePrepareFn)resolve_rva(k_rva_subtitle_prepare);
+    SubtitleRuntimeRenderFn render_fn = (SubtitleRuntimeRenderFn)resolve_rva(k_rva_subtitle_render);
+    SubtitleRuntimeStageFn stage_fn = NULL;
+    SubtitleRuntimePayloadGetterFn payload_getter_fn = NULL;
+    uintptr_t view_vtbl = 0;
+    uintptr_t state = 0;
+    uintptr_t state_vtbl = 0;
+    uintptr_t payload_src = 0;
+    uint32_t token = 0;
+    uint8_t scratch[104];
+    uint8_t meta[16];
 
-    if (g_cfg.enable_builder_probe || g_cfg.enable_selector_probe) {
-        uint64_t words[8] = {0};
-        uint64_t p6_data[8] = {0};
-        uint64_t p7_data[8] = {0};
-        BOOL readable = FALSE;
-        uintptr_t vtbl_rva = 0;
-        uintptr_t p6_vtbl_rva = 0;
-        uintptr_t p7_vtbl_rva = 0;
-        if (payload != NULL && !IsBadReadPtr(payload, sizeof(words))) {
-            memcpy(words, payload, sizeof(words));
-            readable = TRUE;
-            if (g_image_base != 0 && (uintptr_t)words[0] > g_image_base) {
-                vtbl_rva = (uintptr_t)words[0] - g_image_base;
-            }
-            if (words[6] != 0 &&
-                !IsBadReadPtr((const void *)(uintptr_t)words[6], sizeof(p6_data))) {
-                memcpy(p6_data, (const void *)(uintptr_t)words[6], sizeof(p6_data));
-                if (g_image_base != 0 && (uintptr_t)p6_data[0] > g_image_base) {
-                    p6_vtbl_rva = (uintptr_t)p6_data[0] - g_image_base;
-                }
-            }
-            if (words[7] != 0 &&
-                !IsBadReadPtr((const void *)(uintptr_t)words[7], sizeof(p7_data))) {
-                memcpy(p7_data, (const void *)(uintptr_t)words[7], sizeof(p7_data));
-                if (g_image_base != 0 && (uintptr_t)p7_data[0] > g_image_base) {
-                    p7_vtbl_rva = (uintptr_t)p7_data[0] - g_image_base;
-                }
-            }
-        }
-        log_line(
-            "[show] tid=%lu caller_rva=0x%llx r=%d vtbl_rva=0x%llx p=[0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx] p6v=0x%llx p6=[0x%llx,0x%llx,0x%llx,0x%llx] p7v=0x%llx p7=[0x%llx,0x%llx,0x%llx,0x%llx]",
-            (unsigned long)GetCurrentThreadId(),
-            (unsigned long long)caller_rva,
-            readable ? 1 : 0,
-            (unsigned long long)vtbl_rva,
-            (unsigned long long)words[0],
-            (unsigned long long)words[1],
-            (unsigned long long)words[2],
-            (unsigned long long)words[3],
-            (unsigned long long)words[4],
-            (unsigned long long)words[5],
-            (unsigned long long)words[6],
-            (unsigned long long)words[7],
-            (unsigned long long)p6_vtbl_rva,
-            (unsigned long long)p6_data[0],
-            (unsigned long long)p6_data[1],
-            (unsigned long long)p6_data[2],
-            (unsigned long long)p6_data[3],
-            (unsigned long long)p7_vtbl_rva,
-            (unsigned long long)p7_data[0],
-            (unsigned long long)p7_data[1],
-            (unsigned long long)p7_data[2],
-            (unsigned long long)p7_data[3]);
+    if (prepare_fn == NULL || render_fn == NULL || view == 0) {
+        return g_real_subtitle_runtime_wrapper(view, arg2);
     }
 
-    /* v3.16: reverted 0x38598b blanket mute — p7 is the subtitle renderer
-     * singleton (shared by dollman/Sam/NPC gameplay paths). Speaker identity
-     * lives in StartTalkFunction::a1[3]+376+0 (line_data->vtbl). Captured by
-     * the new talk dispatcher probe below (hook_talk_dispatcher at 0x3857E0). */
-
-    /* v3.17: gameplay-only Dollman filter. Match on (speaker tag, caller RVA).
-     * gameplay chatter  -> speaker 0x12b6f + caller 0x38598b -> return 0
-     * cutscene dialog   -> speaker 0x12b6f + caller 0x202f16f -> pass (留 cutscene)
-     * anonymous dollman -> speaker 0x12b70 -> pass (cutscene 里未命名占位)
-     * 其它 speaker 一律放行。payload 读前先 IsBadReadPtr。 */
-    if (g_cfg.enabled && g_hotkey_throw_recall_mute &&
-        caller_rva == k_dollman_gameplay_caller_rva &&
-        payload != NULL && !IsBadReadPtr(payload, sizeof(uint64_t) * 8)) {
-        uint64_t p7 = payload[7];
-        if (p7 != 0 && !IsBadReadPtr((const void *)(uintptr_t)p7, 0x10)) {
-            uint64_t w1 = *(const uint64_t *)((uintptr_t)p7 + 0x08);
-            uint32_t speaker_tag = (uint32_t)(w1 >> 32);
-            if (speaker_tag == k_dollman_gameplay_speaker_tag) {
-                log_verbose(
-                    "[mute] gameplay dollman speaker=0x%x caller=0x%llx",
-                    speaker_tag,
-                    (unsigned long long)caller_rva);
-                return 0;
-            }
-        }
+    view_vtbl = safe_deref_qword(view);
+    if (view_vtbl == 0 || IsBadReadPtr((const void *)(view_vtbl + 80), sizeof(uintptr_t))) {
+        return g_real_subtitle_runtime_wrapper(view, arg2);
+    }
+    stage_fn = (SubtitleRuntimeStageFn)safe_deref_qword(view_vtbl + 80);
+    if (stage_fn == NULL) {
+        return g_real_subtitle_runtime_wrapper(view, arg2);
     }
 
-    /* legacy TLS family path (kept as fallback in case producer still sets it) */
-    if (g_cfg.enabled && muted_family != SUBTITLE_FAMILY_NONE) {
+    token = read_subtitle_runtime_prepare_token();
+    if (token == 0) {
+        return g_real_subtitle_runtime_wrapper(view, arg2);
+    }
+
+    prepare_fn(view, arg2, token);
+
+    state = safe_deref_qword(view + 24);
+    state_vtbl = safe_deref_qword(state);
+    if (state == 0 || state_vtbl == 0 || IsBadReadPtr((const void *)(state_vtbl + 64), sizeof(uintptr_t))) {
+        return 0;
+    }
+
+    stage_fn(view,
+             state,
+             view + 2300,
+             view + 132,
+             view + (16 * sizeof(uintptr_t)),
+             view + (299 * sizeof(uintptr_t)));
+
+    state = safe_deref_qword(view + 24);
+    state_vtbl = safe_deref_qword(state);
+    if (state == 0 || state_vtbl == 0 || IsBadReadPtr((const void *)(state_vtbl + 64), sizeof(uintptr_t))) {
+        return 0;
+    }
+
+    payload_getter_fn = (SubtitleRuntimePayloadGetterFn)safe_deref_qword(state_vtbl + 64);
+    if (payload_getter_fn == NULL) {
+        return 0;
+    }
+
+    ZeroMemory(scratch, sizeof(scratch));
+    ZeroMemory(meta, sizeof(meta));
+    payload_src = payload_getter_fn(state, scratch, meta);
+    if (payload_src == 0 || IsBadReadPtr((const void *)payload_src, 0x60)) {
+        return 0;
+    }
+
+    if (process_subtitle_payload("wrapper", caller_rva, (const uint64_t *)payload_src)) {
+        return 0;
+    }
+
+    memcpy((void *)(view + 0x20), (const void *)payload_src, 0x60);
+    render_fn(view);
+    return 0;
+}
+
+static uintptr_t __fastcall hook_show_subtitle(uintptr_t view, const uint64_t *payload)
+{
+    uintptr_t caller_ra = (uintptr_t)__builtin_return_address(0);
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+                               ? (caller_ra - g_image_base)
+                               : 0;
+    if (process_subtitle_payload("sender", caller_rva, payload)) {
         log_verbose(
-            "Muted ShowSubtitle family=%s payload=%p",
-            subtitle_family_name((uint32_t)muted_family),
-            (const void *)payload);
+            "[mute] surface=sender caller=0x%llx",
+            (unsigned long long)caller_rva);
         return 0;
     }
 
     return g_real_show_subtitle(view, payload);
+}
+
+static uintptr_t __fastcall hook_remove_subtitle(uintptr_t view, const uint64_t *key_pair, char mode)
+{
+    uintptr_t caller_ra = (uintptr_t)__builtin_return_address(0);
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+                               ? (caller_ra - g_image_base)
+                               : 0;
+    LONG hit_index = InterlockedIncrement(&g_subtitle_remove_hits);
+
+    if (hit_index <= 24) {
+        log_remove_subtitle_probe(caller_rva, key_pair, mode);
+    }
+
+    return g_real_remove_subtitle(view, key_pair, mode);
 }
 
 static uintptr_t safe_deref_qword(uintptr_t addr)
@@ -1033,6 +1808,189 @@ static BOOL read_localized_text_resource(
     return TRUE;
 }
 
+static void log_localized_text_resource_candidate(
+    const char *label,
+    uintptr_t ptr)
+{
+    uintptr_t vtbl = 0;
+    uintptr_t vtbl_rva = 0;
+    uint64_t word1 = 0;
+    uintptr_t text_ptr = 0;
+    uint64_t text_len = 0;
+    char preview[96];
+    size_t copy_len = 0;
+
+    if (ptr == 0) {
+        log_line(
+            "SubtitleCandidate label=%s ptr=0x0 unreadable=1",
+            label != NULL ? label : "?");
+        return;
+    }
+
+    if (IsBadReadPtr((const void *)ptr, 0x30)) {
+        log_line(
+            "SubtitleCandidate label=%s ptr=0x%llx unreadable=1",
+            label != NULL ? label : "?",
+            (unsigned long long)ptr);
+        return;
+    }
+
+    ZeroMemory(preview, sizeof(preview));
+    vtbl = *(const uintptr_t *)(ptr + 0x0);
+    if (g_image_base != 0 && vtbl > g_image_base) {
+        vtbl_rva = vtbl - g_image_base;
+    }
+    word1 = *(const uint64_t *)(ptr + 0x8);
+    text_ptr = *(const uintptr_t *)(ptr + 0x20);
+    text_len = *(const uint64_t *)(ptr + 0x28);
+
+    if (text_ptr != 0 &&
+        text_len != 0 &&
+        text_len < sizeof(preview) &&
+        !IsBadReadPtr((const void *)text_ptr, (size_t)text_len)) {
+        copy_len = (size_t)text_len;
+        memcpy(preview, (const void *)text_ptr, copy_len);
+        preview[copy_len] = '\0';
+    }
+
+    log_line(
+        "SubtitleCandidate label=%s ptr=0x%llx vtbl=0x%llx vtbl_rva=0x%llx looks_ltr=%d "
+        "word1=0x%llx hi32=0x%x text_ptr=0x%llx text_len=0x%llx preview=\"%s\"",
+        label != NULL ? label : "?",
+        (unsigned long long)ptr,
+        (unsigned long long)vtbl,
+        (unsigned long long)vtbl_rva,
+        (vtbl_rva == k_rva_localized_text_resource_vtbl) ? 1 : 0,
+        (unsigned long long)word1,
+        (unsigned int)(word1 >> 32),
+        (unsigned long long)text_ptr,
+        (unsigned long long)text_len,
+        preview);
+}
+
+static void log_localized_hits_in_block(
+    uintptr_t caller_rva,
+    const char *label,
+    uintptr_t base,
+    size_t size)
+{
+    uint64_t words[16];
+    size_t word_count;
+    size_t i;
+
+    if (!is_stf_probe_window_open()) {
+        return;
+    }
+    if (base == 0 || size == 0 || size > sizeof(words) ||
+        IsBadReadPtr((const void *)base, size)) {
+        return;
+    }
+
+    ZeroMemory(words, sizeof(words));
+    memcpy(words, (const void *)base, size);
+    word_count = size / sizeof(words[0]);
+
+    for (i = 0; i < word_count; ++i) {
+        uint32_t tag = 0;
+        char text[160];
+        ZeroMemory(text, sizeof(text));
+        if (read_localized_text_resource((uintptr_t)words[i], &tag, text, sizeof(text))) {
+            log_line(
+                "[350c70-hit] caller_rva=0x%llx %s+0x%x ptr=0x%llx tag=0x%x text=\"%s\"",
+                (unsigned long long)caller_rva,
+                label != NULL ? label : "?",
+                (unsigned int)(i * sizeof(uint64_t)),
+                (unsigned long long)(uintptr_t)words[i],
+                (unsigned int)tag,
+                text);
+        }
+    }
+}
+
+static const char *subtitle_strategy_name(uint32_t strategy)
+{
+    if (strategy < SUBTITLE_STRATEGY_COUNT) {
+        return k_subtitle_strategy_meta[strategy].name;
+    }
+    return "unknown";
+}
+
+static const char *subtitle_strategy_desc(uint32_t strategy)
+{
+    if (strategy < SUBTITLE_STRATEGY_COUNT) {
+        return k_subtitle_strategy_meta[strategy].desc;
+    }
+    return "unknown";
+}
+
+static void log_sentence_desc_probe(
+    const char *tag,
+    uintptr_t caller_rva,
+    unsigned int index,
+    uintptr_t desc)
+{
+    uintptr_t desc_vtbl;
+    uintptr_t desc_vtbl_rva = 0;
+    uintptr_t line_loc;
+    uintptr_t speaker_wrap;
+    uintptr_t speaker_wrap_vtbl;
+    uintptr_t speaker_wrap_vtbl_rva = 0;
+    uintptr_t speaker_loc;
+    uint32_t line_tag = 0;
+    uint32_t speaker_tag = 0;
+    uint32_t speaker_wrap_tag = 0;
+    char line_text[160];
+    char speaker_text[160];
+    BOOL line_ok;
+    BOOL speaker_ok;
+
+    if (!is_stf_probe_window_open() || desc == 0) {
+        return;
+    }
+
+    ZeroMemory(line_text, sizeof(line_text));
+    ZeroMemory(speaker_text, sizeof(speaker_text));
+
+    desc_vtbl = safe_deref_qword(desc + 0x0);
+    if (g_image_base != 0 && desc_vtbl > g_image_base) {
+        desc_vtbl_rva = desc_vtbl - g_image_base;
+    }
+
+    line_loc = safe_deref_qword(desc + 0x48);
+    speaker_wrap = safe_deref_qword(desc + 0x50);
+    speaker_wrap_vtbl = safe_deref_qword(speaker_wrap + 0x0);
+    if (g_image_base != 0 && speaker_wrap_vtbl > g_image_base) {
+        speaker_wrap_vtbl_rva = speaker_wrap_vtbl - g_image_base;
+    }
+    speaker_wrap_tag = read_identity_hi32(speaker_wrap);
+    speaker_loc = safe_deref_qword(speaker_wrap + 0x28);
+
+    line_ok = read_localized_text_resource(line_loc, &line_tag, line_text, sizeof(line_text));
+    speaker_ok = read_localized_text_resource(speaker_loc, &speaker_tag, speaker_text, sizeof(speaker_text));
+
+    log_line(
+        "[%s] caller_rva=0x%llx idx=%u desc=0x%llx desc_vtbl_rva=0x%llx "
+        "line=0x%llx ok=%d tag=0x%x text=\"%s\" "
+        "speaker_wrap=0x%llx wrap_vtbl_rva=0x%llx wrap_tag=0x%x "
+        "speaker=0x%llx ok=%d tag=0x%x text=\"%s\"",
+        tag != NULL ? tag : "desc",
+        (unsigned long long)caller_rva,
+        index,
+        (unsigned long long)desc,
+        (unsigned long long)desc_vtbl_rva,
+        (unsigned long long)line_loc,
+        line_ok ? 1 : 0,
+        (unsigned int)line_tag,
+        line_text,
+        (unsigned long long)speaker_wrap,
+        (unsigned long long)speaker_wrap_vtbl_rva,
+        (unsigned int)speaker_wrap_tag,
+        (unsigned long long)speaker_loc,
+        speaker_ok ? 1 : 0,
+        (unsigned int)speaker_tag,
+        speaker_text);
+}
+
 static void log_builder_c_post_probe(uintptr_t rcx, uintptr_t result)
 {
     uint64_t words[16];
@@ -1045,6 +2003,9 @@ static void log_builder_c_post_probe(uintptr_t rcx, uintptr_t result)
     unsigned int offsets[4];
     char texts[4][160];
 
+    if (!is_stf_probe_window_open()) {
+        return;
+    }
     if (result == 0 || IsBadReadPtr((const void *)result, sizeof(words))) {
         return;
     }
@@ -1097,71 +2058,87 @@ static void log_builder_c_post_probe(uintptr_t rcx, uintptr_t result)
 
 static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_obj)
 {
-    uintptr_t tf_vtbl;
-    uintptr_t tf_vtbl_rva = 0;
-    uintptr_t q1;
-    uintptr_t q2;
-    uintptr_t sh2_vtbl;
-    uintptr_t sh2_vtbl_rva = 0;
     uintptr_t p200;
-    uintptr_t p200_deref;
-    uintptr_t field72;
-    uint32_t hi32 = 0;
-    uint32_t tag1 = 0;
-    uint32_t tag2 = 0;
-    char text1[160];
-    char text2[160];
-    BOOL loc1;
-    BOOL loc2;
+    uintptr_t desc;
+    uintptr_t desc_vtbl;
+    uintptr_t desc_vtbl_rva = 0;
+    uintptr_t line_loc;
+    uintptr_t speaker_wrap;
+    uintptr_t speaker_wrap_vtbl;
+    uintptr_t speaker_wrap_vtbl_rva = 0;
+    uintptr_t speaker_loc;
+    uint32_t line_tag = 0;
+    uint32_t speaker_tag = 0;
+    uint32_t speaker_wrap_tag = 0;
+    char line_text[160];
+    char speaker_text[160];
+    BOOL line_ok;
+    BOOL speaker_ok;
+    uint64_t dedupe_key;
 
-    if (this_obj == 0 || IsBadReadPtr((const void *)this_obj, 0xD0)) {
+    if (!is_stf_probe_window_open() || this_obj == 0) {
         return;
     }
 
-    ZeroMemory(text1, sizeof(text1));
-    ZeroMemory(text2, sizeof(text2));
-
-    tf_vtbl = safe_deref_qword(this_obj + 0x0);
-    if (g_image_base != 0 && tf_vtbl > g_image_base) {
-        tf_vtbl_rva = tf_vtbl - g_image_base;
-    }
-
-    q1 = safe_deref_qword(this_obj + 0x8);
-    q2 = safe_deref_qword(this_obj + 0x10);
-    loc1 = read_localized_text_resource(q1, &tag1, text1, sizeof(text1));
-    loc2 = read_localized_text_resource(q2, &tag2, text2, sizeof(text2));
-
-    sh2_vtbl = safe_deref_qword(this_obj + 0x88);
-    if (g_image_base != 0 && sh2_vtbl > g_image_base) {
-        sh2_vtbl_rva = sh2_vtbl - g_image_base;
-    }
+    ZeroMemory(line_text, sizeof(line_text));
+    ZeroMemory(speaker_text, sizeof(speaker_text));
 
     p200 = safe_deref_qword(this_obj + 200);
-    p200_deref = safe_deref_qword(p200);
-    field72 = safe_deref_qword(p200_deref + 72);
-    hi32 = read_identity_hi32(field72);
+    desc = safe_deref_qword(p200);
+    if (desc == 0) {
+        return;
+    }
+
+    desc_vtbl = safe_deref_qword(desc + 0x0);
+    if (g_image_base != 0 && desc_vtbl > g_image_base) {
+        desc_vtbl_rva = desc_vtbl - g_image_base;
+    }
+
+    line_loc = safe_deref_qword(desc + 0x48);
+    speaker_wrap = safe_deref_qword(desc + 0x50);
+    speaker_wrap_vtbl = safe_deref_qword(speaker_wrap + 0x0);
+    if (g_image_base != 0 && speaker_wrap_vtbl > g_image_base) {
+        speaker_wrap_vtbl_rva = speaker_wrap_vtbl - g_image_base;
+    }
+    speaker_wrap_tag = read_identity_hi32(speaker_wrap);
+    speaker_loc = safe_deref_qword(speaker_wrap + 0x28);
+
+    line_ok = read_localized_text_resource(line_loc, &line_tag, line_text, sizeof(line_text));
+    speaker_ok = read_localized_text_resource(speaker_loc, &speaker_tag, speaker_text, sizeof(speaker_text));
+    if (!line_ok && !speaker_ok) {
+        return;
+    }
+
+    dedupe_key = ((uint64_t)desc << 1) ^ ((uint64_t)line_loc >> 3) ^ ((uint64_t)speaker_loc << 7);
+    if (phase != NULL && phase[0] == 'p' && phase[1] == 'o') {
+        dedupe_key ^= 0x9E3779B97F4A7C15ull;
+    }
+    if (stf_probe_seen_or_mark(dedupe_key)) {
+        return;
+    }
 
     log_line(
-        "[stf-%s] tid=%lu this=0x%llx tf_vtbl_rva=0x%llx "
-        "q1=0x%llx loc1=%d tag1=0x%x text1=\"%s\" "
-        "q2=0x%llx loc2=%d tag2=0x%x text2=\"%s\" "
-        "sh2_vtbl_rva=0x%llx p200=0x%llx field72=0x%llx hi32=0x%x",
+        "[stf-%s] tid=%lu this=0x%llx p200=0x%llx desc=0x%llx desc_vtbl_rva=0x%llx "
+        "line=0x%llx ok=%d tag=0x%x text=\"%s\" "
+        "speaker_wrap=0x%llx wrap_vtbl_rva=0x%llx wrap_tag=0x%x "
+        "speaker=0x%llx ok=%d tag=0x%x text=\"%s\"",
         phase != NULL ? phase : "?",
         (unsigned long)GetCurrentThreadId(),
         (unsigned long long)this_obj,
-        (unsigned long long)tf_vtbl_rva,
-        (unsigned long long)q1,
-        loc1 ? 1 : 0,
-        (unsigned int)tag1,
-        text1,
-        (unsigned long long)q2,
-        loc2 ? 1 : 0,
-        (unsigned int)tag2,
-        text2,
-        (unsigned long long)sh2_vtbl_rva,
         (unsigned long long)p200,
-        (unsigned long long)field72,
-        (unsigned int)hi32);
+        (unsigned long long)desc,
+        (unsigned long long)desc_vtbl_rva,
+        (unsigned long long)line_loc,
+        line_ok ? 1 : 0,
+        (unsigned int)line_tag,
+        line_text,
+        (unsigned long long)speaker_wrap,
+        (unsigned long long)speaker_wrap_vtbl_rva,
+        (unsigned int)speaker_wrap_tag,
+        (unsigned long long)speaker_loc,
+        speaker_ok ? 1 : 0,
+        (unsigned int)speaker_tag,
+        speaker_text);
 }
 
 static BOOL identity_seen_or_mark(uintptr_t key)
@@ -1243,11 +2220,12 @@ static uintptr_t __fastcall hook_subtitle_producer(uintptr_t this_obj)
     uintptr_t pre_p200 = 0;
     uintptr_t pre_p200_deref = 0;
     uintptr_t pre_p200_field72 = 0;
-    uintptr_t previous_muted_family = SUBTITLE_FAMILY_NONE;
+    uintptr_t previous_current_family = SUBTITLE_FAMILY_NONE;
     uint32_t family = SUBTITLE_FAMILY_NONE;
-    BOOL mute_this_call = FALSE;
     uintptr_t result;
-    BOOL probe_enabled = (g_cfg.enable_builder_probe || g_cfg.enable_selector_probe);
+    BOOL probe_enabled = (g_cfg.enable_subtitle_producer_probe ||
+                          g_cfg.enable_builder_probe ||
+                          g_cfg.enable_selector_probe);
 
     if (probe_enabled) {
         log_start_talk_function_snapshot("pre", this_obj);
@@ -1258,11 +2236,8 @@ static uintptr_t __fastcall hook_subtitle_producer(uintptr_t this_obj)
         pre_p200_deref = safe_deref_qword(pre_p200);
         pre_p200_field72 = safe_deref_qword(pre_p200_deref + 72);
         family = classify_subtitle_family(pre_p200_field72);
-        if (g_cfg.enabled && should_mute_subtitle_family(family)) {
-            previous_muted_family = tls_get_muted_subtitle_family();
-            tls_set_muted_subtitle_family((uintptr_t)family);
-            mute_this_call = TRUE;
-        }
+        previous_current_family = tls_get_current_subtitle_family();
+        tls_set_current_subtitle_family((uintptr_t)family);
     }
 
     result = g_real_subtitle_producer(this_obj);
@@ -1271,11 +2246,127 @@ static uintptr_t __fastcall hook_subtitle_producer(uintptr_t this_obj)
         log_start_talk_function_snapshot("post", this_obj);
     }
 
-    if (mute_this_call) {
-        tls_set_muted_subtitle_family(previous_muted_family);
+    if (this_obj != 0) {
+        tls_set_current_subtitle_family(previous_current_family);
     }
 
     return result;
+}
+
+static uintptr_t __fastcall hook_start_talk_init(uintptr_t this_obj)
+{
+    uintptr_t result;
+    BOOL probe_enabled = (g_cfg.enable_subtitle_producer_probe ||
+                          g_cfg.enable_builder_probe ||
+                          g_cfg.enable_selector_probe);
+
+    if (probe_enabled) {
+        log_start_talk_function_snapshot("sti-pre", this_obj);
+    }
+
+    result = g_real_start_talk_init(this_obj);
+
+    if (probe_enabled) {
+        log_start_talk_function_snapshot("sti-post", this_obj);
+    }
+
+    return result;
+}
+
+static uintptr_t __fastcall hook_gameplay_sink(
+    uintptr_t rcx,
+    uintptr_t rdx,
+    uintptr_t r8,
+    uintptr_t r9,
+    uintptr_t a5,
+    uintptr_t a6,
+    uintptr_t a7,
+    uintptr_t a8,
+    uintptr_t a9)
+{
+    uintptr_t caller_ra = (uintptr_t)__builtin_return_address(0);
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+                               ? (caller_ra - g_image_base)
+                               : 0;
+    uint64_t dedupe_key;
+
+    if (g_cfg.enable_builder_probe && is_stf_probe_window_open()) {
+        uint32_t span_count = 0;
+        uintptr_t span_data = 0;
+        uint64_t candidate0[5];
+        unsigned int i;
+
+        dedupe_key = 0x350C70ull ^
+                     ((uint64_t)caller_rva << 1) ^
+                     ((uint64_t)(rdx >> 4)) ^
+                     ((uint64_t)(a6 >> 5)) ^
+                     ((uint64_t)(a7 >> 6)) ^
+                     ((uint64_t)((uint32_t)a5) << 32) ^
+                     (uint64_t)(uint32_t)a9;
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            ZeroMemory(candidate0, sizeof(candidate0));
+            if (a6 != 0 && !IsBadReadPtr((const void *)a6, 16)) {
+                span_count = *(const uint32_t *)(a6 + 0x0);
+                span_data = *(const uintptr_t *)(a6 + 0x8);
+                if (span_count != 0 && span_data != 0 &&
+                    !IsBadReadPtr((const void *)span_data, sizeof(candidate0))) {
+                    memcpy(candidate0, (const void *)span_data, sizeof(candidate0));
+                }
+            }
+
+            log_line(
+                "[350c70] tid=%lu caller_rva=0x%llx this=0x%llx arg2=0x%llx arg3=0x%x arg4=0x%llx "
+                "arg5=0x%x arg6=0x%llx {count=%u data=0x%llx c0=[0x%llx,0x%llx,0x%llx,0x%llx,0x%llx]} "
+                "arg7=0x%llx arg8=0x%x arg9=0x%x",
+                (unsigned long)GetCurrentThreadId(),
+                (unsigned long long)caller_rva,
+                (unsigned long long)rcx,
+                (unsigned long long)rdx,
+                (unsigned int)(uint32_t)r8,
+                (unsigned long long)r9,
+                (unsigned int)(uint32_t)a5,
+                (unsigned long long)a6,
+                (unsigned int)span_count,
+                (unsigned long long)span_data,
+                (unsigned long long)candidate0[0],
+                (unsigned long long)candidate0[1],
+                (unsigned long long)candidate0[2],
+                (unsigned long long)candidate0[3],
+                (unsigned long long)candidate0[4],
+                (unsigned long long)a7,
+                (unsigned int)(uint8_t)a8,
+                (unsigned int)(uint32_t)a9);
+
+            log_localized_hits_in_block(caller_rva, "arg2", rdx, 0x30);
+            log_localized_hits_in_block(caller_rva, "arg7", a7, 0x50);
+            if (r9 != 0) {
+                uint32_t tag = 0;
+                char text[160];
+                ZeroMemory(text, sizeof(text));
+                if (read_localized_text_resource(r9, &tag, text, sizeof(text))) {
+                    log_line(
+                        "[350c70-hit] caller_rva=0x%llx arg4 ptr=0x%llx tag=0x%x text=\"%s\"",
+                        (unsigned long long)caller_rva,
+                        (unsigned long long)r9,
+                        (unsigned int)tag,
+                        text);
+                }
+            }
+
+            if (span_count != 0 && span_data != 0) {
+                unsigned int max_entries = span_count;
+                if (max_entries > 4u) {
+                    max_entries = 4u;
+                }
+                for (i = 0; i < max_entries; ++i) {
+                    uintptr_t desc = safe_deref_qword(span_data + (uintptr_t)i * 0x28u);
+                    log_sentence_desc_probe("350c70-desc", caller_rva, i, desc);
+                }
+            }
+        }
+    }
+
+    return g_real_gameplay_sink(rcx, rdx, r8, r9, a5, a6, a7, a8, a9);
 }
 
 static uintptr_t builder_common(
@@ -1314,7 +2405,7 @@ static uintptr_t builder_common(
         msg_readable = TRUE;
     }
 
-    if (g_cfg.enable_builder_probe) {
+    if (g_cfg.enable_builder_probe && is_stf_probe_window_open()) {
         const char *klass = (id == BUILDER_ID_C)
             ? classify_builder_c_msg(msg_vtbl_rva, msg_words[1], msg_words[2], msg_words[3])
             : "n/a";
@@ -1384,7 +2475,7 @@ static uintptr_t __fastcall hook_selector_dispatch(uintptr_t rcx, uintptr_t rdx)
 {
     uintptr_t caller_ra = (uintptr_t)__builtin_return_address(0);
 
-    if (g_cfg.enable_selector_probe) {
+    if (g_cfg.enable_selector_probe && is_stf_probe_window_open()) {
         uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
                                    ? (caller_ra - g_image_base)
                                    : 0;
@@ -1435,6 +2526,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     unsigned int hook_count = 0;
     BOOL throw_recall_mute = FALSE;
     BOOL dialogue_mute = FALSE;
+    BOOL need_show_subtitle_hook = FALSE;
+    BOOL need_subtitle_producer_hook = FALSE;
+    BOOL show_subtitle_hook_installed = FALSE;
+    BOOL subtitle_runtime_surface_enabled = FALSE;
 
     ZeroMemory(&g_proxy_ctx, sizeof(g_proxy_ctx));
     if (ctx != NULL) {
@@ -1447,6 +2542,8 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     g_log_lock_inited = TRUE;
     InitializeCriticalSection(&g_identity_lock);
     g_identity_lock_inited = TRUE;
+    InitializeCriticalSection(&g_stf_probe_lock);
+    g_stf_probe_lock_inited = TRUE;
     InitializeCriticalSection(&g_hotkey_lock);
     g_hotkey_lock_inited = TRUE;
 
@@ -1463,36 +2560,49 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
             }
         }
     }
-    g_tls_muted_subtitle_family = TlsAlloc();
-    if (g_tls_muted_subtitle_family == TLS_OUT_OF_INDEXES) {
-        log_line("TlsAlloc failed: %lu", (unsigned long)GetLastError());
+    g_tls_current_subtitle_family = TlsAlloc();
+    if (g_tls_current_subtitle_family == TLS_OUT_OF_INDEXES) {
+        log_line("TlsAlloc(current_family) failed: %lu", (unsigned long)GetLastError());
     }
     g_tls_last_builder = TlsAlloc();
     if (g_tls_last_builder == TLS_OUT_OF_INDEXES) {
         log_line("TlsAlloc(last_builder) failed: %lu", (unsigned long)GetLastError());
     }
-    {
-        size_t bi;
-        for (bi = 0; bi < BUILDER_ID_COUNT; ++bi) {
-            InterlockedExchange(&g_builder_hit_counts[bi], 0);
-        }
-    }
-    InterlockedExchange(&g_session_counter, 0);
-    g_hotkey_f8_prev = FALSE;
+    reset_builder_hit_counts();
+    reset_strategy_stats();
+    reset_hotkey_runtime_state();
+    reset_session_probe_state();
+    InterlockedExchange(&g_subtitle_runtime_hits, 0);
+    InterlockedExchange(&g_subtitle_remove_hits, 0);
     seed_hotkey_state_from_config();
-    get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute);
+    get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &g_active_subtitle_strategy);
+    subtitle_runtime_surface_enabled = g_cfg.enable_subtitle_runtime_hooks;
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
     log_line(
-        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d throwRecallSubtitleMute=%d producerProbe=%d builderProbe=%d scannerMode=%u",
+        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d throwRecallSubtitleMute=%d activeStrategy=%s strategyDesc='%s' subtitleRuntime=%d familyTracking=%d producerProbe=%d builderProbe=%d selectorProbe=%d talkProbe=%d scannerMode=%u",
         g_cfg.enabled,
         g_cfg.verbose_log,
         g_cfg.enable_dollman_radio_mute,
         g_cfg.enable_throw_recall_subtitle_mute,
+        subtitle_strategy_name(g_active_subtitle_strategy),
+        subtitle_strategy_desc(g_active_subtitle_strategy),
+        subtitle_runtime_surface_enabled,
+        g_cfg.enable_subtitle_family_tracking,
         g_cfg.enable_subtitle_producer_probe,
         g_cfg.enable_builder_probe,
+        g_cfg.enable_selector_probe,
+        g_cfg.enable_talk_dispatcher_probe,
         (unsigned int)g_cfg.scanner_mode);
+
+    need_show_subtitle_hook =
+        subtitle_runtime_surface_enabled ||
+        g_cfg.enable_builder_probe;
+    need_subtitle_producer_hook =
+        g_cfg.enable_subtitle_producer_probe ||
+        g_cfg.enable_builder_probe ||
+        g_cfg.enable_subtitle_family_tracking;
 
     status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
@@ -1531,59 +2641,136 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("Dollman radio mute disabled by config");
     }
 
-    if (install_rva_hook(
-            k_rva_show_subtitle,
-            hook_show_subtitle,
-            (void **)&g_real_show_subtitle,
-            "GameViewGame.ShowSubtitle")) {
-        ++hook_count;
+    if (need_show_subtitle_hook) {
+        if (install_rva_hook(
+                k_rva_subtitle_runtime_wrapper,
+                hook_subtitle_runtime_wrapper,
+                (void **)&g_real_subtitle_runtime_wrapper,
+                "GameViewGame.SubtitleRuntime.sub_140780690")) {
+            show_subtitle_hook_installed = TRUE;
+            ++hook_count;
+        } else {
+            log_line("Subtitle runtime wrapper hook unavailable on this build");
+        }
+
+        if (install_rva_hook(
+                k_rva_show_subtitle,
+                hook_show_subtitle,
+                (void **)&g_real_show_subtitle,
+                "GameViewGame.ShowSubtitleSender.sub_140780740")) {
+            show_subtitle_hook_installed = TRUE;
+            ++hook_count;
+        } else {
+            log_line("Subtitle sender hook unavailable on this build");
+        }
+
+        if (install_rva_hook(
+                k_rva_remove_subtitle,
+                hook_remove_subtitle,
+                (void **)&g_real_remove_subtitle,
+                "GameViewGame.RemoveSubtitleSender.sub_140780840")) {
+            ++hook_count;
+        } else {
+            log_line("Subtitle remove sender hook unavailable on this build");
+        }
+    } else {
+        log_line("ShowSubtitle hook disabled by config");
     }
 
-    if (install_rva_hook(
-            k_rva_subtitle_producer,
-            hook_subtitle_producer,
-            (void **)&g_real_subtitle_producer,
-            "StartTalkFunction.slot15.producer")) {
-        ++hook_count;
+    if (subtitle_runtime_surface_enabled && !show_subtitle_hook_installed) {
+        log_line("Subtitle runtime surface requested but ShowSubtitle hook is unavailable on this build");
+    }
+
+    if (need_subtitle_producer_hook) {
+        if (install_rva_hook(
+                k_rva_subtitle_producer,
+                hook_subtitle_producer,
+                (void **)&g_real_subtitle_producer,
+                "StartTalkFunction.slot15.producer")) {
+            ++hook_count;
+        }
+    } else {
+        log_line("Subtitle producer hook disabled by config");
+    }
+
+    if (subtitle_runtime_surface_enabled &&
+        subtitle_strategy_uses_family_tracking(g_active_subtitle_strategy) &&
+        !g_cfg.enable_subtitle_family_tracking) {
+        log_line("ShowSubtitle payload family classification active: producer-side family tracking not required for active strategy");
+    }
+
+    if (g_cfg.enable_subtitle_producer_probe) {
+        if (install_rva_hook(
+                k_rva_start_talk_init,
+                hook_start_talk_init,
+                (void **)&g_real_start_talk_init,
+                "StartTalkFunction.init.sub_140387670")) {
+            ++hook_count;
+        }
+    } else {
+        log_line("Deep StartTalk init probe disabled by config");
     }
 
     if (g_cfg.enable_builder_probe) {
-        if (install_rva_hook(
-                k_rva_builder_a,
-                hook_builder_a,
-                (void **)&g_real_builder_a,
-                "BuilderA.sub_140350050")) {
-            ++hook_count;
+        if (g_cfg.enable_subtitle_producer_probe && k_rva_gameplay_sink != 0) {
+            if (install_rva_hook(
+                    k_rva_gameplay_sink,
+                    hook_gameplay_sink,
+                    (void **)&g_real_gameplay_sink,
+                    "GameplaySink.currentBuild")) {
+                ++hook_count;
+            }
+        } else if (g_cfg.enable_subtitle_producer_probe) {
+            log_line("GameplaySink interior hook quarantined on current build");
+        }
+        if (k_rva_builder_a != 0) {
+            if (install_rva_hook(
+                    k_rva_builder_a,
+                    hook_builder_a,
+                    (void **)&g_real_builder_a,
+                    "BuilderA.currentBuild")) {
+                ++hook_count;
+            }
+        } else {
+            log_line("BuilderA hook quarantined on current build: unresolved function entry");
         }
         if (install_rva_hook(
                 k_rva_builder_b,
                 hook_builder_b,
                 (void **)&g_real_builder_b,
-                "BuilderB.sub_140350460")) {
+                "BuilderB.sub_140350380")) {
             ++hook_count;
         }
         if (install_rva_hook(
                 k_rva_builder_c,
                 hook_builder_c,
                 (void **)&g_real_builder_c,
-                "BuilderC.sub_140350960")) {
+                "BuilderC.sub_140350790")) {
             ++hook_count;
         }
         if (install_rva_hook(
                 k_rva_builder_u1,
                 hook_builder_u1,
                 (void **)&g_real_builder_u1,
-                "BuilderU1.sub_140B5BC70")) {
+                "BuilderU1.sub_140B5BC60")) {
             ++hook_count;
         }
         if (install_rva_hook(
                 k_rva_builder_u2,
                 hook_builder_u2,
                 (void **)&g_real_builder_u2,
-                "BuilderU2.sub_140B5CC30")) {
+                "BuilderU2.sub_140B5CC20")) {
             ++hook_count;
         }
-        log_line("Builder probe armed: F8 = session boundary marker");
+        if (g_cfg.enable_subtitle_producer_probe) {
+            if (k_rva_gameplay_sink != 0) {
+                log_line("Builder probe armed: F8 = session boundary marker + 5s probe window, shared sink probe active");
+            } else {
+                log_line("Builder probe armed: F8 = session boundary marker + 5s probe window, shared sink probe quarantined on current build");
+            }
+        } else {
+            log_line("Builder probe armed: F8 = session boundary marker + 5s probe window");
+        }
     } else {
         log_line("Builder probe disabled by config");
     }
@@ -1593,27 +2780,28 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_selector_dispatch,
                 hook_selector_dispatch,
                 (void **)&g_real_selector_dispatch,
-                "SelectorDispatch.sub_140DAFAD0")) {
+                "SelectorDispatch.sub_140DAF8A0")) {
             ++hook_count;
         }
-        if (install_rva_hook(
-                k_rva_talk_dispatcher,
-                hook_talk_dispatcher,
-                (void **)&g_real_talk_dispatcher,
-                "TalkDispatcher.sub_1403857E0")) {
-            ++hook_count;
-        }
-        log_line("Selector dispatch probe armed (sub_140DAFAD0 + sub_1403857E0)");
+        log_line("Selector dispatch probe armed (sub_140DAF8A0)");
     } else {
         log_line("Selector dispatch probe disabled by config");
+    }
+
+    if (g_cfg.enable_talk_dispatcher_probe) {
+        log_line("TalkDispatcher probe remains quarantined on current build; not installed");
+    } else {
+        log_line("TalkDispatcher probe disabled by config");
     }
 
     g_hotkey_thread_handle = CreateThread(NULL, 0, hotkey_thread_proc, NULL, 0, NULL);
     if (g_hotkey_thread_handle != NULL) {
         log_line(
-            "Hotkeys active: J=throwRecall on, K=throwRecall off, N=dialogue on, M=dialogue off, F12=clear (startup throwRecall=%d dialogue=%d)",
+            "Hotkeys active: J=throwRecall on, K=throwRecall off, N=dialogue on, M=dialogue off, F12=clear, F1..F6=strategy (startup throwRecall=%d dialogue=%d activeStrategy=%s desc='%s')",
             throw_recall_mute ? 1 : 0,
-            dialogue_mute ? 1 : 0);
+            dialogue_mute ? 1 : 0,
+            subtitle_strategy_name(g_active_subtitle_strategy),
+            subtitle_strategy_desc(g_active_subtitle_strategy));
     } else {
         log_line("Failed to start hotkey thread");
     }
@@ -1641,6 +2829,13 @@ __declspec(dllexport) void core_shutdown(void)
         g_hotkey_thread_handle = NULL;
     }
 
+    restore_pointer_slot(
+        g_show_subtitle_vtable_slot,
+        g_show_subtitle_vtable_original,
+        "GameViewGame.vtbl[ShowSubtitle]");
+    g_show_subtitle_vtable_slot = NULL;
+    g_show_subtitle_vtable_original = NULL;
+
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
 
@@ -1652,12 +2847,27 @@ __declspec(dllexport) void core_shutdown(void)
         (long)g_builder_hit_counts[BUILDER_ID_U1],
         (long)g_builder_hit_counts[BUILDER_ID_U2],
         (long)g_session_counter);
+    {
+        size_t si;
+        for (si = 0; si < SUBTITLE_STRATEGY_COUNT; ++si) {
+            log_line(
+                "Strategy summary: name=%s evaluated=%ld wouldMute=%ld actualMute=%ld",
+                subtitle_strategy_name((uint32_t)si),
+                (long)g_strategy_stats[si].evaluated,
+                (long)g_strategy_stats[si].would_mute,
+                (long)g_strategy_stats[si].actual_mute);
+        }
+    }
 
     g_real_post_event_id = NULL;
     g_real_dollman_radio_play_voice_by_controller_delay = NULL;
     g_real_dollman_voice_dispatcher = NULL;
+    g_real_subtitle_runtime_wrapper = NULL;
     g_real_show_subtitle = NULL;
+    g_real_remove_subtitle = NULL;
     g_real_subtitle_producer = NULL;
+    g_real_start_talk_init = NULL;
+    g_real_gameplay_sink = NULL;
     g_real_builder_a = NULL;
     g_real_builder_b = NULL;
     g_real_builder_c = NULL;
@@ -1666,9 +2876,9 @@ __declspec(dllexport) void core_shutdown(void)
     g_real_selector_dispatch = NULL;
     g_real_talk_dispatcher = NULL;
 
-    if (g_tls_muted_subtitle_family != TLS_OUT_OF_INDEXES) {
-        TlsFree(g_tls_muted_subtitle_family);
-        g_tls_muted_subtitle_family = TLS_OUT_OF_INDEXES;
+    if (g_tls_current_subtitle_family != TLS_OUT_OF_INDEXES) {
+        TlsFree(g_tls_current_subtitle_family);
+        g_tls_current_subtitle_family = TLS_OUT_OF_INDEXES;
     }
     if (g_tls_last_builder != TLS_OUT_OF_INDEXES) {
         TlsFree(g_tls_last_builder);
@@ -1678,21 +2888,18 @@ __declspec(dllexport) void core_shutdown(void)
     g_identity_cache_count = 0;
     g_identity_cache_full_warned = FALSE;
     g_image_base = 0;
-
-    g_hotkey_j_prev = FALSE;
-    g_hotkey_k_prev = FALSE;
-    g_hotkey_n_prev = FALSE;
-    g_hotkey_m_prev = FALSE;
-    g_hotkey_f12_prev = FALSE;
-    g_hotkey_f8_prev = FALSE;
-    g_hotkey_f9_prev = FALSE;
-    InterlockedExchange(&g_session_counter, 0);
+    reset_session_probe_state();
+    reset_hotkey_runtime_state();
 
     log_line("core_shutdown complete");
 
     if (g_hotkey_lock_inited) {
         DeleteCriticalSection(&g_hotkey_lock);
         g_hotkey_lock_inited = FALSE;
+    }
+    if (g_stf_probe_lock_inited) {
+        DeleteCriticalSection(&g_stf_probe_lock);
+        g_stf_probe_lock_inited = FALSE;
     }
     if (g_identity_lock_inited) {
         DeleteCriticalSection(&g_identity_lock);

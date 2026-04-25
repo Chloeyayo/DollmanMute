@@ -1,12 +1,13 @@
 # DollmanMute
 
-`DollmanMute` is an ASI mod for `DEATH STRANDING 2 - ON THE BEACH` that mutes Dollman voice lines.
+`DollmanMute` is an ASI mod for `DEATH STRANDING 2 - ON THE BEACH` that mutes Dollman gameplay voice lines and subtitles.
 
 It does not replace game archives or modify packaged assets.
 
 ## What It Does
 
-- mutes Dollman voice lines
+- mutes Dollman gameplay voice lines
+- mutes Dollman gameplay subtitles with a current-build runtime hook
 - keeps ambient/world audio intact
 - works as a lightweight native ASI mod
 
@@ -18,8 +19,9 @@ It does not replace game archives or modify packaged assets.
 ## Installation
 
 1. Copy `DollmanMute.asi` to the game root folder
-2. Copy `DollmanMute.ini` to the game root folder
-3. Copy `version.dll` to the game root folder
+2. Copy `DollmanMuteCore.dll` to the game root folder
+3. Copy `DollmanMute.ini` to the game root folder
+4. Copy `version.dll` to the game root folder if you do not already have a working ASI loader
 
 Game root example:
 
@@ -32,7 +34,9 @@ Game root example:
 - `Enabled=1` enables the mod
 - `VerboseLog=0` is recommended for normal use
 - `VerboseLog=1` enables extra logging for troubleshooting
-- `EnablePlayerVoiceHooks=0` is the recommended default after game updates
+- `EnableDollmanRadioMute=1` enables Dollman voice muting
+- `EnableSubtitleRuntimeHooks=1` enables current-build subtitle muting
+- `EnableSelectorProbe=1` keeps the current-build selector research anchor enabled
 
 ## Troubleshooting
 
@@ -50,4 +54,4 @@ If the game receives an update, check this repository or the latest release page
 
 ## Future Plans
 
-- optional hiding of Dollman-only subtitles without affecting other subtitle lines
+- tighter current-build semantic muting above the subtitle tail

@@ -15,6 +15,53 @@ $destIni = Join-Path $gameRoot 'DollmanMute.ini'
 $srcIni = Join-Path $root 'DollmanMute.ini'
 $unloadFlag = Join-Path $gameRoot 'DollmanMute.unload'
 $loadFlag = Join-Path $gameRoot 'DollmanMute.load'
+$loaderDll = Join-Path $root 'release\DollmanMute-public-release-v1-with-loader\version.dll'
+$licenseSrc = Join-Path $root 'third_party\minhook\LICENSE.txt'
+$readmeSrc = Join-Path $root 'README.md'
+
+function Get-GitShortHash {
+    try {
+        $hash = (& git -C $root rev-parse --short HEAD 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $hash) {
+            return ($hash | Select-Object -First 1).Trim()
+        }
+    } catch {
+    }
+    return 'manual'
+}
+
+function New-ReleasePackage {
+    param(
+        [string]$PackageName,
+        [bool]$IncludeLoader
+    )
+
+    $packageDir = Join-Path $outDir $PackageName
+    $packageZip = "$packageDir.zip"
+
+    if (Test-Path $packageDir) {
+        Remove-Item -LiteralPath $packageDir -Recurse -Force
+    }
+    if (Test-Path $packageZip) {
+        Remove-Item -LiteralPath $packageZip -Force
+    }
+
+    New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+    Copy-Item -LiteralPath $proxyOut -Destination (Join-Path $packageDir 'DollmanMute.asi') -Force
+    Copy-Item -LiteralPath $coreOut -Destination (Join-Path $packageDir 'DollmanMuteCore.dll') -Force
+    Copy-Item -LiteralPath $srcIni -Destination (Join-Path $packageDir 'DollmanMute.ini') -Force
+    Copy-Item -LiteralPath $readmeSrc -Destination (Join-Path $packageDir 'README.md') -Force
+    if (Test-Path $licenseSrc) {
+        Copy-Item -LiteralPath $licenseSrc -Destination (Join-Path $packageDir 'LICENSE-MinHook.txt') -Force
+    }
+    if ($IncludeLoader -and (Test-Path $loaderDll)) {
+        Copy-Item -LiteralPath $loaderDll -Destination (Join-Path $packageDir 'version.dll') -Force
+    }
+
+    Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $packageZip -Force
+    return $packageZip
+}
 
 $zigCandidates = @()
 if ($Zig) { $zigCandidates += $Zig }
@@ -93,12 +140,16 @@ foreach ($artifact in $extraArtifacts) {
     }
 }
 
-Copy-Item -LiteralPath $coreOut -Destination $destCore -Force -ErrorAction SilentlyContinue
-if (-not $?) {
+$copied = $false
+try {
+    Copy-Item -LiteralPath $coreOut -Destination $destCore -Force -ErrorAction Stop
+    $copied = $true
+} catch {
+}
+if (-not $copied) {
     # Core locked by running game; ask proxy to unload, then retry.
     Write-Output "Core in use - triggering proxy unload via $unloadFlag"
     New-Item -ItemType File -Path $unloadFlag -Force | Out-Null
-    $copied = $false
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 200
         try {
@@ -116,18 +167,46 @@ if (-not $?) {
     New-Item -ItemType File -Path $loadFlag -Force | Out-Null
 }
 if (-not $CoreOnly) {
-    Copy-Item -LiteralPath $proxyOut -Destination $destAsi -Force
+    $proxyInstalled = $false
+    try {
+        Copy-Item -LiteralPath $proxyOut -Destination $destAsi -Force -ErrorAction Stop
+        $proxyInstalled = $true
+    } catch {
+        Write-Warning "ASI copy skipped because $destAsi is in use. Restart the game to replace the proxy."
+    }
+} else {
+    $proxyInstalled = $true
 }
 if (-not (Test-Path $destIni)) {
     Copy-Item -LiteralPath $srcIni -Destination $destIni
+}
+
+$cleanPackageZip = $null
+$withLoaderPackageZip = $null
+if (-not $CoreOnly) {
+    $gitShort = Get-GitShortHash
+    $cleanPackageZip = New-ReleasePackage -PackageName "DollmanMute-$gitShort-clean-build" -IncludeLoader:$false
+    if (Test-Path $loaderDll) {
+        $withLoaderPackageZip = New-ReleasePackage -PackageName "DollmanMute-$gitShort-with-loader" -IncludeLoader:$true
+    } else {
+        Write-Warning "Controlled version.dll not found at $loaderDll - skipping with-loader package"
+    }
 }
 
 if (-not $CoreOnly) {
     Write-Output "Built proxy: $proxyOut"
 }
 Write-Output "Built core:  $coreOut"
-if (-not $CoreOnly) {
+if (-not $CoreOnly -and $proxyInstalled) {
     Write-Output "Installed ASI:  $destAsi"
+} elseif (-not $CoreOnly) {
+    Write-Output "Installed ASI:  skipped (file in use)"
 }
 Write-Output "Installed Core: $destCore"
 Write-Output "Config: $destIni"
+if ($cleanPackageZip) {
+    Write-Output "Packaged clean build: $cleanPackageZip"
+}
+if ($withLoaderPackageZip) {
+    Write-Output "Packaged with-loader build: $withLoaderPackageZip"
+}

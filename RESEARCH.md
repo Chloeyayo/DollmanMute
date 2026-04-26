@@ -120,20 +120,25 @@ Player:
 - blanket 拦 `sub_140DAC7B0` 风险很高
 - 当前 voice 路和 subtitle 路已经证明属于同一套 talk/controller 生态，但**还没有**证明它们共享同一个最终 identity 字段
 
-### 1.5 当前 throw/recall 残余语音的 live 结论
+### 1.5 当前 throw/recall / equip 残余语音的 live 结论
 
-- 当前 build 下，throw/recall 残余语音已经通过 `PostEventID / Wwise` 被 live 坐实
-- 最关键的两个 eventId:
+- 当前 build 下，throw/recall/equip 残余语音已经通过 `PostEventID / Wwise` 被 live 坐实
+- 当前最关键的 eventId:
+  - `2995625663` = equip / 拿出 Dollman
   - `2820786646` = throw
   - `2978848044` = recall
 - 它们在 `F8` 窗口里会和 `SubtitleHit caller_rva=0x385C1B speaker_tag=0x12B6F line_tag=0x1F4` 紧邻出现
+- `2995625663` 的最新 live 证据更直接：
+  - 连续多段 `F8` 窗口里都出现 `Muted subtitle ... speaker_tag=0x12B6F line_tag=0x1F4`
+  - 紧接着 1 到 3ms 内出现 `[postevent] eventId=2995625663 ... blocked=0`
+  - 这证明“拿出 Dollman 还有声音”不是 subtitle pair 漂了，而是 sender-only 语音窄拦截漏了 `equip`
 - 当前抓到的 `PostEventID` caller RVA 统一落在:
   - `0x026B6846`
 - 这个 caller 本身区分度不高；真正有价值的是 **eventId**
-- 因此对当前残余 throw/recall 语音，最稳的工程切点已经不是 `DAC7B0 / DAC910`，而是这两个 Wwise eventId
+- 因此对当前残余 equip/throw/recall 语音，最稳的工程切点已经不是 `DAC7B0 / DAC910`，而是这组 Wwise eventId
 - 当前源码已经切到 sender-only 下的窄拦截版本：
-  - `research-v3.27f-postevent-narrow-block`
-  - sender-only 模式下只拦 `throw / recall` 这两个 eventId
+  - `research-v3.27g-postevent-equip-narrow-block`
+  - sender-only 模式下拦 `equip / throw / recall` 这三个 eventId
   - 同时保留 `F8` 窗口里的 `[postevent]` 观测
 
 ### 1.6 当前更高层的语义锚点

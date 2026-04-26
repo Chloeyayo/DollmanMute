@@ -112,7 +112,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "research-v3.27f-postevent-narrow-block";
+static const char *k_build_tag = "research-v3.27g-postevent-equip-narrow-block";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -265,6 +265,7 @@ static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COU
 static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = {
     'J', 'K', 'N', 'M', VK_F12, VK_F8, VK_F9
 };
+static const AkUniqueID k_event_id_dollman_equip = 2995625663u;
 static const AkUniqueID k_event_id_dollman_throw = 2820786646u;
 static const AkUniqueID k_event_id_dollman_recall = 2978848044u;
 
@@ -310,7 +311,7 @@ static BOOL g_hotkey_control_prev[HOTKEY_CONTROL_COUNT] = {FALSE};
 static volatile LONG g_session_counter = 0;
 
 static const AkUniqueID k_blocked_event_ids[] = {
-    2995625663u, /* equip */
+    k_event_id_dollman_equip, /* equip */
     k_event_id_dollman_throw,  /* throw */
     k_event_id_dollman_recall, /* recall */
     1966841225u, /* random chatter */
@@ -1053,7 +1054,8 @@ static BOOL should_block_sender_only_event_id(AkUniqueID event_id)
         return FALSE;
     }
 
-    return event_id == k_event_id_dollman_throw ||
+    return event_id == k_event_id_dollman_equip ||
+           event_id == k_event_id_dollman_throw ||
            event_id == k_event_id_dollman_recall;
 }
 
@@ -3294,7 +3296,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
             if (!effective_dollman_radio_mute && g_cfg.scanner_mode == SCANNER_MODE_OFF) {
                 if (sender_only_dollman_voice_mute) {
                     log_line(
-                        "PostEventID sender-only narrow mute active: throw/recall Wwise events are blocked; F8 windows also log audio events");
+                        "PostEventID sender-only narrow mute active: equip/throw/recall Wwise events are blocked; F8 windows also log audio events");
                 } else if (need_deep_probe) {
                     log_line("PostEventID passive probe active: F8 windows log audio events without legacy broad mute");
                 }

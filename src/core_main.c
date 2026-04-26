@@ -39,7 +39,7 @@ typedef AkPlayingID(__cdecl *PostEventIdFn)(
     uint32_t external_source_count,
     void *external_sources,
     uint32_t playing_id);
-typedef uintptr_t(__fastcall *DollmanRadioPlayVoiceByControllerDelayFn)(
+typedef uintptr_t(__fastcall *DollmanVoiceDelayScheduleFn)(
     uintptr_t instance,
     int controller_index);
 typedef uintptr_t(__fastcall *VoiceSharedHelperFn)(
@@ -99,7 +99,7 @@ static volatile LONG g_core_shutting_down = 0;
 static HANDLE g_hotkey_thread_handle = NULL;
 
 static PostEventIdFn g_real_post_event_id = NULL;
-static DollmanRadioPlayVoiceByControllerDelayFn g_real_dollman_radio_play_voice_by_controller_delay = NULL;
+static DollmanVoiceDelayScheduleFn g_real_dollman_voice_delay_schedule = NULL;
 static VoiceSharedHelperFn g_real_voice_shared_helper = NULL;
 static VoiceQueueSubmitFn g_real_voice_queue_submit = NULL;
 static DollmanVoiceDelayClosureFn g_real_dollman_voice_delay_closure = NULL;
@@ -112,7 +112,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "research-v3.27g-postevent-equip-narrow-block";
+static const char *k_build_tag = "research-v3.27l-random-postevent-block";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -152,21 +152,25 @@ static int g_stf_probe_cache_count = 0;
 static volatile LONG64 g_stf_probe_window_until_ms = 0;
 static CRITICAL_SECTION g_hotkey_lock;
 static BOOL g_hotkey_lock_inited = FALSE;
-static BOOL g_hotkey_throw_recall_mute = FALSE;
-static BOOL g_hotkey_dialogue_mute = FALSE;
 static DWORD g_tls_current_subtitle_family = TLS_OUT_OF_INDEXES;
 static volatile LONG g_subtitle_runtime_hits = 0;
 static volatile LONG g_subtitle_remove_hits = 0;
+static volatile LONG64 g_last_dowser_subtitle_ms = 0;
+static uint64_t g_last_dowser_key2 = 0;
+static uint64_t g_last_dowser_key3 = 0;
+static uintptr_t g_last_dowser_p6 = 0;
+static uintptr_t g_last_dowser_p7 = 0;
 
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
 /* Legacy broad audio hook names are kept for source continuity. On the current
  * build, 0x00C73BF0 lands in a ThroughDollmanInstance teardown path, not the
- * live delay wrapper. The Dollman-only runtime voice closure is 0x00C73EE0.
+ * live delay scheduler. The live Dollman delay scheduler is 0x00C73E30 and the
+ * Dollman-only runtime voice closure is 0x00C73EE0.
  * The old 0x00DAA410 "dispatcher" probe was a manager tick/update; the real
  * shared voice submit helper is 0x00DAC7B0. */
-static const uintptr_t k_rva_dollman_radio_play_voice_by_controller_delay = 0x00C73BF0u;
+static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C73E30u;
 static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C73EE0u;
 static const uintptr_t k_rva_voice_shared_helper = 0x00DAC7B0u;
 static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C73AEEu;
@@ -193,10 +197,16 @@ static const uintptr_t k_rva_gameplay_sink = 0u;
  * build; live sender now lands at 0x385C1B. */
 static const uint32_t k_dollman_gameplay_speaker_tag = 0x12b6fu;
 static const uintptr_t k_dollman_gameplay_caller_rva = 0x385c1bu;
+static const uint32_t k_dowser_gameplay_speaker_tag = 0x0e406u;
+static const uint32_t k_dowser_gameplay_line_tag = 0x0e404u;
 
 static const AkUniqueID k_scanner_event_id_1 = 4235852663u;
 static const AkUniqueID k_scanner_event_id_2 = 4094913469u;
 static const AkUniqueID k_scanner_event_id_3 = 2611919341u;
+static const AkUniqueID k_event_id_dowser_gameplay_chatter = 2134002697u;
+static const uint64_t k_dowser_ext0_sample = 0x47f324c09ull;
+static const AkUniqueID k_event_id_dollman_fall_chatter = 448888368u;
+static const uint64_t k_dollman_fall_chatter_ext0_sample = 0x41ac17e30ull;
 
 enum {
     SCANNER_MODE_OFF = 0u,
@@ -221,14 +231,9 @@ enum {
 };
 
 enum {
-    HOTKEY_CONTROL_THROW_RECALL_ON = 0u,
-    HOTKEY_CONTROL_THROW_RECALL_OFF = 1u,
-    HOTKEY_CONTROL_DIALOGUE_ON = 2u,
-    HOTKEY_CONTROL_DIALOGUE_OFF = 3u,
-    HOTKEY_CONTROL_CLEAR_ALL = 4u,
-    HOTKEY_CONTROL_SESSION_MARK = 5u,
-    HOTKEY_CONTROL_CLEAR_LOG = 6u,
-    HOTKEY_CONTROL_COUNT = 7u
+    HOTKEY_CONTROL_SESSION_MARK = 0u,
+    HOTKEY_CONTROL_CLEAR_LOG = 1u,
+    HOTKEY_CONTROL_COUNT = 2u
 };
 
 typedef struct ShowStrategyContext {
@@ -259,11 +264,11 @@ static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COU
     { "pair", "mute only when caller 0x385C1B and speaker tag 0x12B6F both match", VK_F2 },
     { "callerOnly", "mute everything from caller 0x385C1B", VK_F3 },
     { "speakerOnly", "mute everything with speaker tag 0x12B6F", VK_F4 },
-    { "selectedFamily", "mute only the subtitle families currently enabled by J/K/N/M", VK_F5 },
-    { "pairOrSelectedFamily", "mute when the gameplay pair matches or the selected family matches", VK_F6 }
+    { "selectedFamily", "mute only the subtitle families enabled by config defaults", VK_F5 },
+    { "pairOrSelectedFamily", "mute when the gameplay pair matches or the config-selected family matches", VK_F6 }
 };
 static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = {
-    'J', 'K', 'N', 'M', VK_F12, VK_F8, VK_F9
+    VK_F8, VK_F9
 };
 static const AkUniqueID k_event_id_dollman_equip = 2995625663u;
 static const AkUniqueID k_event_id_dollman_throw = 2820786646u;
@@ -349,7 +354,22 @@ static void reset_session_probe_state(void);
 static void reset_runtime_capture_counters(void);
 static void reset_identity_probe_cache(void);
 static void reset_log_capture_state(void);
-static void log_hotkey_mute_state(const char *key_name);
+static uint32_t get_active_subtitle_strategy(void);
+static BOOL is_dowser_gameplay_subtitle(
+    uintptr_t caller_rva,
+    uint32_t speaker_tag,
+    BOOL speaker_tag_valid,
+    uint32_t line_tag,
+    BOOL line_tag_valid);
+static void note_dowser_gameplay_subtitle(
+    uintptr_t caller_rva,
+    const uint64_t *words,
+    size_t word_count,
+    uint32_t speaker_tag,
+    uint32_t line_tag);
+static BOOL get_recent_dowser_subtitle_delta_ms(
+    ULONGLONG now_ms,
+    ULONGLONG *delta_ms_out);
 static void log_localized_hits_in_block(
     uintptr_t caller_rva,
     const char *label,
@@ -366,7 +386,10 @@ static BOOL is_subtitle_runtime_mute_enabled(void);
 static BOOL is_sender_only_runtime_mode_enabled(void);
 static BOOL is_legacy_dollman_radio_mute_enabled(void);
 static BOOL is_sender_only_dollman_radio_mute_enabled(void);
-static BOOL should_block_sender_only_event_id(AkUniqueID event_id);
+static BOOL should_block_sender_only_event_id(
+    AkUniqueID event_id,
+    uint32_t external_source_count,
+    uint64_t ext0);
 static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag);
 static uint32_t read_subtitle_runtime_prepare_token(void);
 static void log_subtitle_identity_probe(
@@ -386,6 +409,13 @@ static uintptr_t pass_through_subtitle_runtime_wrapper(
     uintptr_t view,
     uintptr_t arg2,
     const char *reason);
+static void log_pair_bypass_probe(
+    uint32_t active_strategy,
+    const ShowStrategyContext *ctx,
+    uint32_t line_tag,
+    BOOL line_tag_valid,
+    BOOL pair_match,
+    BOOL preamble_match);
 
 static const char *k_default_ini =
     "; DollmanMute runtime config.\n"
@@ -400,8 +430,8 @@ static const char *k_default_ini =
     ";   4=selectedFamily, 5=pairOrSelectedFamily.\n"
     ";   observe=never mute, pair=must match caller+speaker,\n"
     ";   callerOnly=only caller match, speakerOnly=only speaker match,\n"
-    ";   selectedFamily=respect J/K/N/M family toggles only,\n"
-    ";   pairOrSelectedFamily=either pair match or selected family match.\n"
+    ";   selectedFamily=respect config-selected families only,\n"
+    ";   pairOrSelectedFamily=either pair match or config-selected family match.\n"
     "; EnableSenderOnlyRuntimeMode=1 keeps active mute on the current\n"
     ";   ShowSubtitle sender surface only. It suppresses the legacy audio mute\n"
     ";   hooks and skips the older runtime wrapper to minimize blast radius.\n"
@@ -426,11 +456,6 @@ static const char *k_default_ini =
     ";   StartTalk/init/shared-sink deep research hooks.\n"
     "; EnableTalkDispatcherProbe=1 is currently unsafe on this build.\n"
     "; Runtime hotkeys:\n"
-    ";   J = throw/recall mute ON\n"
-    ";   K = throw/recall mute OFF\n"
-    ";   N = dollman dialogue mute ON\n"
-    ";   M = dollman dialogue mute OFF\n"
-    ";   F12 = clear all runtime subtitle mutes\n"
     ";   F1..F6 = switch active subtitle strategy\n"
     ";   F8  = mark session boundary + open 5s deep-probe window\n"
     ";   F9  = truncate DollmanMute.log (fresh capture)\n"
@@ -894,22 +919,16 @@ static void reset_log_capture_state(void)
     reset_runtime_capture_counters();
     reset_stf_probe_cache();
     reset_identity_probe_cache();
-}
-
-static void log_hotkey_mute_state(const char *key_name)
-{
-    log_line(
-        "HotkeyMute throwRecall=%d dialogue=%d key='%s'",
-        g_hotkey_throw_recall_mute ? 1 : 0,
-        g_hotkey_dialogue_mute ? 1 : 0,
-        key_name != NULL ? key_name : "?");
+    InterlockedExchange64(&g_last_dowser_subtitle_ms, 0);
+    g_last_dowser_key2 = 0;
+    g_last_dowser_key3 = 0;
+    g_last_dowser_p6 = 0;
+    g_last_dowser_p7 = 0;
 }
 
 static void seed_hotkey_state_from_config(void)
 {
     EnterCriticalSection(&g_hotkey_lock);
-    g_hotkey_throw_recall_mute = g_cfg.enable_throw_recall_subtitle_mute;
-    g_hotkey_dialogue_mute = FALSE;
     if (g_cfg.active_subtitle_strategy < SUBTITLE_STRATEGY_COUNT) {
         g_active_subtitle_strategy = g_cfg.active_subtitle_strategy;
     } else {
@@ -918,36 +937,91 @@ static void seed_hotkey_state_from_config(void)
     LeaveCriticalSection(&g_hotkey_lock);
 }
 
-static void get_hotkey_mute_state(
-    BOOL *throw_recall_mute,
-    BOOL *dialogue_mute,
-    uint32_t *active_strategy)
+static uint32_t get_active_subtitle_strategy(void)
 {
+    uint32_t active_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+
     EnterCriticalSection(&g_hotkey_lock);
-    if (throw_recall_mute != NULL) {
-        *throw_recall_mute = g_hotkey_throw_recall_mute;
-    }
-    if (dialogue_mute != NULL) {
-        *dialogue_mute = g_hotkey_dialogue_mute;
-    }
-    if (active_strategy != NULL) {
-        *active_strategy = g_active_subtitle_strategy;
-    }
+    active_strategy = g_active_subtitle_strategy;
     LeaveCriticalSection(&g_hotkey_lock);
+
+    return active_strategy;
+}
+
+static BOOL is_dowser_gameplay_subtitle(
+    uintptr_t caller_rva,
+    uint32_t speaker_tag,
+    BOOL speaker_tag_valid,
+    uint32_t line_tag,
+    BOOL line_tag_valid)
+{
+    return caller_rva == k_dollman_gameplay_caller_rva &&
+           speaker_tag_valid &&
+           line_tag_valid &&
+           speaker_tag == k_dowser_gameplay_speaker_tag &&
+           line_tag == k_dowser_gameplay_line_tag;
+}
+
+static void note_dowser_gameplay_subtitle(
+    uintptr_t caller_rva,
+    const uint64_t *words,
+    size_t word_count,
+    uint32_t speaker_tag,
+    uint32_t line_tag)
+{
+    ULONGLONG now_ms = GetTickCount64();
+
+    if (words != NULL) {
+        g_last_dowser_key2 = (word_count > 2) ? words[2] : 0;
+        g_last_dowser_key3 = (word_count > 3) ? words[3] : 0;
+        g_last_dowser_p6 = (uintptr_t)((word_count > 6) ? words[6] : 0);
+        g_last_dowser_p7 = (uintptr_t)((word_count > 7) ? words[7] : 0);
+    } else {
+        g_last_dowser_key2 = 0;
+        g_last_dowser_key3 = 0;
+        g_last_dowser_p6 = 0;
+        g_last_dowser_p7 = 0;
+    }
+    InterlockedExchange64(&g_last_dowser_subtitle_ms, (LONG64)now_ms);
+
+    if (is_stf_probe_window_open()) {
+        log_line(
+            "DowserSubtitleSample caller_rva=0x%llx speaker_tag=0x%x line_tag=0x%x q2=0x%llx q3=0x%llx p6=0x%llx p7=0x%llx",
+            (unsigned long long)caller_rva,
+            (unsigned int)speaker_tag,
+            (unsigned int)line_tag,
+            (unsigned long long)g_last_dowser_key2,
+            (unsigned long long)g_last_dowser_key3,
+            (unsigned long long)g_last_dowser_p6,
+            (unsigned long long)g_last_dowser_p7);
+    }
+}
+
+static BOOL get_recent_dowser_subtitle_delta_ms(
+    ULONGLONG now_ms,
+    ULONGLONG *delta_ms_out)
+{
+    LONG64 last_ms = InterlockedCompareExchange64(&g_last_dowser_subtitle_ms, 0, 0);
+    ULONGLONG delta_ms = 0;
+
+    if (delta_ms_out != NULL) {
+        *delta_ms_out = 0;
+    }
+    if (last_ms <= 0 || now_ms < (ULONGLONG)last_ms) {
+        return FALSE;
+    }
+
+    delta_ms = now_ms - (ULONGLONG)last_ms;
+    if (delta_ms_out != NULL) {
+        *delta_ms_out = delta_ms;
+    }
+    return delta_ms <= 500ull;
 }
 
 static BOOL is_selected_subtitle_family(uint32_t family)
 {
-    BOOL throw_recall_mute = FALSE;
-    BOOL dialogue_mute = FALSE;
-
-    get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, NULL);
-
     if (family == SUBTITLE_FAMILY_THROW_RECALL) {
-        return throw_recall_mute;
-    }
-    if (family == SUBTITLE_FAMILY_DIALOGUE) {
-        return dialogue_mute;
+        return g_cfg.enable_throw_recall_subtitle_mute;
     }
     return FALSE;
 }
@@ -1017,6 +1091,14 @@ static BOOL is_gameplay_dollman_pair(
            speaker_tag == k_dollman_gameplay_speaker_tag;
 }
 
+static BOOL should_mute_gameplay_throw_recall_preamble(const ShowStrategyContext *ctx)
+{
+    return ctx != NULL &&
+           !ctx->speaker_tag_valid &&
+           ctx->caller_rva == k_dollman_gameplay_caller_rva &&
+           ctx->current_family == SUBTITLE_FAMILY_THROW_RECALL;
+}
+
 static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy)
 {
     return strategy == SUBTITLE_STRATEGY_SELECTED_FAMILY ||
@@ -1048,7 +1130,26 @@ static BOOL is_sender_only_dollman_radio_mute_enabled(void)
            is_sender_only_runtime_mode_enabled();
 }
 
-static BOOL should_block_sender_only_event_id(AkUniqueID event_id)
+static BOOL is_sender_only_random_chatter_event(
+    AkUniqueID event_id,
+    uint32_t external_source_count,
+    uint64_t ext0)
+{
+    if (external_source_count != 1u) {
+        return FALSE;
+    }
+
+    if (event_id == k_event_id_dollman_fall_chatter) {
+        return ext0 == k_dollman_fall_chatter_ext0_sample;
+    }
+
+    return FALSE;
+}
+
+static BOOL should_block_sender_only_event_id(
+    AkUniqueID event_id,
+    uint32_t external_source_count,
+    uint64_t ext0)
 {
     if (!is_sender_only_dollman_radio_mute_enabled()) {
         return FALSE;
@@ -1056,7 +1157,11 @@ static BOOL should_block_sender_only_event_id(AkUniqueID event_id)
 
     return event_id == k_event_id_dollman_equip ||
            event_id == k_event_id_dollman_throw ||
-           event_id == k_event_id_dollman_recall;
+           event_id == k_event_id_dollman_recall ||
+           is_sender_only_random_chatter_event(
+               event_id,
+               external_source_count,
+               ext0);
 }
 
 static uint32_t read_subtitle_runtime_prepare_token(void)
@@ -1201,7 +1306,8 @@ static BOOL should_mute_show_ctx(const ShowStrategyContext *ctx, uint32_t strate
     case SUBTITLE_STRATEGY_OBSERVE:
         return FALSE;
     case SUBTITLE_STRATEGY_GAMEPLAY_PAIR:
-        return is_gameplay_dollman_pair(ctx->caller_rva, ctx->speaker_tag, ctx->speaker_tag_valid);
+        return is_gameplay_dollman_pair(ctx->caller_rva, ctx->speaker_tag, ctx->speaker_tag_valid) ||
+               should_mute_gameplay_throw_recall_preamble(ctx);
     case SUBTITLE_STRATEGY_CALLER_ONLY:
         return ctx->caller_rva == k_dollman_gameplay_caller_rva;
     case SUBTITLE_STRATEGY_SPEAKER_ONLY:
@@ -1237,7 +1343,7 @@ static BOOL process_subtitle_payload(
     LONG hit_index = 0;
     uint32_t i;
 
-    get_hotkey_mute_state(NULL, NULL, &active_strategy);
+    active_strategy = get_active_subtitle_strategy();
 
     if (payload != NULL && !IsBadReadPtr(payload, sizeof(words))) {
         memcpy(words, payload, sizeof(words));
@@ -1269,6 +1375,20 @@ static BOOL process_subtitle_payload(
     strategy_ctx.speaker_tag = speaker_tag;
     strategy_ctx.speaker_tag_valid = speaker_tag_valid;
     strategy_ctx.last_builder = last_builder;
+
+    if (is_dowser_gameplay_subtitle(
+            caller_rva,
+            speaker_tag,
+            speaker_tag_valid,
+            line_tag,
+            line_tag_valid)) {
+        note_dowser_gameplay_subtitle(
+            caller_rva,
+            words,
+            sizeof(words) / sizeof(words[0]),
+            speaker_tag,
+            line_tag);
+    }
 
     for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
         BOOL would_mute = should_mute_show_ctx(&strategy_ctx, i);
@@ -1415,22 +1535,19 @@ static void update_hotkey_mute_state(void)
 
     if (key_control_down[HOTKEY_CONTROL_SESSION_MARK] &&
         !g_hotkey_control_prev[HOTKEY_CONTROL_SESSION_MARK]) {
-        BOOL throw_recall_mute = FALSE;
-        BOOL dialogue_mute = FALSE;
         uint32_t active_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
         LONG counter = InterlockedIncrement(&g_session_counter);
         ULONGLONG until_ms = GetTickCount64() + 5000ull;
         InterlockedExchange64(&g_stf_probe_window_until_ms, (LONG64)until_ms);
         reset_stf_probe_cache();
         reset_runtime_capture_counters();
-        get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &active_strategy);
+        active_strategy = get_active_subtitle_strategy();
         log_line("=== session boundary F8 count=%ld ===", (long)counter);
         log_line(
-            "StrategySession active=%s desc='%s' throwRecall=%d dialogue=%d",
+            "StrategySession active=%s desc='%s' throwRecallDefault=%d",
             subtitle_strategy_name(active_strategy),
             subtitle_strategy_desc(active_strategy),
-            throw_recall_mute ? 1 : 0,
-            dialogue_mute ? 1 : 0);
+            g_cfg.enable_throw_recall_subtitle_mute ? 1 : 0);
     }
 
     if (key_control_down[HOTKEY_CONTROL_CLEAR_LOG] &&
@@ -1441,33 +1558,6 @@ static void update_hotkey_mute_state(void)
     }
 
     EnterCriticalSection(&g_hotkey_lock);
-
-    if (key_control_down[HOTKEY_CONTROL_THROW_RECALL_ON] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_THROW_RECALL_ON]) {
-        g_hotkey_throw_recall_mute = TRUE;
-        log_hotkey_mute_state("J");
-    }
-    if (key_control_down[HOTKEY_CONTROL_THROW_RECALL_OFF] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_THROW_RECALL_OFF]) {
-        g_hotkey_throw_recall_mute = FALSE;
-        log_hotkey_mute_state("K");
-    }
-    if (key_control_down[HOTKEY_CONTROL_DIALOGUE_ON] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_DIALOGUE_ON]) {
-        g_hotkey_dialogue_mute = TRUE;
-        log_hotkey_mute_state("N");
-    }
-    if (key_control_down[HOTKEY_CONTROL_DIALOGUE_OFF] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_DIALOGUE_OFF]) {
-        g_hotkey_dialogue_mute = FALSE;
-        log_hotkey_mute_state("M");
-    }
-    if (key_control_down[HOTKEY_CONTROL_CLEAR_ALL] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_CLEAR_ALL]) {
-        g_hotkey_throw_recall_mute = FALSE;
-        g_hotkey_dialogue_mute = FALSE;
-        log_hotkey_mute_state("F12");
-    }
     for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
         if (key_strategy_down[i] && !g_hotkey_strategy_prev[i]) {
             g_active_subtitle_strategy = i;
@@ -1682,8 +1772,11 @@ static AkPlayingID __cdecl hook_post_event_id(
          g_cfg.enable_deep_probe ||
          is_sender_only_dollman_radio_mute_enabled());
     BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
-    BOOL blocked_sender_only = g_cfg.enabled && should_block_sender_only_event_id(event_id);
-    BOOL blocked = blocked_legacy || blocked_sender_only;
+    BOOL blocked_sender_only = FALSE;
+    BOOL blocked = FALSE;
+    BOOL dowser_event_match = FALSE;
+    BOOL dowser_ext_match = FALSE;
+    BOOL dowser_recent = FALSE;
     const char *block_mode = blocked_sender_only ? "sender-only-narrow" :
                              (blocked_legacy ? "legacy" : "none");
     uintptr_t caller_ra = get_return_address_value();
@@ -1693,7 +1786,19 @@ static AkPlayingID __cdecl hook_post_event_id(
     uintptr_t ext_ptr = (uintptr_t)external_sources;
     uint64_t ext0 = safe_read_u64(ext_ptr + 0x0);
     uint64_t ext1 = safe_read_u64(ext_ptr + 0x8);
+    uint64_t ext2 = safe_read_u64(ext_ptr + 0x10);
+    uint64_t ext3 = safe_read_u64(ext_ptr + 0x18);
     uint64_t dedupe_key = 0;
+    ULONGLONG dowser_delta_ms = 0;
+    ULONGLONG now_ms = GetTickCount64();
+
+    blocked_sender_only =
+        g_cfg.enabled &&
+        should_block_sender_only_event_id(
+            event_id,
+            external_source_count,
+            ext0);
+    blocked = blocked_legacy || blocked_sender_only;
 
     if (probe_enabled) {
         dedupe_key = ((uint64_t)event_id) ^
@@ -1701,8 +1806,8 @@ static AkPlayingID __cdecl hook_post_event_id(
                      (((uint64_t)(uint32_t)external_source_count) << 19) ^
                      (((uint64_t)game_object_id) >> 7) ^
                      (((uint64_t)ext0) << 3) ^
-                     (((uint64_t)ext1) >> 11) ^
-                     0x504F53544556454Eull;
+                    (((uint64_t)ext1) >> 11) ^
+                    0x504F53544556454Eull;
         if (!stf_probe_seen_or_mark(dedupe_key)) {
             log_line(
                 "[postevent] caller_rva=0x%llx eventId=%u gameObject=0x%llx externalSources=%u ext_ptr=0x%llx ext0=0x%llx ext1=0x%llx blocked=%d playingIdIn=%u",
@@ -1715,6 +1820,33 @@ static AkPlayingID __cdecl hook_post_event_id(
                 (unsigned long long)ext1,
                 blocked ? 1 : 0,
                 (unsigned int)playing_id);
+        }
+
+        dowser_event_match = event_id == k_event_id_dowser_gameplay_chatter;
+        dowser_ext_match = ext0 == k_dowser_ext0_sample;
+        dowser_recent =
+            external_source_count == 1 &&
+            get_recent_dowser_subtitle_delta_ms(now_ms, &dowser_delta_ms);
+        if (dowser_event_match || dowser_ext_match || dowser_recent) {
+            log_line(
+                "DowserPostEventCandidate caller_rva=0x%llx eventId=%u extCount=%u ext0=0x%llx ext1=0x%llx ext2=0x%llx ext3=0x%llx "
+                "eventMatch=%d ext0Match=%d recentSubtitle=%d deltaMs=%llu key2=0x%llx key3=0x%llx p6=0x%llx p7=0x%llx blocked=%d",
+                (unsigned long long)caller_rva,
+                (unsigned int)event_id,
+                (unsigned int)external_source_count,
+                (unsigned long long)ext0,
+                (unsigned long long)ext1,
+                (unsigned long long)ext2,
+                (unsigned long long)ext3,
+                dowser_event_match ? 1 : 0,
+                dowser_ext_match ? 1 : 0,
+                dowser_recent ? 1 : 0,
+                (unsigned long long)dowser_delta_ms,
+                (unsigned long long)g_last_dowser_key2,
+                (unsigned long long)g_last_dowser_key3,
+                (unsigned long long)g_last_dowser_p6,
+                (unsigned long long)g_last_dowser_p7,
+                blocked ? 1 : 0);
         }
     }
 
@@ -1754,19 +1886,41 @@ static AkPlayingID __cdecl hook_post_event_id(
         playing_id);
 }
 
-static uintptr_t __fastcall hook_dollman_radio_play_voice_by_controller_delay(
+static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
     uintptr_t instance,
     int controller_index)
 {
-    if (is_legacy_dollman_radio_mute_enabled()) {
+    BOOL sender_only_block = is_sender_only_dollman_radio_mute_enabled();
+    BOOL legacy_block = is_legacy_dollman_radio_mute_enabled();
+    BOOL probe_enabled =
+        (g_cfg.enable_deep_probe || sender_only_block) &&
+        is_stf_probe_window_open();
+    uintptr_t caller_ra = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+        ? (caller_ra - g_image_base)
+        : 0;
+
+    if (probe_enabled) {
         log_line(
-            "Muted DollmanRadio.PlayVoiceByControllerDelay instance=%p controller=%d",
+            "[voice-delay-schedule] tid=%lu caller_rva=0x%llx instance=%p controller=%d block=%d",
+            (unsigned long)GetCurrentThreadId(),
+            (unsigned long long)caller_rva,
+            (void *)instance,
+            controller_index,
+            (sender_only_block || legacy_block) ? 1 : 0);
+    }
+
+    if (sender_only_block || legacy_block) {
+        log_line(
+            "Muted Dollman voice delay schedule mode=%s caller_rva=0x%llx instance=%p controller=%d",
+            sender_only_block ? "sender-only" : "legacy",
+            (unsigned long long)caller_rva,
             (void *)instance,
             controller_index);
         return 0;
     }
 
-    return g_real_dollman_radio_play_voice_by_controller_delay(instance, controller_index);
+    return g_real_dollman_voice_delay_schedule(instance, controller_index);
 }
 
 static char __fastcall hook_voice_queue_submit(
@@ -3173,8 +3327,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
 {
     MH_STATUS status;
     unsigned int hook_count = 0;
-    BOOL throw_recall_mute = FALSE;
-    BOOL dialogue_mute = FALSE;
     BOOL need_show_subtitle_hook = FALSE;
     BOOL need_subtitle_producer_hook = FALSE;
     BOOL show_subtitle_hook_installed = FALSE;
@@ -3184,6 +3336,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     BOOL sender_only_dollman_voice_mute = FALSE;
     BOOL install_subtitle_runtime_wrapper = FALSE;
     BOOL need_deep_probe = FALSE;
+    BOOL need_voice_delay_schedule_hook = FALSE;
     BOOL need_voice_dispatch_hook = FALSE;
     BOOL need_voice_closure_hook = FALSE;
 
@@ -3230,7 +3383,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     reset_session_probe_state();
     reset_log_capture_state();
     seed_hotkey_state_from_config();
-    get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &g_active_subtitle_strategy);
+    g_active_subtitle_strategy = get_active_subtitle_strategy();
     subtitle_runtime_surface_enabled = g_cfg.enable_subtitle_runtime_hooks;
     sender_only_runtime_mode = is_sender_only_runtime_mode_enabled();
     sender_only_dollman_voice_mute = is_sender_only_dollman_radio_mute_enabled();
@@ -3240,6 +3393,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         !sender_only_runtime_mode &&
         g_cfg.enable_legacy_runtime_wrapper;
     need_deep_probe = g_cfg.enable_deep_probe;
+    need_voice_delay_schedule_hook =
+        effective_dollman_radio_mute ||
+        sender_only_dollman_voice_mute ||
+        need_deep_probe;
     need_voice_dispatch_hook =
         sender_only_dollman_voice_mute ||
         need_deep_probe;
@@ -3296,7 +3453,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
             if (!effective_dollman_radio_mute && g_cfg.scanner_mode == SCANNER_MODE_OFF) {
                 if (sender_only_dollman_voice_mute) {
                     log_line(
-                        "PostEventID sender-only narrow mute active: equip/throw/recall Wwise events are blocked; F8 windows also log audio events");
+                        "PostEventID sender-only narrow mute active: action and proven random-chatter Wwise events are blocked; F8 windows also log audio events");
                 } else if (need_deep_probe) {
                     log_line("PostEventID passive probe active: F8 windows log audio events without legacy broad mute");
                 }
@@ -3306,20 +3463,21 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("Legacy PostEvent mute path disabled");
     }
 
-    if (effective_dollman_radio_mute) {
+    if (need_voice_delay_schedule_hook) {
         if (install_rva_hook(
-                k_rva_dollman_radio_play_voice_by_controller_delay,
-                hook_dollman_radio_play_voice_by_controller_delay,
-                (void **)&g_real_dollman_radio_play_voice_by_controller_delay,
-                "DollmanRadio.PlayVoiceByControllerDelay")) {
+                k_rva_dollman_voice_delay_schedule,
+                hook_dollman_voice_delay_schedule,
+                (void **)&g_real_dollman_voice_delay_schedule,
+                "DollmanVoiceDelaySchedule.sub_140C73E30")) {
             ++hook_count;
+            if (sender_only_dollman_voice_mute) {
+                log_line("Sender-only Dollman voice mute active via schedule.sub_140C73E30");
+            } else if (effective_dollman_radio_mute) {
+                log_line("Legacy Dollman voice mute active via schedule.sub_140C73E30");
+            }
         }
     } else {
-        if (g_cfg.enable_dollman_radio_mute && sender_only_runtime_mode) {
-            log_line("Dollman radio mute suppressed by sender-only runtime mode");
-        } else {
-            log_line("Dollman radio mute disabled by config");
-        }
+        log_line("Dollman voice delay schedule hook disabled");
     }
 
     if (need_voice_dispatch_hook) {
@@ -3531,9 +3689,8 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     g_hotkey_thread_handle = CreateThread(NULL, 0, hotkey_thread_proc, NULL, 0, NULL);
     if (g_hotkey_thread_handle != NULL) {
         log_line(
-            "Hotkeys active: J=throwRecall on, K=throwRecall off, N=dialogue on, M=dialogue off, F12=clear, F1..F6=strategy (startup throwRecall=%d dialogue=%d activeStrategy=%s desc='%s')",
-            throw_recall_mute ? 1 : 0,
-            dialogue_mute ? 1 : 0,
+            "Hotkeys active: F1..F6=strategy, F8=session boundary, F9=clear log (throwRecallDefault=%d activeStrategy=%s desc='%s')",
+            g_cfg.enable_throw_recall_subtitle_mute ? 1 : 0,
             subtitle_strategy_name(g_active_subtitle_strategy),
             subtitle_strategy_desc(g_active_subtitle_strategy));
     } else {
@@ -3594,7 +3751,7 @@ __declspec(dllexport) void core_shutdown(void)
     }
 
     g_real_post_event_id = NULL;
-    g_real_dollman_radio_play_voice_by_controller_delay = NULL;
+    g_real_dollman_voice_delay_schedule = NULL;
     g_real_voice_shared_helper = NULL;
     g_real_voice_queue_submit = NULL;
     g_real_dollman_voice_delay_closure = NULL;

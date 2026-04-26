@@ -18,6 +18,7 @@ typedef struct Config {
     BOOL enable_dollman_radio_mute;
     BOOL enable_throw_recall_subtitle_mute;
     uint32_t active_subtitle_strategy;
+    BOOL enable_sender_only_runtime_mode;
     BOOL enable_subtitle_runtime_hooks;
     BOOL enable_subtitle_family_tracking;
     BOOL enable_subtitle_producer_probe;
@@ -45,6 +46,7 @@ typedef uintptr_t(__fastcall *DollmanVoiceDispatcherFn)(
     uintptr_t param32,
     int mode,
     int *sentence_key);
+typedef void(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
 typedef uintptr_t(__fastcall *SubtitleRuntimeWrapperFn)(uintptr_t view, uintptr_t arg2);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
 typedef uintptr_t(__fastcall *RemoveSubtitleFn)(uintptr_t view, const uint64_t *key_pair, char mode);
@@ -90,6 +92,7 @@ static HANDLE g_hotkey_thread_handle = NULL;
 static PostEventIdFn g_real_post_event_id = NULL;
 static DollmanRadioPlayVoiceByControllerDelayFn g_real_dollman_radio_play_voice_by_controller_delay = NULL;
 static DollmanVoiceDispatcherFn g_real_dollman_voice_dispatcher = NULL;
+static DollmanVoiceDelayClosureFn g_real_dollman_voice_delay_closure = NULL;
 static SubtitleRuntimeWrapperFn g_real_subtitle_runtime_wrapper = NULL;
 static ShowSubtitleFn g_real_show_subtitle = NULL;
 static RemoveSubtitleFn g_real_remove_subtitle = NULL;
@@ -99,7 +102,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "research-v3.25c-subtitle-decode-fix";
+static const char *k_build_tag = "research-v3.26a-dollman-voice-closure";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -148,7 +151,11 @@ static volatile LONG g_subtitle_remove_hits = 0;
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
+/* Legacy broad audio hook names are kept for source continuity. On the current
+ * build, 0x00C73BF0 lands in a ThroughDollmanInstance teardown path, not the
+ * live delay wrapper. The Dollman-only runtime voice closure is 0x00C73EE0. */
 static const uintptr_t k_rva_dollman_radio_play_voice_by_controller_delay = 0x00C73BF0u;
+static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C73EE0u;
 static const uintptr_t k_rva_dollman_voice_dispatcher = 0x00DAA410u;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780690u;
 static const uintptr_t k_rva_show_subtitle = 0x00780740u;
@@ -344,8 +351,9 @@ static BOOL process_subtitle_payload(
 static const char *k_default_ini =
     "; DollmanMute runtime config.\n"
     "; VerboseLog=1 enables per-event mute logging for debugging.\n"
-    "; EnableDollmanRadioMute=1 enables the old audio mute path.\n"
-    ";   Keep 0 while testing the new subtitle-family hotkeys.\n"
+    "; EnableDollmanRadioMute=1 enables the current audio mute path.\n"
+    ";   In sender-only mode it uses the Dollman-only voice closure path.\n"
+    ";   Outside sender-only mode it falls back to the older broad legacy path.\n"
     ";   (hat/glasses reactions etc) together with their subtitles.\n"
     "; EnableThrowRecallSubtitleMute=1 sets startup default for throw/recall mute.\n"
     "; ActiveSubtitleStrategy selects which subtitle strategy actually mutes.\n"
@@ -355,6 +363,9 @@ static const char *k_default_ini =
     ";   callerOnly=only caller match, speakerOnly=only speaker match,\n"
     ";   selectedFamily=respect J/K/N/M family toggles only,\n"
     ";   pairOrSelectedFamily=either pair match or selected family match.\n"
+    "; EnableSenderOnlyRuntimeMode=1 keeps active mute on the current\n"
+    ";   ShowSubtitle sender surface only. It suppresses the legacy audio mute\n"
+    ";   hooks and skips the older runtime wrapper to minimize blast radius.\n"
     "; EnableSubtitleRuntimeHooks=1 arms ShowSubtitle-side runtime muting.\n"
     ";   Current research default keeps this ON.\n"
     "; EnableSubtitleFamilyTracking=1 keeps the older producer-side family probe\n"
@@ -392,6 +403,7 @@ static const char *k_default_ini =
     "EnableDollmanRadioMute=1\n"
     "EnableThrowRecallSubtitleMute=0\n"
     "ActiveSubtitleStrategy=1\n"
+    "EnableSenderOnlyRuntimeMode=1\n"
     "EnableSubtitleRuntimeHooks=1\n"
     "EnableSubtitleFamilyTracking=0\n"
     "EnableSubtitleProducerProbe=0\n"
@@ -487,6 +499,7 @@ static void load_config(void)
     g_cfg.enable_dollman_radio_mute = TRUE;
     g_cfg.enable_throw_recall_subtitle_mute = FALSE;
     g_cfg.active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
+    g_cfg.enable_sender_only_runtime_mode = TRUE;
     g_cfg.enable_subtitle_runtime_hooks = TRUE;
     g_cfg.enable_subtitle_family_tracking = FALSE;
     g_cfg.enable_subtitle_producer_probe = FALSE;
@@ -514,6 +527,11 @@ static void load_config(void)
         "ActiveSubtitleStrategy",
         (int)g_cfg.active_subtitle_strategy,
         g_ini_path);
+    g_cfg.enable_sender_only_runtime_mode = GetPrivateProfileIntA(
+        "General",
+        "EnableSenderOnlyRuntimeMode",
+        g_cfg.enable_sender_only_runtime_mode,
+        g_ini_path) != 0;
     g_cfg.enable_subtitle_runtime_hooks = GetPrivateProfileIntA(
         "General",
         "EnableSubtitleRuntimeHooks",
@@ -1583,6 +1601,18 @@ static uintptr_t __fastcall hook_dollman_voice_dispatcher(
     return g_real_dollman_voice_dispatcher(lock_obj, radio_instance, param32, mode, sentence_key);
 }
 
+static void __fastcall hook_dollman_voice_delay_closure(void *closure_state)
+{
+    if (g_cfg.enabled && g_cfg.enable_dollman_radio_mute) {
+        log_line(
+            "Muted Dollman voice closure state=%p",
+            closure_state);
+        return;
+    }
+
+    g_real_dollman_voice_delay_closure(closure_state);
+}
+
 static uintptr_t __fastcall hook_talk_dispatcher(uintptr_t *a1, uintptr_t *i)
 {
     /* v3.16 probe: sub_1403857E0 is DSTalkInternal::StartTalkFunction's event
@@ -2530,6 +2560,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     BOOL need_subtitle_producer_hook = FALSE;
     BOOL show_subtitle_hook_installed = FALSE;
     BOOL subtitle_runtime_surface_enabled = FALSE;
+    BOOL sender_only_runtime_mode = FALSE;
+    BOOL effective_dollman_radio_mute = FALSE;
+    BOOL sender_only_dollman_voice_mute = FALSE;
+    BOOL install_subtitle_runtime_wrapper = FALSE;
 
     ZeroMemory(&g_proxy_ctx, sizeof(g_proxy_ctx));
     if (ctx != NULL) {
@@ -2577,18 +2611,33 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     seed_hotkey_state_from_config();
     get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &g_active_subtitle_strategy);
     subtitle_runtime_surface_enabled = g_cfg.enable_subtitle_runtime_hooks;
+    sender_only_runtime_mode =
+        subtitle_runtime_surface_enabled &&
+        g_cfg.enable_sender_only_runtime_mode;
+    sender_only_dollman_voice_mute =
+        g_cfg.enable_dollman_radio_mute &&
+        sender_only_runtime_mode;
+    effective_dollman_radio_mute =
+        g_cfg.enable_dollman_radio_mute &&
+        !sender_only_runtime_mode;
+    install_subtitle_runtime_wrapper =
+        subtitle_runtime_surface_enabled &&
+        !sender_only_runtime_mode;
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
     log_line(
-        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d throwRecallSubtitleMute=%d activeStrategy=%s strategyDesc='%s' subtitleRuntime=%d familyTracking=%d producerProbe=%d builderProbe=%d selectorProbe=%d talkProbe=%d scannerMode=%u",
+        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d effectiveRadioMute=%d senderOnlyVoiceMute=%d throwRecallSubtitleMute=%d activeStrategy=%s strategyDesc='%s' subtitleRuntime=%d senderOnlyMode=%d familyTracking=%d producerProbe=%d builderProbe=%d selectorProbe=%d talkProbe=%d scannerMode=%u",
         g_cfg.enabled,
         g_cfg.verbose_log,
         g_cfg.enable_dollman_radio_mute,
+        effective_dollman_radio_mute,
+        sender_only_dollman_voice_mute,
         g_cfg.enable_throw_recall_subtitle_mute,
         subtitle_strategy_name(g_active_subtitle_strategy),
         subtitle_strategy_desc(g_active_subtitle_strategy),
         subtitle_runtime_surface_enabled,
+        sender_only_runtime_mode,
         g_cfg.enable_subtitle_family_tracking,
         g_cfg.enable_subtitle_producer_probe,
         g_cfg.enable_builder_probe,
@@ -2610,7 +2659,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         return 0;
     }
 
-    if (g_cfg.enable_dollman_radio_mute || g_cfg.scanner_mode != SCANNER_MODE_OFF) {
+    if (effective_dollman_radio_mute || g_cfg.scanner_mode != SCANNER_MODE_OFF) {
         if (install_export_hook(
                 k_export_post_event_id,
                 hook_post_event_id,
@@ -2622,7 +2671,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("Legacy PostEvent mute path disabled");
     }
 
-    if (g_cfg.enable_dollman_radio_mute) {
+    if (effective_dollman_radio_mute) {
         if (install_rva_hook(
                 k_rva_dollman_radio_play_voice_by_controller_delay,
                 hook_dollman_radio_play_voice_by_controller_delay,
@@ -2637,20 +2686,39 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "DollmanVoiceDispatcher")) {
             ++hook_count;
         }
+    } else if (sender_only_dollman_voice_mute) {
+        if (install_rva_hook(
+                k_rva_dollman_voice_delay_closure,
+                hook_dollman_voice_delay_closure,
+                (void **)&g_real_dollman_voice_delay_closure,
+                "DollmanVoiceDelayClosure.sub_140C73EE0")) {
+            ++hook_count;
+            log_line("Sender-only Dollman voice mute active via closure.sub_140C73EE0");
+        }
     } else {
-        log_line("Dollman radio mute disabled by config");
+        if (g_cfg.enable_dollman_radio_mute && sender_only_runtime_mode) {
+            log_line("Dollman radio mute suppressed by sender-only runtime mode");
+        } else {
+            log_line("Dollman radio mute disabled by config");
+        }
     }
 
     if (need_show_subtitle_hook) {
-        if (install_rva_hook(
-                k_rva_subtitle_runtime_wrapper,
-                hook_subtitle_runtime_wrapper,
-                (void **)&g_real_subtitle_runtime_wrapper,
-                "GameViewGame.SubtitleRuntime.sub_140780690")) {
-            show_subtitle_hook_installed = TRUE;
-            ++hook_count;
+        if (install_subtitle_runtime_wrapper) {
+            if (install_rva_hook(
+                    k_rva_subtitle_runtime_wrapper,
+                    hook_subtitle_runtime_wrapper,
+                    (void **)&g_real_subtitle_runtime_wrapper,
+                    "GameViewGame.SubtitleRuntime.sub_140780690")) {
+                show_subtitle_hook_installed = TRUE;
+                ++hook_count;
+            } else {
+                log_line("Subtitle runtime wrapper hook unavailable on this build");
+            }
         } else {
-            log_line("Subtitle runtime wrapper hook unavailable on this build");
+            if (sender_only_runtime_mode) {
+                log_line("Sender-only runtime mode active: skipping subtitle runtime wrapper hook");
+            }
         }
 
         if (install_rva_hook(

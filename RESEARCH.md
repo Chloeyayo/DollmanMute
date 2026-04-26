@@ -1056,3 +1056,26 @@ table @ `0x1441fa7c0` 里除了 A/B/C (slot 5/6/7) 和前 5 条的 `sub_140354CC
 
 ### B.4 `0x140C79A90` / `sub_140C79480` 新 caller 簇
 `sub_1403896f0` 相关的新 caller 不再只看孤立的 `sub_140C79480`；当前更值得盯的是它的 cluster head `0x140C79A90`,下面挂着 `0x140C79480 / 0x140C79570 / 0x140C79640 / 0x140C799B0` 这一簇。它们现在应当视作 `DSRadioSentenceGroups` 旁路线的第二批探针,优先级已高于旧的 “U1/U2 未定类” 假设。
+
+### B.5 2026-04-26 语音路径纠偏
+- 旧源码常量 `k_rva_dollman_radio_play_voice_by_controller_delay = 0x00C73BF0` 在当前 build 上**不是** live 的 delay wrapper；它实际落在 `sub_140C73BF0`，更像 `DSRadioSentenceGroupThroughDollmanInstance` 的 teardown / cleanup 面。
+- 当前更可信的 Dollman 专属语音延迟链应记成：
+  - `sub_140C73E30` — `PlayVoiceByControllerDelay_DSRadioSentenceGroupThroughDollmanInstance` delay wrapper
+  - `sub_140C7E780` — 纯 thunk
+  - `sub_140C73EE0` — Dollman delay closure 真执行体
+  - `sub_140DAC7B0` — Player / Dollman 共享的 voice-event 提交 helper
+- Player 对照链是：
+  - `sub_140C739B0 -> sub_140C7E760 -> sub_140C73A60 -> sub_140DAC7B0`
+- `sub_140DAC7B0` 当前两个已确认代码调用点：
+  - Player: `0x140C73AE9`
+  - Dollman: `0x140C73F68`
+  这说明它是共享 helper，不适合无条件拦。
+- 当前最窄的 Dollman-only 语音切点优先级：
+  1. `sub_140C73EE0` 早退 / no-op
+  2. `sub_140C73E30` 早退
+  3. `sub_140DAC7B0` + 仅按 Dollman caller 判别
+- 需要保留的风险面：`ThroughEntity` 已经能解释当前成功的 sender-only 字幕静音，但残余 Dollman 语音**不一定**还走同一路。
+  当前更像独立旁路的 Speaker 线是：
+  - `sub_140C74220` — `PlayVoiceByControllerDelay_DSRadioSentenceGroupThroughSpeakerInstance`
+  - `sub_140C7E7A0` — delayed closure fan-out 到 `qword_146230F40 + 128` listener 列表
+  这条线静态上足以解释“字幕没了但语音还在”，若 Dollman 专属 closure mute 无效，应优先回到这条 Speaker 旁路做窄 probe。

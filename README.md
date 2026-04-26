@@ -34,9 +34,13 @@ Game root example:
 - `Enabled=1` enables the mod
 - `VerboseLog=0` is recommended for normal use
 - `VerboseLog=1` enables extra logging for troubleshooting
-- `EnableDollmanRadioMute=1` enables Dollman voice muting
-- `EnableSubtitleRuntimeHooks=1` enables current-build subtitle muting
-- `EnableSelectorProbe=1` keeps the current-build selector research anchor enabled
+- `EnableVoiceMute=1` enables Dollman voice muting
+- `EnableSubtitleMute=1` enables Dollman subtitle muting
+- `ScannerMode=0` keeps scanner audio unchanged, `1` reduces it, `2` fully mutes it
+
+## Hotkeys
+
+- `F8` marks a fresh probe session window in `DollmanMute.log`
 
 ## Troubleshooting
 

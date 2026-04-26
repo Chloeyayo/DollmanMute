@@ -112,7 +112,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "research-v3.27l-random-postevent-block";
+static const char *k_build_tag = "beta-v3-user-config-cleanup";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -232,8 +232,7 @@ enum {
 
 enum {
     HOTKEY_CONTROL_SESSION_MARK = 0u,
-    HOTKEY_CONTROL_CLEAR_LOG = 1u,
-    HOTKEY_CONTROL_COUNT = 2u
+    HOTKEY_CONTROL_COUNT = 1u
 };
 
 typedef struct ShowStrategyContext {
@@ -267,9 +266,7 @@ static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COU
     { "selectedFamily", "mute only the subtitle families enabled by config defaults", VK_F5 },
     { "pairOrSelectedFamily", "mute when the gameplay pair matches or the config-selected family matches", VK_F6 }
 };
-static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = {
-    VK_F8, VK_F9
-};
+static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = { VK_F8 };
 static const AkUniqueID k_event_id_dollman_equip = 2995625663u;
 static const AkUniqueID k_event_id_dollman_throw = 2820786646u;
 static const AkUniqueID k_event_id_dollman_recall = 2978848044u;
@@ -311,7 +308,6 @@ static volatile LONG g_builder_hit_counts[BUILDER_ID_COUNT] = {0};
 static DWORD g_tls_last_builder = TLS_OUT_OF_INDEXES;
 static uint32_t g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
 static SubtitleStrategyStats g_strategy_stats[SUBTITLE_STRATEGY_COUNT];
-static BOOL g_hotkey_strategy_prev[SUBTITLE_STRATEGY_COUNT] = {FALSE};
 static BOOL g_hotkey_control_prev[HOTKEY_CONTROL_COUNT] = {FALSE};
 static volatile LONG g_session_counter = 0;
 
@@ -419,48 +415,11 @@ static void log_pair_bypass_probe(
 
 static const char *k_default_ini =
     "; DollmanMute runtime config.\n"
-    "; VerboseLog=1 enables per-event mute logging for debugging.\n"
-    "; EnableDollmanRadioMute=1 enables the current audio mute path.\n"
-    ";   In sender-only mode it uses the Dollman-only voice closure path.\n"
-    ";   Outside sender-only mode it falls back to the older broad legacy path.\n"
-    ";   (hat/glasses reactions etc) together with their subtitles.\n"
-    "; EnableThrowRecallSubtitleMute=1 sets startup default for throw/recall mute.\n"
-    "; ActiveSubtitleStrategy selects which subtitle strategy actually mutes.\n"
-    ";   0=observe, 1=pair, 2=callerOnly, 3=speakerOnly,\n"
-    ";   4=selectedFamily, 5=pairOrSelectedFamily.\n"
-    ";   observe=never mute, pair=must match caller+speaker,\n"
-    ";   callerOnly=only caller match, speakerOnly=only speaker match,\n"
-    ";   selectedFamily=respect config-selected families only,\n"
-    ";   pairOrSelectedFamily=either pair match or config-selected family match.\n"
-    "; EnableSenderOnlyRuntimeMode=1 keeps active mute on the current\n"
-    ";   ShowSubtitle sender surface only. It suppresses the legacy audio mute\n"
-    ";   hooks and skips the older runtime wrapper to minimize blast radius.\n"
-    "; EnableSubtitleRuntimeHooks=1 arms ShowSubtitle-side runtime muting.\n"
-    ";   Current research default keeps this ON.\n"
-    "; EnableLegacyRuntimeWrapper=1 re-enables the older pre-sender runtime wrapper.\n"
-    ";   It is OFF by default because sender-side muting is the stable surface.\n"
-    "; EnableSubtitleFamilyTracking=1 keeps the older producer-side family probe\n"
-    ";   available for research. Runtime family muting can classify directly from\n"
-    ";   ShowSubtitle payload line identity tags on this build.\n"
-    "; Current default profile keeps SelectorDispatch ON, but leaves\n"
-    "; TalkDispatcher OFF because it currently causes runtime crashes.\n"
-    "; EnableDeepProbe=1 explicitly arms StartTalk producer/init + Dollman voice\n"
-    ";   correlation during F8 windows. Selector probe no longer piggybacks it.\n"
-    "; Builder hooks remain OFF by default.\n"
-    "; EnableBuilderProbe=1 installs log-only hooks on gameplay subtitle builders\n"
-    ";   A=quarantined on current build, B=sub_140350380, C=sub_140350790,\n"
-    ";   U1=sub_140B5BC60, U2=sub_140B5CC20.\n"
-    ";   and emits windowed [show]/[builder]/[350c70] log lines.\n"
-    ";   Used for mapping dollman behaviours to builder paths.\n"
-    "; EnableSubtitleProducerProbe=1 additionally enables the newer\n"
-    ";   StartTalk/init/shared-sink deep research hooks.\n"
-    "; EnableTalkDispatcherProbe=1 is currently unsafe on this build.\n"
+    "; VerboseLog=1 enables extra logging for troubleshooting.\n"
+    "; EnableVoiceMute=1 mutes Dollman gameplay voice lines.\n"
+    "; EnableSubtitleMute=1 mutes Dollman gameplay subtitles.\n"
     "; Runtime hotkeys:\n"
-    ";   F1..F6 = switch active subtitle strategy\n"
-    ";   F8  = mark session boundary + open 5s deep-probe window\n"
-    ";   F9  = truncate DollmanMute.log (fresh capture)\n"
-    ";   F10 = reload core (proxy feature, not handled here)\n"
-    "; EnableSubtitleProducerProbe is kept only for offline research builds.\n"
+    ";   F8 = mark a fresh probe session window in DollmanMute.log\n"
     "; ScannerMode=0 keeps scanner audio unchanged.\n"
     "; ScannerMode=1 reduces scanner intensity.\n"
     "; ScannerMode=2 fully mutes scanner audio.\n"
@@ -468,18 +427,8 @@ static const char *k_default_ini =
     "[General]\n"
     "Enabled=1\n"
     "VerboseLog=0\n"
-    "EnableDollmanRadioMute=1\n"
-    "EnableThrowRecallSubtitleMute=0\n"
-    "ActiveSubtitleStrategy=1\n"
-    "EnableSenderOnlyRuntimeMode=1\n"
-    "EnableSubtitleRuntimeHooks=1\n"
-    "EnableLegacyRuntimeWrapper=0\n"
-    "EnableSubtitleFamilyTracking=0\n"
-    "EnableSubtitleProducerProbe=0\n"
-    "EnableBuilderProbe=0\n"
-    "EnableSelectorProbe=1\n"
-    "EnableDeepProbe=0\n"
-    "EnableTalkDispatcherProbe=0\n"
+    "EnableVoiceMute=1\n"
+    "EnableSubtitleMute=1\n"
     "ScannerMode=0\n";
 
 static void join_path(char *buffer, size_t buffer_size, const char *dir, const char *file_name)
@@ -561,6 +510,38 @@ static void ensure_default_ini(void)
     CloseHandle(file);
 }
 
+static BOOL read_ini_bool_compat(
+    const char *section,
+    const char *key,
+    const char *legacy_key,
+    BOOL default_value)
+{
+    int value = GetPrivateProfileIntA(section, key, -1, g_ini_path);
+    if (value == -1 && legacy_key != NULL) {
+        value = GetPrivateProfileIntA(section, legacy_key, -1, g_ini_path);
+    }
+    if (value == -1) {
+        value = default_value ? 1 : 0;
+    }
+    return value != 0;
+}
+
+static int read_ini_int_compat(
+    const char *section,
+    const char *key,
+    const char *legacy_key,
+    int default_value)
+{
+    int value = GetPrivateProfileIntA(section, key, -1, g_ini_path);
+    if (value == -1 && legacy_key != NULL) {
+        value = GetPrivateProfileIntA(section, legacy_key, -1, g_ini_path);
+    }
+    if (value == -1) {
+        value = default_value;
+    }
+    return value;
+}
+
 static void load_config(void)
 {
     ZeroMemory(&g_cfg, sizeof(g_cfg));
@@ -575,81 +556,31 @@ static void load_config(void)
     g_cfg.enable_subtitle_family_tracking = FALSE;
     g_cfg.enable_subtitle_producer_probe = FALSE;
     g_cfg.enable_builder_probe = FALSE;
-    g_cfg.enable_selector_probe = TRUE;
+    g_cfg.enable_selector_probe = FALSE;
     g_cfg.enable_deep_probe = FALSE;
     g_cfg.enable_talk_dispatcher_probe = FALSE;
     g_cfg.scanner_mode = SCANNER_MODE_OFF;
 
     ensure_default_ini();
 
-    g_cfg.enabled = GetPrivateProfileIntA("General", "Enabled", g_cfg.enabled, g_ini_path) != 0;
-    g_cfg.verbose_log = GetPrivateProfileIntA("General", "VerboseLog", g_cfg.verbose_log, g_ini_path) != 0;
-    g_cfg.enable_dollman_radio_mute = GetPrivateProfileIntA(
+    g_cfg.enabled = read_ini_bool_compat("General", "Enabled", NULL, g_cfg.enabled);
+    g_cfg.verbose_log = read_ini_bool_compat("General", "VerboseLog", NULL, g_cfg.verbose_log);
+    g_cfg.enable_dollman_radio_mute = read_ini_bool_compat(
         "General",
+        "EnableVoiceMute",
         "EnableDollmanRadioMute",
-        g_cfg.enable_dollman_radio_mute,
-        g_ini_path) != 0;
-    g_cfg.enable_throw_recall_subtitle_mute = GetPrivateProfileIntA(
+        g_cfg.enable_dollman_radio_mute);
+    g_cfg.enable_subtitle_runtime_hooks = read_ini_bool_compat(
         "General",
-        "EnableThrowRecallSubtitleMute",
-        g_cfg.enable_throw_recall_subtitle_mute,
-        g_ini_path) != 0;
-    g_cfg.active_subtitle_strategy = (uint32_t)GetPrivateProfileIntA(
-        "General",
-        "ActiveSubtitleStrategy",
-        (int)g_cfg.active_subtitle_strategy,
-        g_ini_path);
-    g_cfg.enable_sender_only_runtime_mode = GetPrivateProfileIntA(
-        "General",
-        "EnableSenderOnlyRuntimeMode",
-        g_cfg.enable_sender_only_runtime_mode,
-        g_ini_path) != 0;
-    g_cfg.enable_subtitle_runtime_hooks = GetPrivateProfileIntA(
-        "General",
+        "EnableSubtitleMute",
         "EnableSubtitleRuntimeHooks",
-        g_cfg.enable_subtitle_runtime_hooks,
-        g_ini_path) != 0;
-    g_cfg.enable_legacy_runtime_wrapper = GetPrivateProfileIntA(
-        "General",
-        "EnableLegacyRuntimeWrapper",
-        g_cfg.enable_legacy_runtime_wrapper,
-        g_ini_path) != 0;
-    g_cfg.enable_subtitle_family_tracking = GetPrivateProfileIntA(
-        "General",
-        "EnableSubtitleFamilyTracking",
-        g_cfg.enable_subtitle_family_tracking,
-        g_ini_path) != 0;
-    g_cfg.enable_subtitle_producer_probe = GetPrivateProfileIntA(
-        "General",
-        "EnableSubtitleProducerProbe",
-        g_cfg.enable_subtitle_producer_probe,
-        g_ini_path) != 0;
-    g_cfg.enable_builder_probe = GetPrivateProfileIntA(
-        "General",
-        "EnableBuilderProbe",
-        g_cfg.enable_builder_probe,
-        g_ini_path) != 0;
-    g_cfg.enable_selector_probe = GetPrivateProfileIntA(
-        "General",
-        "EnableSelectorProbe",
-        g_cfg.enable_selector_probe,
-        g_ini_path) != 0;
-    g_cfg.enable_deep_probe = GetPrivateProfileIntA(
-        "General",
-        "EnableDeepProbe",
-        g_cfg.enable_deep_probe,
-        g_ini_path) != 0;
-    g_cfg.enable_talk_dispatcher_probe = GetPrivateProfileIntA(
-        "General",
-        "EnableTalkDispatcherProbe",
-        g_cfg.enable_talk_dispatcher_probe,
-        g_ini_path) != 0;
+        g_cfg.enable_subtitle_runtime_hooks);
     {
-        int scanner_mode_value = GetPrivateProfileIntA(
+        int scanner_mode_value = read_ini_int_compat(
             "General",
             "ScannerMode",
-            (int)g_cfg.scanner_mode,
-            g_ini_path);
+            NULL,
+            (int)g_cfg.scanner_mode);
         if (scanner_mode_value < (int)SCANNER_MODE_OFF) {
             scanner_mode_value = (int)SCANNER_MODE_OFF;
         }
@@ -657,9 +588,6 @@ static void load_config(void)
             scanner_mode_value = (int)SCANNER_MODE_MUTE_ALL;
         }
         g_cfg.scanner_mode = (uint32_t)scanner_mode_value;
-    }
-    if (g_cfg.active_subtitle_strategy >= SUBTITLE_STRATEGY_COUNT) {
-        g_cfg.active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
     }
 }
 
@@ -886,7 +814,6 @@ static void reset_strategy_stats(void)
 static void reset_hotkey_runtime_state(void)
 {
     ZeroMemory(g_hotkey_control_prev, sizeof(g_hotkey_control_prev));
-    ZeroMemory(g_hotkey_strategy_prev, sizeof(g_hotkey_strategy_prev));
 }
 
 static void reset_session_probe_state(void)
@@ -929,11 +856,7 @@ static void reset_log_capture_state(void)
 static void seed_hotkey_state_from_config(void)
 {
     EnterCriticalSection(&g_hotkey_lock);
-    if (g_cfg.active_subtitle_strategy < SUBTITLE_STRATEGY_COUNT) {
-        g_active_subtitle_strategy = g_cfg.active_subtitle_strategy;
-    } else {
-        g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
-    }
+    g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
     LeaveCriticalSection(&g_hotkey_lock);
 }
 
@@ -1523,58 +1446,23 @@ static BOOL process_subtitle_payload(
 static void update_hotkey_mute_state(void)
 {
     BOOL key_control_down[HOTKEY_CONTROL_COUNT];
-    BOOL key_strategy_down[SUBTITLE_STRATEGY_COUNT];
     uint32_t i;
 
     for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
         key_control_down[i] = is_vk_down(k_hotkey_control_vks[i]);
     }
-    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
-        key_strategy_down[i] = is_vk_down(k_subtitle_strategy_meta[i].vk);
-    }
 
     if (key_control_down[HOTKEY_CONTROL_SESSION_MARK] &&
         !g_hotkey_control_prev[HOTKEY_CONTROL_SESSION_MARK]) {
-        uint32_t active_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
         LONG counter = InterlockedIncrement(&g_session_counter);
         ULONGLONG until_ms = GetTickCount64() + 5000ull;
         InterlockedExchange64(&g_stf_probe_window_until_ms, (LONG64)until_ms);
-        reset_stf_probe_cache();
-        reset_runtime_capture_counters();
-        active_strategy = get_active_subtitle_strategy();
-        log_line("=== session boundary F8 count=%ld ===", (long)counter);
-        log_line(
-            "StrategySession active=%s desc='%s' throwRecallDefault=%d",
-            subtitle_strategy_name(active_strategy),
-            subtitle_strategy_desc(active_strategy),
-            g_cfg.enable_throw_recall_subtitle_mute ? 1 : 0);
-    }
-
-    if (key_control_down[HOTKEY_CONTROL_CLEAR_LOG] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_CLEAR_LOG]) {
-        clear_log_file();
         reset_log_capture_state();
-        log_line("=== log cleared by F9; runtime hit budgets and probe caches reset ===");
+        log_line("=== session boundary F8 count=%ld ===", (long)counter);
     }
-
-    EnterCriticalSection(&g_hotkey_lock);
-    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
-        if (key_strategy_down[i] && !g_hotkey_strategy_prev[i]) {
-            g_active_subtitle_strategy = i;
-            log_line(
-                "HotkeyStrategy active=%s key='F%u' desc='%s'",
-                subtitle_strategy_name(i),
-                (unsigned int)(i + 1u),
-                subtitle_strategy_desc(i));
-        }
-    }
-    LeaveCriticalSection(&g_hotkey_lock);
 
     for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
         g_hotkey_control_prev[i] = key_control_down[i];
-    }
-    for (i = 0; i < SUBTITLE_STRATEGY_COUNT; ++i) {
-        g_hotkey_strategy_prev[i] = key_strategy_down[i];
     }
 }
 
@@ -3405,24 +3293,11 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
     log_line(
-        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d effectiveRadioMute=%d senderOnlyVoiceMute=%d throwRecallSubtitleMute=%d activeStrategy=%s strategyDesc='%s' subtitleRuntime=%d senderOnlyMode=%d legacyWrapper=%d familyTracking=%d producerProbe=%d builderProbe=%d selectorProbe=%d deepProbe=%d talkProbe=%d scannerMode=%u",
+        "DollmanMute init start: enabled=%d verbose=%d voiceMute=%d subtitleMute=%d scannerMode=%u",
         g_cfg.enabled,
         g_cfg.verbose_log,
         g_cfg.enable_dollman_radio_mute,
-        effective_dollman_radio_mute,
-        sender_only_dollman_voice_mute,
-        g_cfg.enable_throw_recall_subtitle_mute,
-        subtitle_strategy_name(g_active_subtitle_strategy),
-        subtitle_strategy_desc(g_active_subtitle_strategy),
         subtitle_runtime_surface_enabled,
-        sender_only_runtime_mode,
-        g_cfg.enable_legacy_runtime_wrapper,
-        g_cfg.enable_subtitle_family_tracking,
-        g_cfg.enable_subtitle_producer_probe,
-        g_cfg.enable_builder_probe,
-        g_cfg.enable_selector_probe,
-        g_cfg.enable_deep_probe,
-        g_cfg.enable_talk_dispatcher_probe,
         (unsigned int)g_cfg.scanner_mode);
 
     need_show_subtitle_hook =
@@ -3450,14 +3325,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 (void **)&g_real_post_event_id,
                 "PostEventID")) {
             ++hook_count;
-            if (!effective_dollman_radio_mute && g_cfg.scanner_mode == SCANNER_MODE_OFF) {
-                if (sender_only_dollman_voice_mute) {
-                    log_line(
-                        "PostEventID sender-only narrow mute active: action and proven random-chatter Wwise events are blocked; F8 windows also log audio events");
-                } else if (need_deep_probe) {
-                    log_line("PostEventID passive probe active: F8 windows log audio events without legacy broad mute");
-                }
-            }
         }
     } else {
         log_line("Legacy PostEvent mute path disabled");
@@ -3593,8 +3460,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "StartTalkFunction.init.sub_140387670")) {
             ++hook_count;
         }
-    } else {
-        log_line("Deep StartTalk init probe disabled (needs producerProbe or deepProbe)");
     }
 
     if (g_cfg.enable_builder_probe) {
@@ -3648,17 +3513,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "BuilderU2.sub_140B5CC20")) {
             ++hook_count;
         }
-        if (g_cfg.enable_subtitle_producer_probe) {
-            if (k_rva_gameplay_sink != 0) {
-                log_line("Builder probe armed: F8 = session boundary marker + 5s probe window, shared sink probe active");
-            } else {
-                log_line("Builder probe armed: F8 = session boundary marker + 5s probe window, shared sink probe quarantined on current build");
-            }
-        } else {
-            log_line("Builder probe armed: F8 = session boundary marker + 5s probe window");
-        }
-    } else {
-        log_line("Builder probe disabled by config");
     }
 
     if (g_cfg.enable_selector_probe) {
@@ -3669,30 +3523,19 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "SelectorDispatch.sub_140DAF8A0")) {
             ++hook_count;
         }
-        log_line("Selector dispatch probe armed (sub_140DAF8A0)");
-    } else {
-        log_line("Selector dispatch probe disabled by config");
     }
 
     if (need_deep_probe) {
         log_line("Deep correlation probe armed: F8 window correlates StartTalk producer/init with Dollman voice hooks");
-    } else {
-        log_line("Deep correlation probe disabled by config");
     }
 
     if (g_cfg.enable_talk_dispatcher_probe) {
         log_line("TalkDispatcher probe remains quarantined on current build; not installed");
-    } else {
-        log_line("TalkDispatcher probe disabled by config");
     }
 
     g_hotkey_thread_handle = CreateThread(NULL, 0, hotkey_thread_proc, NULL, 0, NULL);
     if (g_hotkey_thread_handle != NULL) {
-        log_line(
-            "Hotkeys active: F1..F6=strategy, F8=session boundary, F9=clear log (throwRecallDefault=%d activeStrategy=%s desc='%s')",
-            g_cfg.enable_throw_recall_subtitle_mute ? 1 : 0,
-            subtitle_strategy_name(g_active_subtitle_strategy),
-            subtitle_strategy_desc(g_active_subtitle_strategy));
+        log_line("Hotkeys active: F8=session mark");
     } else {
         log_line("Failed to start hotkey thread");
     }

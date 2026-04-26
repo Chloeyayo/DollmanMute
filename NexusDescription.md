@@ -6,13 +6,24 @@ BI*CH SHUT THE F UP
 
 ## Description
 
+**v2.0 beta notice:** supports game version `v1.5`.
+
+Brief changelog:
+
+- Added Dollman subtitle muting
+- Broader Dollman gameplay voice mute coverage
+
+Detailed changelog and update notes are in the discussion section.
+
 **DollmanMute** exists for one reason: to shut Dollman up during normal gameplay.
 
 This mod mutes Dollman's repetitive and annoying gameplay voice lines, including his chatter during normal play, the lines that play when you throw him, and his voice lines after mission failure.
 
 Under normal circumstances, it should not affect Dollman's dialogue in story scenes.
 
-If you notice any missed lines, or anything being muted that should not be, let me know.
+If you notice any missed lines, or anything being muted that should not be, please let me know.
+
+If you can include `DollmanMute.log` from the game root, that helps a lot.
 
 Hideo Kojima, please stop treating your players like idiots. At least give us a choice.
 
@@ -25,6 +36,7 @@ Open your game root folder:
 Copy these files:
 
 - `DollmanMute.asi`
+- `DollmanMuteCore.dll`
 - `DollmanMute.ini`
 - `version.dll`
 
@@ -32,11 +44,10 @@ Then launch the game.
 
 ## Main Features
 
-- Mutes Dollman's repetitive gameplay chatter
-- Mutes Dollman voice lines when throwing him
-- Mutes Dollman voice lines after mission failure
+
+- Mutes all Dollman gameplay audios and subtitles
 - Keeps ambient and world audio intact
-- Intended not to affect Dollman's story dialogue under normal use
+- Intended not to affect cutscenes or private-room dialogue under normal use
 - Lightweight native ASI mod
 - No archive unpacking or replacement required
 
@@ -53,7 +64,7 @@ Notes:
 
 ## Future Plans
 
-- Optional hiding of Dollman-only subtitles without affecting other subtitle lines
+- Further beta hardening for missed lines, false positives, and edge cases
 
 ## Shout Outs
 

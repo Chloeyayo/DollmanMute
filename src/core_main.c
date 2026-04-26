@@ -24,7 +24,9 @@ typedef struct Config {
     BOOL enable_subtitle_producer_probe;
     BOOL enable_builder_probe;
     BOOL enable_selector_probe;
+    BOOL enable_deep_probe;
     BOOL enable_talk_dispatcher_probe;
+    BOOL enable_legacy_runtime_wrapper;
     uint32_t scanner_mode;
 } Config;
 
@@ -40,12 +42,19 @@ typedef AkPlayingID(__cdecl *PostEventIdFn)(
 typedef uintptr_t(__fastcall *DollmanRadioPlayVoiceByControllerDelayFn)(
     uintptr_t instance,
     int controller_index);
-typedef uintptr_t(__fastcall *DollmanVoiceDispatcherFn)(
-    uintptr_t lock_obj,
-    uintptr_t radio_instance,
-    uintptr_t param32,
+typedef uintptr_t(__fastcall *VoiceSharedHelperFn)(
+    uintptr_t manager_obj,
+    uintptr_t voice_source,
+    uintptr_t payload_source,
     int mode,
-    int *sentence_key);
+    unsigned int *sentence_key);
+typedef char(__fastcall *VoiceQueueSubmitFn)(
+    uintptr_t *queue_obj,
+    unsigned int *request,
+    char a3,
+    uintptr_t a4,
+    uintptr_t a5,
+    unsigned char *a6);
 typedef void(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
 typedef uintptr_t(__fastcall *SubtitleRuntimeWrapperFn)(uintptr_t view, uintptr_t arg2);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
@@ -91,7 +100,8 @@ static HANDLE g_hotkey_thread_handle = NULL;
 
 static PostEventIdFn g_real_post_event_id = NULL;
 static DollmanRadioPlayVoiceByControllerDelayFn g_real_dollman_radio_play_voice_by_controller_delay = NULL;
-static DollmanVoiceDispatcherFn g_real_dollman_voice_dispatcher = NULL;
+static VoiceSharedHelperFn g_real_voice_shared_helper = NULL;
+static VoiceQueueSubmitFn g_real_voice_queue_submit = NULL;
 static DollmanVoiceDelayClosureFn g_real_dollman_voice_delay_closure = NULL;
 static SubtitleRuntimeWrapperFn g_real_subtitle_runtime_wrapper = NULL;
 static ShowSubtitleFn g_real_show_subtitle = NULL;
@@ -102,7 +112,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "research-v3.26a-dollman-voice-closure";
+static const char *k_build_tag = "research-v3.27f-postevent-narrow-block";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -153,10 +163,18 @@ static const char *k_export_post_event_id =
 
 /* Legacy broad audio hook names are kept for source continuity. On the current
  * build, 0x00C73BF0 lands in a ThroughDollmanInstance teardown path, not the
- * live delay wrapper. The Dollman-only runtime voice closure is 0x00C73EE0. */
+ * live delay wrapper. The Dollman-only runtime voice closure is 0x00C73EE0.
+ * The old 0x00DAA410 "dispatcher" probe was a manager tick/update; the real
+ * shared voice submit helper is 0x00DAC7B0. */
 static const uintptr_t k_rva_dollman_radio_play_voice_by_controller_delay = 0x00C73BF0u;
 static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C73EE0u;
-static const uintptr_t k_rva_dollman_voice_dispatcher = 0x00DAA410u;
+static const uintptr_t k_rva_voice_shared_helper = 0x00DAC7B0u;
+static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C73AEEu;
+static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C73F6Du;
+static const uintptr_t k_rva_voice_queue_submit = 0x00DAC910u;
+static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DAC891u;
+static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DAAB64u;
+static const uintptr_t k_rva_voice_queue_dispatcher_forward_return = 0x00DAC17Au;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780690u;
 static const uintptr_t k_rva_show_subtitle = 0x00780740u;
 static const uintptr_t k_rva_remove_subtitle = 0x00780840u;
@@ -247,6 +265,8 @@ static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COU
 static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = {
     'J', 'K', 'N', 'M', VK_F12, VK_F8, VK_F9
 };
+static const AkUniqueID k_event_id_dollman_throw = 2820786646u;
+static const AkUniqueID k_event_id_dollman_recall = 2978848044u;
 
 /* --- Builder probe (v3.14): log-only hooks on gameplay subtitle builders --- */
 enum {
@@ -291,14 +311,17 @@ static volatile LONG g_session_counter = 0;
 
 static const AkUniqueID k_blocked_event_ids[] = {
     2995625663u, /* equip */
-    2820786646u, /* throw */
-    2978848044u, /* recall */
+    k_event_id_dollman_throw,  /* throw */
+    k_event_id_dollman_recall, /* recall */
     1966841225u, /* random chatter */
     302733266u,  /* task-failure */
     448888368u   /* fall chatter */
 };
 
 static uintptr_t safe_deref_qword(uintptr_t addr);
+static uintptr_t safe_read_ptr(uintptr_t addr);
+static uint64_t safe_read_u64(uintptr_t addr);
+static uint32_t safe_read_u32(uintptr_t addr);
 static const char *subtitle_strategy_name(uint32_t strategy);
 static const char *subtitle_strategy_desc(uint32_t strategy);
 static BOOL read_localized_text_resource(
@@ -311,6 +334,10 @@ static void log_localized_text_resource_candidate(
     uintptr_t ptr);
 static void log_builder_c_post_probe(uintptr_t rcx, uintptr_t result);
 static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_obj);
+static void log_dollman_voice_closure_probe(const char *phase, uintptr_t closure_state);
+static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva);
+static const char *voice_queue_probe_caller_name(uintptr_t caller_rva);
+static uintptr_t get_return_address_value(void);
 static BOOL is_stf_probe_window_open(void);
 static void reset_stf_probe_cache(void);
 static BOOL stf_probe_seen_or_mark(uint64_t key);
@@ -318,6 +345,9 @@ static void reset_builder_hit_counts(void);
 static void reset_strategy_stats(void);
 static void reset_hotkey_runtime_state(void);
 static void reset_session_probe_state(void);
+static void reset_runtime_capture_counters(void);
+static void reset_identity_probe_cache(void);
+static void reset_log_capture_state(void);
 static void log_hotkey_mute_state(const char *key_name);
 static void log_localized_hits_in_block(
     uintptr_t caller_rva,
@@ -332,6 +362,10 @@ static void log_sentence_desc_probe(
 static void *resolve_rva(uintptr_t rva);
 static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy);
 static BOOL is_subtitle_runtime_mute_enabled(void);
+static BOOL is_sender_only_runtime_mode_enabled(void);
+static BOOL is_legacy_dollman_radio_mute_enabled(void);
+static BOOL is_sender_only_dollman_radio_mute_enabled(void);
+static BOOL should_block_sender_only_event_id(AkUniqueID event_id);
 static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag);
 static uint32_t read_subtitle_runtime_prepare_token(void);
 static void log_subtitle_identity_probe(
@@ -347,6 +381,10 @@ static BOOL process_subtitle_payload(
     const char *surface,
     uintptr_t caller_rva,
     const uint64_t *payload);
+static uintptr_t pass_through_subtitle_runtime_wrapper(
+    uintptr_t view,
+    uintptr_t arg2,
+    const char *reason);
 
 static const char *k_default_ini =
     "; DollmanMute runtime config.\n"
@@ -368,12 +406,16 @@ static const char *k_default_ini =
     ";   hooks and skips the older runtime wrapper to minimize blast radius.\n"
     "; EnableSubtitleRuntimeHooks=1 arms ShowSubtitle-side runtime muting.\n"
     ";   Current research default keeps this ON.\n"
+    "; EnableLegacyRuntimeWrapper=1 re-enables the older pre-sender runtime wrapper.\n"
+    ";   It is OFF by default because sender-side muting is the stable surface.\n"
     "; EnableSubtitleFamilyTracking=1 keeps the older producer-side family probe\n"
     ";   available for research. Runtime family muting can classify directly from\n"
     ";   ShowSubtitle payload line identity tags on this build.\n"
     "; Current default profile keeps SelectorDispatch ON, but leaves\n"
     "; TalkDispatcher OFF because it currently causes runtime crashes.\n"
-    "; Producer/builder hooks are also OFF by default.\n"
+    "; EnableDeepProbe=1 explicitly arms StartTalk producer/init + Dollman voice\n"
+    ";   correlation during F8 windows. Selector probe no longer piggybacks it.\n"
+    "; Builder hooks remain OFF by default.\n"
     "; EnableBuilderProbe=1 installs log-only hooks on gameplay subtitle builders\n"
     ";   A=quarantined on current build, B=sub_140350380, C=sub_140350790,\n"
     ";   U1=sub_140B5BC60, U2=sub_140B5CC20.\n"
@@ -405,10 +447,12 @@ static const char *k_default_ini =
     "ActiveSubtitleStrategy=1\n"
     "EnableSenderOnlyRuntimeMode=1\n"
     "EnableSubtitleRuntimeHooks=1\n"
+    "EnableLegacyRuntimeWrapper=0\n"
     "EnableSubtitleFamilyTracking=0\n"
     "EnableSubtitleProducerProbe=0\n"
     "EnableBuilderProbe=0\n"
     "EnableSelectorProbe=1\n"
+    "EnableDeepProbe=0\n"
     "EnableTalkDispatcherProbe=0\n"
     "ScannerMode=0\n";
 
@@ -501,10 +545,12 @@ static void load_config(void)
     g_cfg.active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
     g_cfg.enable_sender_only_runtime_mode = TRUE;
     g_cfg.enable_subtitle_runtime_hooks = TRUE;
+    g_cfg.enable_legacy_runtime_wrapper = FALSE;
     g_cfg.enable_subtitle_family_tracking = FALSE;
     g_cfg.enable_subtitle_producer_probe = FALSE;
     g_cfg.enable_builder_probe = FALSE;
     g_cfg.enable_selector_probe = TRUE;
+    g_cfg.enable_deep_probe = FALSE;
     g_cfg.enable_talk_dispatcher_probe = FALSE;
     g_cfg.scanner_mode = SCANNER_MODE_OFF;
 
@@ -537,6 +583,11 @@ static void load_config(void)
         "EnableSubtitleRuntimeHooks",
         g_cfg.enable_subtitle_runtime_hooks,
         g_ini_path) != 0;
+    g_cfg.enable_legacy_runtime_wrapper = GetPrivateProfileIntA(
+        "General",
+        "EnableLegacyRuntimeWrapper",
+        g_cfg.enable_legacy_runtime_wrapper,
+        g_ini_path) != 0;
     g_cfg.enable_subtitle_family_tracking = GetPrivateProfileIntA(
         "General",
         "EnableSubtitleFamilyTracking",
@@ -556,6 +607,11 @@ static void load_config(void)
         "General",
         "EnableSelectorProbe",
         g_cfg.enable_selector_probe,
+        g_ini_path) != 0;
+    g_cfg.enable_deep_probe = GetPrivateProfileIntA(
+        "General",
+        "EnableDeepProbe",
+        g_cfg.enable_deep_probe,
         g_ini_path) != 0;
     g_cfg.enable_talk_dispatcher_probe = GetPrivateProfileIntA(
         "General",
@@ -749,6 +805,38 @@ static BOOL stf_probe_seen_or_mark(uint64_t key)
     return seen;
 }
 
+static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva)
+{
+    return caller_rva == k_rva_voice_queue_shared_helper_return ||
+           caller_rva == k_rva_voice_queue_dispatcher_synth_return ||
+           caller_rva == k_rva_voice_queue_dispatcher_forward_return;
+}
+
+static const char *voice_queue_probe_caller_name(uintptr_t caller_rva)
+{
+    switch (caller_rva) {
+    case k_rva_voice_queue_shared_helper_return:
+        return "shared-helper";
+    case k_rva_voice_queue_dispatcher_synth_return:
+        return "dispatcher-synth";
+    case k_rva_voice_queue_dispatcher_forward_return:
+        return "dispatcher-forward";
+    default:
+        return "other";
+    }
+}
+
+static uintptr_t get_return_address_value(void)
+{
+#if defined(__clang__) || defined(__GNUC__)
+    return (uintptr_t)__builtin_return_address(0);
+#elif defined(_MSC_VER)
+    return (uintptr_t)_ReturnAddress();
+#else
+    return 0;
+#endif
+}
+
 static void reset_builder_hit_counts(void)
 {
     size_t i;
@@ -780,6 +868,31 @@ static void reset_session_probe_state(void)
     InterlockedExchange(&g_session_counter, 0);
     InterlockedExchange64(&g_stf_probe_window_until_ms, 0);
     reset_stf_probe_cache();
+}
+
+static void reset_runtime_capture_counters(void)
+{
+    InterlockedExchange(&g_subtitle_runtime_hits, 0);
+    InterlockedExchange(&g_subtitle_remove_hits, 0);
+}
+
+static void reset_identity_probe_cache(void)
+{
+    if (!g_identity_lock_inited) {
+        return;
+    }
+
+    EnterCriticalSection(&g_identity_lock);
+    g_identity_cache_count = 0;
+    g_identity_cache_full_warned = FALSE;
+    LeaveCriticalSection(&g_identity_lock);
+}
+
+static void reset_log_capture_state(void)
+{
+    reset_runtime_capture_counters();
+    reset_stf_probe_cache();
+    reset_identity_probe_cache();
 }
 
 static void log_hotkey_mute_state(const char *key_name)
@@ -872,7 +985,7 @@ static void tls_set_last_builder(uint32_t id)
 
 static uint32_t read_identity_hi32(uintptr_t ptr)
 {
-    uint64_t word1 = safe_deref_qword(ptr + sizeof(uint64_t));
+    uint64_t word1 = safe_read_u64(ptr + sizeof(uint64_t));
     return (uint32_t)(word1 >> 32);
 }
 
@@ -912,6 +1025,36 @@ static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy)
 static BOOL is_subtitle_runtime_mute_enabled(void)
 {
     return g_cfg.enabled && g_cfg.enable_subtitle_runtime_hooks;
+}
+
+static BOOL is_sender_only_runtime_mode_enabled(void)
+{
+    return g_cfg.enable_subtitle_runtime_hooks &&
+           g_cfg.enable_sender_only_runtime_mode;
+}
+
+static BOOL is_legacy_dollman_radio_mute_enabled(void)
+{
+    return g_cfg.enabled &&
+           g_cfg.enable_dollman_radio_mute &&
+           !is_sender_only_runtime_mode_enabled();
+}
+
+static BOOL is_sender_only_dollman_radio_mute_enabled(void)
+{
+    return g_cfg.enabled &&
+           g_cfg.enable_dollman_radio_mute &&
+           is_sender_only_runtime_mode_enabled();
+}
+
+static BOOL should_block_sender_only_event_id(AkUniqueID event_id)
+{
+    if (!is_sender_only_dollman_radio_mute_enabled()) {
+        return FALSE;
+    }
+
+    return event_id == k_event_id_dollman_throw ||
+           event_id == k_event_id_dollman_recall;
 }
 
 static uint32_t read_subtitle_runtime_prepare_token(void)
@@ -1277,6 +1420,7 @@ static void update_hotkey_mute_state(void)
         ULONGLONG until_ms = GetTickCount64() + 5000ull;
         InterlockedExchange64(&g_stf_probe_window_until_ms, (LONG64)until_ms);
         reset_stf_probe_cache();
+        reset_runtime_capture_counters();
         get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &active_strategy);
         log_line("=== session boundary F8 count=%ld ===", (long)counter);
         log_line(
@@ -1290,7 +1434,8 @@ static void update_hotkey_mute_state(void)
     if (key_control_down[HOTKEY_CONTROL_CLEAR_LOG] &&
         !g_hotkey_control_prev[HOTKEY_CONTROL_CLEAR_LOG]) {
         clear_log_file();
-        log_line("=== log cleared by F9 ===");
+        reset_log_capture_state();
+        log_line("=== log cleared by F9; runtime hit budgets and probe caches reset ===");
     }
 
     EnterCriticalSection(&g_hotkey_lock);
@@ -1365,7 +1510,7 @@ static BOOL should_block_event_id(AkUniqueID event_id)
                g_cfg.scanner_mode == SCANNER_MODE_REDUCED;
     }
 
-    if (!g_cfg.enable_dollman_radio_mute) {
+    if (!is_legacy_dollman_radio_mute_enabled()) {
         return FALSE;
     }
 
@@ -1529,11 +1674,52 @@ static AkPlayingID __cdecl hook_post_event_id(
     void *external_sources,
     uint32_t playing_id)
 {
-    BOOL blocked = g_cfg.enabled && should_block_event_id(event_id);
+    BOOL probe_enabled =
+        is_stf_probe_window_open() &&
+        (g_cfg.enable_selector_probe ||
+         g_cfg.enable_deep_probe ||
+         is_sender_only_dollman_radio_mute_enabled());
+    BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
+    BOOL blocked_sender_only = g_cfg.enabled && should_block_sender_only_event_id(event_id);
+    BOOL blocked = blocked_legacy || blocked_sender_only;
+    const char *block_mode = blocked_sender_only ? "sender-only-narrow" :
+                             (blocked_legacy ? "legacy" : "none");
+    uintptr_t caller_ra = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+        ? (caller_ra - g_image_base)
+        : 0;
+    uintptr_t ext_ptr = (uintptr_t)external_sources;
+    uint64_t ext0 = safe_read_u64(ext_ptr + 0x0);
+    uint64_t ext1 = safe_read_u64(ext_ptr + 0x8);
+    uint64_t dedupe_key = 0;
+
+    if (probe_enabled) {
+        dedupe_key = ((uint64_t)event_id) ^
+                     (((uint64_t)caller_rva) << 32) ^
+                     (((uint64_t)(uint32_t)external_source_count) << 19) ^
+                     (((uint64_t)game_object_id) >> 7) ^
+                     (((uint64_t)ext0) << 3) ^
+                     (((uint64_t)ext1) >> 11) ^
+                     0x504F53544556454Eull;
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            log_line(
+                "[postevent] caller_rva=0x%llx eventId=%u gameObject=0x%llx externalSources=%u ext_ptr=0x%llx ext0=0x%llx ext1=0x%llx blocked=%d playingIdIn=%u",
+                (unsigned long long)caller_rva,
+                (unsigned int)event_id,
+                (unsigned long long)game_object_id,
+                (unsigned int)external_source_count,
+                (unsigned long long)ext_ptr,
+                (unsigned long long)ext0,
+                (unsigned long long)ext1,
+                blocked ? 1 : 0,
+                (unsigned int)playing_id);
+        }
+    }
 
     if (blocked) {
         log_line(
-            "Blocked PostEventID eventId=%u gameObject=0x%llx externalSources=%u",
+            "Blocked PostEventID mode=%s eventId=%u gameObject=0x%llx externalSources=%u",
+            block_mode,
             (unsigned int)event_id,
             (unsigned long long)game_object_id,
             (unsigned int)external_source_count);
@@ -1570,7 +1756,7 @@ static uintptr_t __fastcall hook_dollman_radio_play_voice_by_controller_delay(
     uintptr_t instance,
     int controller_index)
 {
-    if (g_cfg.enabled && g_cfg.enable_dollman_radio_mute) {
+    if (is_legacy_dollman_radio_mute_enabled()) {
         log_line(
             "Muted DollmanRadio.PlayVoiceByControllerDelay instance=%p controller=%d",
             (void *)instance,
@@ -1581,29 +1767,272 @@ static uintptr_t __fastcall hook_dollman_radio_play_voice_by_controller_delay(
     return g_real_dollman_radio_play_voice_by_controller_delay(instance, controller_index);
 }
 
-static uintptr_t __fastcall hook_dollman_voice_dispatcher(
-    uintptr_t lock_obj,
-    uintptr_t radio_instance,
-    uintptr_t param32,
-    int mode,
-    int *sentence_key)
+static char __fastcall hook_voice_queue_submit(
+    uintptr_t *queue_obj,
+    unsigned int *request,
+    char a3,
+    uintptr_t a4,
+    uintptr_t a5,
+    unsigned char *a6)
 {
-    if (g_cfg.enabled && g_cfg.enable_dollman_radio_mute) {
-        log_line(
-            "Muted DollmanVoiceDispatcher radio=%p mode=%d key=0x%x param=%p",
-            (void *)radio_instance,
-            mode,
-            (sentence_key != NULL) ? (unsigned int)*sentence_key : 0u,
-            (void *)param32);
-        return 1;
+    BOOL probe_enabled =
+        (g_cfg.enable_deep_probe ||
+         is_sender_only_dollman_radio_mute_enabled()) &&
+        is_stf_probe_window_open();
+    uintptr_t caller_ra = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+        ? (caller_ra - g_image_base)
+        : 0;
+
+    if (probe_enabled && request != NULL && is_voice_queue_probe_caller(caller_rva)) {
+        uintptr_t request_addr = (uintptr_t)request;
+        uintptr_t request_ref = safe_read_ptr(request_addr + 0x8);
+        uintptr_t request_ref_vtbl = safe_read_ptr(request_ref + 0x0);
+        uintptr_t request_ref_vtbl_rva = 0;
+        uintptr_t source_vtbl = safe_read_ptr(a4 + 0x0);
+        uintptr_t source_vtbl_rva = 0;
+        uintptr_t source_p20 = safe_read_ptr(a4 + 0x20);
+        uintptr_t source_p20_vtbl = safe_read_ptr(source_p20 + 0x0);
+        uintptr_t source_p20_vtbl_rva = 0;
+        uintptr_t payload_vtbl = safe_read_ptr(a5 + 0x0);
+        uintptr_t payload_vtbl_rva = 0;
+        uint32_t request_key = safe_read_u32(request_addr + 0x0);
+        int request_index = (int)safe_read_u32(request_addr + 0x10);
+        uint32_t request_flag20 = safe_read_u32(request_addr + 0x14) & 0xFFu;
+        uint32_t request_raw24 = safe_read_u32(request_addr + 0x18);
+        uint32_t request_raw28 = safe_read_u32(request_addr + 0x1C);
+        uint32_t request_tail_flags = safe_read_u32(request_addr + 0x20);
+        uint32_t request_flag32 = request_tail_flags & 0xFFu;
+        uint32_t request_flag33 = (request_tail_flags >> 8) & 0xFFu;
+        uint32_t request_flag34 = (request_tail_flags >> 16) & 0xFFu;
+        int request_param = (int)safe_read_u32(request_addr + 0x24);
+        uint32_t source_mode_a0 = safe_read_u32(a4 + 0xA0);
+        uint32_t source_p20_hi32 = read_identity_hi32(source_p20);
+        uint32_t request_ref_tag = 0;
+        uint32_t source_p20_tag = 0;
+        uint32_t payload_tag = 0;
+        char request_ref_text[160];
+        char source_p20_text[160];
+        char payload_text[160];
+        BOOL request_ref_ok;
+        BOOL source_p20_ok;
+        BOOL payload_ok;
+        uint64_t dedupe_key;
+
+        ZeroMemory(request_ref_text, sizeof(request_ref_text));
+        ZeroMemory(source_p20_text, sizeof(source_p20_text));
+        ZeroMemory(payload_text, sizeof(payload_text));
+
+        if (g_image_base != 0 && request_ref_vtbl > g_image_base) {
+            request_ref_vtbl_rva = request_ref_vtbl - g_image_base;
+        }
+        if (g_image_base != 0 && source_vtbl > g_image_base) {
+            source_vtbl_rva = source_vtbl - g_image_base;
+        }
+        if (g_image_base != 0 && source_p20_vtbl > g_image_base) {
+            source_p20_vtbl_rva = source_p20_vtbl - g_image_base;
+        }
+        if (g_image_base != 0 && payload_vtbl > g_image_base) {
+            payload_vtbl_rva = payload_vtbl - g_image_base;
+        }
+
+        request_ref_ok = read_localized_text_resource(
+            request_ref,
+            &request_ref_tag,
+            request_ref_text,
+            sizeof(request_ref_text));
+        source_p20_ok = read_localized_text_resource(
+            source_p20,
+            &source_p20_tag,
+            source_p20_text,
+            sizeof(source_p20_text));
+        payload_ok = read_localized_text_resource(
+            a5,
+            &payload_tag,
+            payload_text,
+            sizeof(payload_text));
+
+        dedupe_key = ((uint64_t)caller_rva << 32) ^
+                     ((uint64_t)request_key) ^
+                     ((uint64_t)(uint32_t)request_index << 5) ^
+                     ((uint64_t)request_raw24 << 13) ^
+                     ((uint64_t)request_raw28 << 19) ^
+                     ((uint64_t)(uint32_t)request_param << 27) ^
+                     ((uint64_t)source_p20_hi32 << 7) ^
+                     ((uint64_t)a5 >> 4) ^
+                     0xDAC9100000000000ull;
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            log_line(
+                "[voice-queue] tid=%lu caller=%s caller_rva=0x%llx queue=0x%llx request=0x%llx "
+                "req_key=0x%x req_ref=0x%llx req_ref_vtbl_rva=0x%llx req_ref_ok=%d req_ref_tag=0x%x req_ref_text=\"%s\" "
+                "req_index=%d req_flag20=0x%x raw24=0x%x raw28=0x%x flags32_34=[0x%x,0x%x,0x%x] req_param=%d a3=0x%x "
+                "source=0x%llx source_vtbl_rva=0x%llx source+0x20=0x%llx source20_vtbl_rva=0x%llx source20_hi32=0x%x source20_ok=%d source20_tag=0x%x source20_text=\"%s\" "
+                "payload=0x%llx payload_vtbl_rva=0x%llx payload_ok=%d payload_tag=0x%x payload_text=\"%s\" source_mode_a0=0x%x",
+                (unsigned long)GetCurrentThreadId(),
+                voice_queue_probe_caller_name(caller_rva),
+                (unsigned long long)caller_rva,
+                (unsigned long long)queue_obj,
+                (unsigned long long)request_addr,
+                (unsigned int)request_key,
+                (unsigned long long)request_ref,
+                (unsigned long long)request_ref_vtbl_rva,
+                request_ref_ok ? 1 : 0,
+                (unsigned int)request_ref_tag,
+                request_ref_text,
+                request_index,
+                (unsigned int)request_flag20,
+                (unsigned int)request_raw24,
+                (unsigned int)request_raw28,
+                (unsigned int)request_flag32,
+                (unsigned int)request_flag33,
+                (unsigned int)request_flag34,
+                request_param,
+                (unsigned int)(unsigned char)a3,
+                (unsigned long long)a4,
+                (unsigned long long)source_vtbl_rva,
+                (unsigned long long)source_p20,
+                (unsigned long long)source_p20_vtbl_rva,
+                (unsigned int)source_p20_hi32,
+                source_p20_ok ? 1 : 0,
+                (unsigned int)source_p20_tag,
+                source_p20_text,
+                (unsigned long long)a5,
+                (unsigned long long)payload_vtbl_rva,
+                payload_ok ? 1 : 0,
+                (unsigned int)payload_tag,
+                payload_text,
+                (unsigned int)source_mode_a0);
+        }
     }
 
-    return g_real_dollman_voice_dispatcher(lock_obj, radio_instance, param32, mode, sentence_key);
+    return g_real_voice_queue_submit(queue_obj, request, a3, a4, a5, a6);
+}
+
+static uintptr_t __fastcall hook_voice_shared_helper(
+    uintptr_t manager_obj,
+    uintptr_t voice_source,
+    uintptr_t payload_source,
+    int mode,
+    unsigned int *sentence_key)
+{
+    BOOL probe_enabled =
+        g_cfg.enable_deep_probe ||
+        is_sender_only_dollman_radio_mute_enabled();
+
+    if (probe_enabled && is_stf_probe_window_open()) {
+        uintptr_t caller_ra = get_return_address_value();
+        uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+            ? (caller_ra - g_image_base)
+            : 0;
+        const char *caller_name = "other";
+        uintptr_t source_vtbl = safe_read_ptr(voice_source + 0x0);
+        uintptr_t source_vtbl_rva = 0;
+        uintptr_t source_p20 = safe_read_ptr(voice_source + 0x20);
+        uintptr_t source_p20_vtbl = safe_read_ptr(source_p20 + 0x0);
+        uintptr_t source_p20_vtbl_rva = 0;
+        uintptr_t payload_vtbl = safe_read_ptr(payload_source + 0x0);
+        uintptr_t payload_vtbl_rva = 0;
+        uint32_t source_p20_hi32 = read_identity_hi32(source_p20);
+        uint32_t source_mode_a0 = safe_read_u32(voice_source + 0xA0);
+        uint32_t key = (sentence_key != NULL) ? *sentence_key : 0u;
+        uint32_t payload_tag = 0;
+        uint32_t source_p20_tag = 0;
+        char payload_text[160];
+        char source_p20_text[160];
+        BOOL payload_ok;
+        BOOL source_p20_ok;
+        uint64_t dedupe_key;
+
+        ZeroMemory(payload_text, sizeof(payload_text));
+        ZeroMemory(source_p20_text, sizeof(source_p20_text));
+
+        if (caller_rva == k_rva_voice_shared_helper_player_return) {
+            caller_name = "player";
+        } else if (caller_rva == k_rva_voice_shared_helper_dollman_return) {
+            caller_name = "dollman";
+        }
+
+        if (g_image_base != 0 && source_vtbl > g_image_base) {
+            source_vtbl_rva = source_vtbl - g_image_base;
+        }
+        if (g_image_base != 0 && source_p20_vtbl > g_image_base) {
+            source_p20_vtbl_rva = source_p20_vtbl - g_image_base;
+        }
+        if (g_image_base != 0 && payload_vtbl > g_image_base) {
+            payload_vtbl_rva = payload_vtbl - g_image_base;
+        }
+
+        payload_ok = read_localized_text_resource(
+            payload_source,
+            &payload_tag,
+            payload_text,
+            sizeof(payload_text));
+        source_p20_ok = read_localized_text_resource(
+            source_p20,
+            &source_p20_tag,
+            source_p20_text,
+            sizeof(source_p20_text));
+
+        dedupe_key = ((uint64_t)voice_source << 1) ^
+                     ((uint64_t)payload_source >> 3) ^
+                     ((uint64_t)(uint32_t)mode << 32) ^
+                     ((uint64_t)caller_rva << 17) ^
+                     (uint64_t)key ^
+                     0xDAC7B00000000000ull;
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            log_line(
+                "[voice-shared] tid=%lu caller=%s caller_rva=0x%llx manager=0x%llx source=0x%llx source_vtbl_rva=0x%llx "
+                "source+0x20=0x%llx source20_vtbl_rva=0x%llx source20_hi32=0x%x source20_ok=%d source20_tag=0x%x source20_text=\"%s\" "
+                "payload=0x%llx payload_vtbl_rva=0x%llx payload_ok=%d payload_tag=0x%x payload_text=\"%s\" "
+                "mode=%d mode_hex=0x%x key=0x%x source_mode_a0=0x%x",
+                (unsigned long)GetCurrentThreadId(),
+                caller_name,
+                (unsigned long long)caller_rva,
+                (unsigned long long)manager_obj,
+                (unsigned long long)voice_source,
+                (unsigned long long)source_vtbl_rva,
+                (unsigned long long)source_p20,
+                (unsigned long long)source_p20_vtbl_rva,
+                (unsigned int)source_p20_hi32,
+                source_p20_ok ? 1 : 0,
+                (unsigned int)source_p20_tag,
+                source_p20_text,
+                (unsigned long long)payload_source,
+                (unsigned long long)payload_vtbl_rva,
+                payload_ok ? 1 : 0,
+                (unsigned int)payload_tag,
+                payload_text,
+                mode,
+                (unsigned int)mode,
+                (unsigned int)key,
+                (unsigned int)source_mode_a0);
+        }
+    }
+
+    if (is_legacy_dollman_radio_mute_enabled()) {
+        log_line(
+            "Legacy voice shared-helper mute path reached manager=%p mode=%d key=0x%x payload=%p",
+            (void *)manager_obj,
+            mode,
+            (sentence_key != NULL) ? (unsigned int)*sentence_key : 0u,
+            (void *)payload_source);
+    }
+
+    return g_real_voice_shared_helper(
+        manager_obj,
+        voice_source,
+        payload_source,
+        mode,
+        sentence_key);
 }
 
 static void __fastcall hook_dollman_voice_delay_closure(void *closure_state)
 {
-    if (g_cfg.enabled && g_cfg.enable_dollman_radio_mute) {
+    log_dollman_voice_closure_probe(
+        is_sender_only_dollman_radio_mute_enabled() ? "mute" : "pass",
+        (uintptr_t)closure_state);
+
+    if (is_sender_only_dollman_radio_mute_enabled()) {
         log_line(
             "Muted Dollman voice closure state=%p",
             closure_state);
@@ -1676,29 +2105,39 @@ static uintptr_t __fastcall hook_subtitle_runtime_wrapper(uintptr_t view, uintpt
     uint8_t meta[16];
 
     if (prepare_fn == NULL || render_fn == NULL || view == 0) {
-        return g_real_subtitle_runtime_wrapper(view, arg2);
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "bootstrap");
     }
 
-    view_vtbl = safe_deref_qword(view);
+    view_vtbl = safe_read_ptr(view);
     if (view_vtbl == 0 || IsBadReadPtr((const void *)(view_vtbl + 80), sizeof(uintptr_t))) {
-        return g_real_subtitle_runtime_wrapper(view, arg2);
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "view-vtbl");
     }
-    stage_fn = (SubtitleRuntimeStageFn)safe_deref_qword(view_vtbl + 80);
+    stage_fn = (SubtitleRuntimeStageFn)safe_read_ptr(view_vtbl + 80);
     if (stage_fn == NULL) {
-        return g_real_subtitle_runtime_wrapper(view, arg2);
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "stage-fn");
     }
 
     token = read_subtitle_runtime_prepare_token();
     if (token == 0) {
-        return g_real_subtitle_runtime_wrapper(view, arg2);
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "prepare-token");
+    }
+
+    state = safe_read_ptr(view + 24);
+    state_vtbl = safe_read_ptr(state);
+    if (state == 0 || state_vtbl == 0 || IsBadReadPtr((const void *)(state_vtbl + 64), sizeof(uintptr_t))) {
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "state-pre-prepare");
+    }
+    payload_getter_fn = (SubtitleRuntimePayloadGetterFn)safe_read_ptr(state_vtbl + 64);
+    if (payload_getter_fn == NULL) {
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "payload-getter-pre-prepare");
     }
 
     prepare_fn(view, arg2, token);
 
-    state = safe_deref_qword(view + 24);
-    state_vtbl = safe_deref_qword(state);
+    state = safe_read_ptr(view + 24);
+    state_vtbl = safe_read_ptr(state);
     if (state == 0 || state_vtbl == 0 || IsBadReadPtr((const void *)(state_vtbl + 64), sizeof(uintptr_t))) {
-        return 0;
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "state-post-prepare");
     }
 
     stage_fn(view,
@@ -1708,22 +2147,22 @@ static uintptr_t __fastcall hook_subtitle_runtime_wrapper(uintptr_t view, uintpt
              view + (16 * sizeof(uintptr_t)),
              view + (299 * sizeof(uintptr_t)));
 
-    state = safe_deref_qword(view + 24);
-    state_vtbl = safe_deref_qword(state);
+    state = safe_read_ptr(view + 24);
+    state_vtbl = safe_read_ptr(state);
     if (state == 0 || state_vtbl == 0 || IsBadReadPtr((const void *)(state_vtbl + 64), sizeof(uintptr_t))) {
-        return 0;
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "state-post-stage");
     }
 
-    payload_getter_fn = (SubtitleRuntimePayloadGetterFn)safe_deref_qword(state_vtbl + 64);
+    payload_getter_fn = (SubtitleRuntimePayloadGetterFn)safe_read_ptr(state_vtbl + 64);
     if (payload_getter_fn == NULL) {
-        return 0;
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "payload-getter-post-stage");
     }
 
     ZeroMemory(scratch, sizeof(scratch));
     ZeroMemory(meta, sizeof(meta));
     payload_src = payload_getter_fn(state, scratch, meta);
     if (payload_src == 0 || IsBadReadPtr((const void *)payload_src, 0x60)) {
-        return 0;
+        return pass_through_subtitle_runtime_wrapper(view, arg2, "payload-src");
     }
 
     if (process_subtitle_payload("wrapper", caller_rva, (const uint64_t *)payload_src)) {
@@ -1768,13 +2207,40 @@ static uintptr_t __fastcall hook_remove_subtitle(uintptr_t view, const uint64_t 
 
 static uintptr_t safe_deref_qword(uintptr_t addr)
 {
+    return (uintptr_t)safe_read_u64(addr);
+}
+
+static uintptr_t safe_read_ptr(uintptr_t addr)
+{
     if (addr == 0) {
         return 0;
     }
     if (IsBadReadPtr((const void *)addr, sizeof(uintptr_t))) {
         return 0;
     }
-    return *(uintptr_t *)addr;
+    return *(const uintptr_t *)addr;
+}
+
+static uint64_t safe_read_u64(uintptr_t addr)
+{
+    if (addr == 0) {
+        return 0;
+    }
+    if (IsBadReadPtr((const void *)addr, sizeof(uint64_t))) {
+        return 0;
+    }
+    return *(const uint64_t *)addr;
+}
+
+static uint32_t safe_read_u32(uintptr_t addr)
+{
+    if (addr == 0) {
+        return 0;
+    }
+    if (IsBadReadPtr((const void *)addr, sizeof(uint32_t))) {
+        return 0;
+    }
+    return *(const uint32_t *)addr;
 }
 
 static BOOL read_localized_text_resource(
@@ -2092,6 +2558,24 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
     uintptr_t desc;
     uintptr_t desc_vtbl;
     uintptr_t desc_vtbl_rva = 0;
+    uint64_t pack_key0;
+    uint64_t pack_key1;
+    uint32_t pack_mode88;
+    uintptr_t pack_builder96;
+    uintptr_t pack_builder96_vtbl;
+    uintptr_t pack_builder96_vtbl_rva = 0;
+    uint32_t pack_flags104;
+    uint32_t pack_aux108;
+    uintptr_t pack_key112;
+    uint64_t pack_key112_w0;
+    uint64_t pack_key112_w1;
+    uint64_t pack_pair120_0;
+    uint64_t pack_pair120_1;
+    uintptr_t pack_obj136;
+    uintptr_t pack_obj136_vtbl;
+    uintptr_t pack_obj136_vtbl_rva = 0;
+    uint32_t pack_u144;
+    uint32_t pack_u148;
     uintptr_t line_loc;
     uintptr_t speaker_wrap;
     uintptr_t speaker_wrap_vtbl;
@@ -2105,6 +2589,8 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
     BOOL line_ok;
     BOOL speaker_ok;
     uint64_t dedupe_key;
+    uint64_t phase_hash;
+    const unsigned char *phase_ptr;
 
     if (!is_stf_probe_window_open() || this_obj == 0) {
         return;
@@ -2124,6 +2610,29 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
         desc_vtbl_rva = desc_vtbl - g_image_base;
     }
 
+    pack_key0 = safe_read_u64(this_obj + 48);
+    pack_key1 = safe_read_u64(this_obj + 56);
+    pack_mode88 = safe_read_u32(this_obj + 88);
+    pack_builder96 = safe_read_ptr(this_obj + 96);
+    pack_builder96_vtbl = safe_read_ptr(pack_builder96 + 0x0);
+    if (g_image_base != 0 && pack_builder96_vtbl > g_image_base) {
+        pack_builder96_vtbl_rva = pack_builder96_vtbl - g_image_base;
+    }
+    pack_flags104 = safe_read_u32(this_obj + 104);
+    pack_aux108 = safe_read_u32(this_obj + 108);
+    pack_key112 = safe_read_ptr(this_obj + 112);
+    pack_key112_w0 = safe_read_u64(pack_key112 + 0x0);
+    pack_key112_w1 = safe_read_u64(pack_key112 + 0x8);
+    pack_pair120_0 = safe_read_u64(this_obj + 120);
+    pack_pair120_1 = safe_read_u64(this_obj + 128);
+    pack_obj136 = safe_read_ptr(this_obj + 136);
+    pack_obj136_vtbl = safe_read_ptr(pack_obj136 + 0x0);
+    if (g_image_base != 0 && pack_obj136_vtbl > g_image_base) {
+        pack_obj136_vtbl_rva = pack_obj136_vtbl - g_image_base;
+    }
+    pack_u144 = safe_read_u32(this_obj + 144);
+    pack_u148 = safe_read_u32(this_obj + 148);
+
     line_loc = safe_deref_qword(desc + 0x48);
     speaker_wrap = safe_deref_qword(desc + 0x50);
     speaker_wrap_vtbl = safe_deref_qword(speaker_wrap + 0x0);
@@ -2135,20 +2644,26 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
 
     line_ok = read_localized_text_resource(line_loc, &line_tag, line_text, sizeof(line_text));
     speaker_ok = read_localized_text_resource(speaker_loc, &speaker_tag, speaker_text, sizeof(speaker_text));
-    if (!line_ok && !speaker_ok) {
-        return;
-    }
 
     dedupe_key = ((uint64_t)desc << 1) ^ ((uint64_t)line_loc >> 3) ^ ((uint64_t)speaker_loc << 7);
-    if (phase != NULL && phase[0] == 'p' && phase[1] == 'o') {
-        dedupe_key ^= 0x9E3779B97F4A7C15ull;
+    dedupe_key ^= ((uint64_t)pack_mode88 << 32) ^ (uint64_t)pack_flags104;
+    phase_hash = 1469598103934665603ull;
+    for (phase_ptr = (const unsigned char *)(phase != NULL ? phase : "");
+         *phase_ptr != '\0';
+         ++phase_ptr) {
+        phase_hash ^= (uint64_t)(*phase_ptr);
+        phase_hash *= 1099511628211ull;
     }
+    dedupe_key ^= phase_hash;
     if (stf_probe_seen_or_mark(dedupe_key)) {
         return;
     }
 
     log_line(
         "[stf-%s] tid=%lu this=0x%llx p200=0x%llx desc=0x%llx desc_vtbl_rva=0x%llx "
+        "pack48=[0x%llx,0x%llx] mode88=0x%x builder96=0x%llx builder96_vtbl_rva=0x%llx "
+        "flags104=0x%x aux108=0x%x key112=0x%llx key112_words=[0x%llx,0x%llx] "
+        "pair120=[0x%llx,0x%llx] obj136=0x%llx obj136_vtbl_rva=0x%llx u144=0x%x u148=0x%x "
         "line=0x%llx ok=%d tag=0x%x text=\"%s\" "
         "speaker_wrap=0x%llx wrap_vtbl_rva=0x%llx wrap_tag=0x%x "
         "speaker=0x%llx ok=%d tag=0x%x text=\"%s\"",
@@ -2158,6 +2673,22 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
         (unsigned long long)p200,
         (unsigned long long)desc,
         (unsigned long long)desc_vtbl_rva,
+        (unsigned long long)pack_key0,
+        (unsigned long long)pack_key1,
+        (unsigned int)pack_mode88,
+        (unsigned long long)pack_builder96,
+        (unsigned long long)pack_builder96_vtbl_rva,
+        (unsigned int)pack_flags104,
+        (unsigned int)pack_aux108,
+        (unsigned long long)pack_key112,
+        (unsigned long long)pack_key112_w0,
+        (unsigned long long)pack_key112_w1,
+        (unsigned long long)pack_pair120_0,
+        (unsigned long long)pack_pair120_1,
+        (unsigned long long)pack_obj136,
+        (unsigned long long)pack_obj136_vtbl_rva,
+        (unsigned int)pack_u144,
+        (unsigned int)pack_u148,
         (unsigned long long)line_loc,
         line_ok ? 1 : 0,
         (unsigned int)line_tag,
@@ -2169,6 +2700,76 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
         speaker_ok ? 1 : 0,
         (unsigned int)speaker_tag,
         speaker_text);
+}
+
+static void log_dollman_voice_closure_probe(const char *phase, uintptr_t closure_state)
+{
+    BOOL probe_enabled =
+        (g_cfg.enable_deep_probe ||
+         is_sender_only_dollman_radio_mute_enabled()) &&
+        is_stf_probe_window_open();
+    uintptr_t source_obj;
+    uintptr_t source_vtbl;
+    uintptr_t source_vtbl_rva = 0;
+    uintptr_t source_p20;
+    uintptr_t source_p20_vtbl;
+    uintptr_t source_p20_vtbl_rva = 0;
+    uint32_t source_p20_hi32;
+    uint32_t captured_id;
+    uint32_t source_mode_a0;
+    uint64_t dedupe_key;
+
+    if (!probe_enabled || closure_state == 0) {
+        return;
+    }
+
+    source_obj = safe_read_ptr(closure_state + 0x0);
+    if (source_obj == 0) {
+        return;
+    }
+
+    captured_id = safe_read_u32(closure_state + 0x8);
+    source_vtbl = safe_read_ptr(source_obj + 0x0);
+    if (g_image_base != 0 && source_vtbl > g_image_base) {
+        source_vtbl_rva = source_vtbl - g_image_base;
+    }
+
+    source_p20 = safe_read_ptr(source_obj + 0x20);
+    source_p20_vtbl = safe_read_ptr(source_p20 + 0x0);
+    if (g_image_base != 0 && source_p20_vtbl > g_image_base) {
+        source_p20_vtbl_rva = source_p20_vtbl - g_image_base;
+    }
+    source_p20_hi32 = read_identity_hi32(source_p20);
+    source_mode_a0 = safe_read_u32(source_obj + 0xA0);
+
+    dedupe_key = ((uint64_t)source_obj << 1) ^
+                 ((uint64_t)source_p20 >> 3) ^
+                 ((uint64_t)captured_id << 32) ^
+                 ((uint64_t)source_mode_a0 << 11) ^
+                 0xD011A4D0A11B00B5ull;
+    if (phase != NULL && phase[0] == 'p') {
+        dedupe_key ^= 0x9E3779B97F4A7C15ull;
+    }
+    if (stf_probe_seen_or_mark(dedupe_key)) {
+        return;
+    }
+
+    log_line(
+        "[voice-%s] tid=%lu closure=0x%llx source=0x%llx source_vtbl_rva=0x%llx "
+        "source+0x20=0x%llx p20_vtbl_rva=0x%llx p20_hi32=0x%x "
+        "captured_id=0x%x source_mode_a0=0x%x",
+        phase != NULL ? phase : "?",
+        (unsigned long)GetCurrentThreadId(),
+        (unsigned long long)closure_state,
+        (unsigned long long)source_obj,
+        (unsigned long long)source_vtbl_rva,
+        (unsigned long long)source_p20,
+        (unsigned long long)source_p20_vtbl_rva,
+        (unsigned int)source_p20_hi32,
+        (unsigned int)captured_id,
+        (unsigned int)source_mode_a0);
+
+    log_localized_text_resource_candidate("voice-source+0x20", source_p20);
 }
 
 static BOOL identity_seen_or_mark(uintptr_t key)
@@ -2255,7 +2856,7 @@ static uintptr_t __fastcall hook_subtitle_producer(uintptr_t this_obj)
     uintptr_t result;
     BOOL probe_enabled = (g_cfg.enable_subtitle_producer_probe ||
                           g_cfg.enable_builder_probe ||
-                          g_cfg.enable_selector_probe);
+                          g_cfg.enable_deep_probe);
 
     if (probe_enabled) {
         log_start_talk_function_snapshot("pre", this_obj);
@@ -2288,7 +2889,7 @@ static uintptr_t __fastcall hook_start_talk_init(uintptr_t this_obj)
     uintptr_t result;
     BOOL probe_enabled = (g_cfg.enable_subtitle_producer_probe ||
                           g_cfg.enable_builder_probe ||
-                          g_cfg.enable_selector_probe);
+                          g_cfg.enable_deep_probe);
 
     if (probe_enabled) {
         log_start_talk_function_snapshot("sti-pre", this_obj);
@@ -2550,6 +3151,22 @@ static uintptr_t __fastcall hook_selector_dispatch(uintptr_t rcx, uintptr_t rdx)
     return g_real_selector_dispatch(rcx, rdx);
 }
 
+static uintptr_t pass_through_subtitle_runtime_wrapper(
+    uintptr_t view,
+    uintptr_t arg2,
+    const char *reason)
+{
+    log_verbose(
+        "[wrapper-pass] reason=%s view=0x%llx arg2=0x%llx",
+        reason != NULL ? reason : "?",
+        (unsigned long long)view,
+        (unsigned long long)arg2);
+    if (g_real_subtitle_runtime_wrapper == NULL) {
+        return 0;
+    }
+    return g_real_subtitle_runtime_wrapper(view, arg2);
+}
+
 __declspec(dllexport) int core_init(const ProxyContext *ctx)
 {
     MH_STATUS status;
@@ -2564,6 +3181,9 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     BOOL effective_dollman_radio_mute = FALSE;
     BOOL sender_only_dollman_voice_mute = FALSE;
     BOOL install_subtitle_runtime_wrapper = FALSE;
+    BOOL need_deep_probe = FALSE;
+    BOOL need_voice_dispatch_hook = FALSE;
+    BOOL need_voice_closure_hook = FALSE;
 
     ZeroMemory(&g_proxy_ctx, sizeof(g_proxy_ctx));
     if (ctx != NULL) {
@@ -2606,28 +3226,27 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     reset_strategy_stats();
     reset_hotkey_runtime_state();
     reset_session_probe_state();
-    InterlockedExchange(&g_subtitle_runtime_hits, 0);
-    InterlockedExchange(&g_subtitle_remove_hits, 0);
+    reset_log_capture_state();
     seed_hotkey_state_from_config();
     get_hotkey_mute_state(&throw_recall_mute, &dialogue_mute, &g_active_subtitle_strategy);
     subtitle_runtime_surface_enabled = g_cfg.enable_subtitle_runtime_hooks;
-    sender_only_runtime_mode =
-        subtitle_runtime_surface_enabled &&
-        g_cfg.enable_sender_only_runtime_mode;
-    sender_only_dollman_voice_mute =
-        g_cfg.enable_dollman_radio_mute &&
-        sender_only_runtime_mode;
-    effective_dollman_radio_mute =
-        g_cfg.enable_dollman_radio_mute &&
-        !sender_only_runtime_mode;
+    sender_only_runtime_mode = is_sender_only_runtime_mode_enabled();
+    sender_only_dollman_voice_mute = is_sender_only_dollman_radio_mute_enabled();
+    effective_dollman_radio_mute = is_legacy_dollman_radio_mute_enabled();
     install_subtitle_runtime_wrapper =
         subtitle_runtime_surface_enabled &&
-        !sender_only_runtime_mode;
+        !sender_only_runtime_mode &&
+        g_cfg.enable_legacy_runtime_wrapper;
+    need_deep_probe = g_cfg.enable_deep_probe;
+    need_voice_dispatch_hook =
+        sender_only_dollman_voice_mute ||
+        need_deep_probe;
+    need_voice_closure_hook = sender_only_dollman_voice_mute || need_deep_probe;
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
     log_line(
-        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d effectiveRadioMute=%d senderOnlyVoiceMute=%d throwRecallSubtitleMute=%d activeStrategy=%s strategyDesc='%s' subtitleRuntime=%d senderOnlyMode=%d familyTracking=%d producerProbe=%d builderProbe=%d selectorProbe=%d talkProbe=%d scannerMode=%u",
+        "DollmanMute init start: enabled=%d verbose=%d dollmanRadioMute=%d effectiveRadioMute=%d senderOnlyVoiceMute=%d throwRecallSubtitleMute=%d activeStrategy=%s strategyDesc='%s' subtitleRuntime=%d senderOnlyMode=%d legacyWrapper=%d familyTracking=%d producerProbe=%d builderProbe=%d selectorProbe=%d deepProbe=%d talkProbe=%d scannerMode=%u",
         g_cfg.enabled,
         g_cfg.verbose_log,
         g_cfg.enable_dollman_radio_mute,
@@ -2638,10 +3257,12 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         subtitle_strategy_desc(g_active_subtitle_strategy),
         subtitle_runtime_surface_enabled,
         sender_only_runtime_mode,
+        g_cfg.enable_legacy_runtime_wrapper,
         g_cfg.enable_subtitle_family_tracking,
         g_cfg.enable_subtitle_producer_probe,
         g_cfg.enable_builder_probe,
         g_cfg.enable_selector_probe,
+        g_cfg.enable_deep_probe,
         g_cfg.enable_talk_dispatcher_probe,
         (unsigned int)g_cfg.scanner_mode);
 
@@ -2651,6 +3272,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     need_subtitle_producer_hook =
         g_cfg.enable_subtitle_producer_probe ||
         g_cfg.enable_builder_probe ||
+        need_deep_probe ||
         g_cfg.enable_subtitle_family_tracking;
 
     status = MH_Initialize();
@@ -2659,13 +3281,24 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         return 0;
     }
 
-    if (effective_dollman_radio_mute || g_cfg.scanner_mode != SCANNER_MODE_OFF) {
+    if (effective_dollman_radio_mute ||
+        g_cfg.scanner_mode != SCANNER_MODE_OFF ||
+        sender_only_dollman_voice_mute ||
+        need_deep_probe) {
         if (install_export_hook(
                 k_export_post_event_id,
                 hook_post_event_id,
                 (void **)&g_real_post_event_id,
                 "PostEventID")) {
             ++hook_count;
+            if (!effective_dollman_radio_mute && g_cfg.scanner_mode == SCANNER_MODE_OFF) {
+                if (sender_only_dollman_voice_mute) {
+                    log_line(
+                        "PostEventID sender-only narrow mute active: throw/recall Wwise events are blocked; F8 windows also log audio events");
+                } else if (need_deep_probe) {
+                    log_line("PostEventID passive probe active: F8 windows log audio events without legacy broad mute");
+                }
+            }
         }
     } else {
         log_line("Legacy PostEvent mute path disabled");
@@ -2679,28 +3312,51 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "DollmanRadio.PlayVoiceByControllerDelay")) {
             ++hook_count;
         }
-        if (install_rva_hook(
-                k_rva_dollman_voice_dispatcher,
-                hook_dollman_voice_dispatcher,
-                (void **)&g_real_dollman_voice_dispatcher,
-                "DollmanVoiceDispatcher")) {
-            ++hook_count;
-        }
-    } else if (sender_only_dollman_voice_mute) {
-        if (install_rva_hook(
-                k_rva_dollman_voice_delay_closure,
-                hook_dollman_voice_delay_closure,
-                (void **)&g_real_dollman_voice_delay_closure,
-                "DollmanVoiceDelayClosure.sub_140C73EE0")) {
-            ++hook_count;
-            log_line("Sender-only Dollman voice mute active via closure.sub_140C73EE0");
-        }
     } else {
         if (g_cfg.enable_dollman_radio_mute && sender_only_runtime_mode) {
             log_line("Dollman radio mute suppressed by sender-only runtime mode");
         } else {
             log_line("Dollman radio mute disabled by config");
         }
+    }
+
+    if (need_voice_dispatch_hook) {
+        if (install_rva_hook(
+                k_rva_voice_queue_submit,
+                hook_voice_queue_submit,
+                (void **)&g_real_voice_queue_submit,
+                "VoiceQueueSubmit.sub_140DAC910")) {
+            ++hook_count;
+        }
+    } else {
+        log_line("Voice queue submit hook disabled");
+    }
+
+    if (need_voice_dispatch_hook) {
+        if (install_rva_hook(
+                k_rva_voice_shared_helper,
+                hook_voice_shared_helper,
+                (void **)&g_real_voice_shared_helper,
+                "VoiceSharedHelper.sub_140DAC7B0")) {
+            ++hook_count;
+        }
+    } else {
+        log_line("Voice shared-helper hook disabled");
+    }
+
+    if (need_voice_closure_hook) {
+        if (install_rva_hook(
+                k_rva_dollman_voice_delay_closure,
+                hook_dollman_voice_delay_closure,
+                (void **)&g_real_dollman_voice_delay_closure,
+                "DollmanVoiceDelayClosure.sub_140C73EE0")) {
+            ++hook_count;
+            if (sender_only_dollman_voice_mute) {
+                log_line("Sender-only Dollman voice mute active via closure.sub_140C73EE0");
+            }
+        }
+    } else {
+        log_line("Dollman voice closure hook disabled");
     }
 
     if (need_show_subtitle_hook) {
@@ -2718,6 +3374,8 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         } else {
             if (sender_only_runtime_mode) {
                 log_line("Sender-only runtime mode active: skipping subtitle runtime wrapper hook");
+            } else if (!g_cfg.enable_legacy_runtime_wrapper) {
+                log_line("Legacy subtitle runtime wrapper disabled by config; sender surface remains active");
             }
         }
 
@@ -2767,7 +3425,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("ShowSubtitle payload family classification active: producer-side family tracking not required for active strategy");
     }
 
-    if (g_cfg.enable_subtitle_producer_probe) {
+    if (g_cfg.enable_subtitle_producer_probe || need_deep_probe) {
         if (install_rva_hook(
                 k_rva_start_talk_init,
                 hook_start_talk_init,
@@ -2776,7 +3434,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
             ++hook_count;
         }
     } else {
-        log_line("Deep StartTalk init probe disabled by config");
+        log_line("Deep StartTalk init probe disabled (needs producerProbe or deepProbe)");
     }
 
     if (g_cfg.enable_builder_probe) {
@@ -2856,6 +3514,12 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("Selector dispatch probe disabled by config");
     }
 
+    if (need_deep_probe) {
+        log_line("Deep correlation probe armed: F8 window correlates StartTalk producer/init with Dollman voice hooks");
+    } else {
+        log_line("Deep correlation probe disabled by config");
+    }
+
     if (g_cfg.enable_talk_dispatcher_probe) {
         log_line("TalkDispatcher probe remains quarantined on current build; not installed");
     } else {
@@ -2929,7 +3593,9 @@ __declspec(dllexport) void core_shutdown(void)
 
     g_real_post_event_id = NULL;
     g_real_dollman_radio_play_voice_by_controller_delay = NULL;
-    g_real_dollman_voice_dispatcher = NULL;
+    g_real_voice_shared_helper = NULL;
+    g_real_voice_queue_submit = NULL;
+    g_real_dollman_voice_delay_closure = NULL;
     g_real_subtitle_runtime_wrapper = NULL;
     g_real_show_subtitle = NULL;
     g_real_remove_subtitle = NULL;

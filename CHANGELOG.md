@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.1
+
+- Added support for game version `v1.6`.
+- Updated runtime hook RVAs for the `v1.6` executable to fix the crash after the game update.
+- Kept the `v2.0 beta` gameplay subtitle mute and expanded gameplay voice mute behavior.
+- Added an extra recent-subtitle voice gate for gameplay Dollman chatter variants that were not covered by the fixed event-id path.
+
 ## v2.0 beta
 
 - Added gameplay subtitle muting for Dollman.
@@ -10,8 +17,7 @@
 - User-facing config was simplified to `EnableVoiceMute`, `EnableSubtitleMute`, and `ScannerMode`.
 
 
-## Beta Notes
+## Notes
 
-- This is a beta release.
 - If you notice missed lines, false positives, or any other bug that affects gameplay, please let me know. Including `DollmanMute.log` from the game root is strongly recommended.
-- The current beta supports game version `v1.5`. Future game updates may cause crashes; if that happens, please roll back to mod `v1.2`.
+- `v2.1` supports game version `v1.6`. Future game updates may cause crashes; if that happens, please roll back to mod `v1.2`.

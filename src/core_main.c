@@ -42,6 +42,10 @@ typedef AkPlayingID(__cdecl *PostEventIdFn)(
 typedef uintptr_t(__fastcall *DollmanVoiceDelayScheduleFn)(
     uintptr_t instance,
     int controller_index);
+typedef void(__fastcall *InvokeReactionEventFn)(
+    unsigned char reaction_event_id,
+    unsigned char force_to_override,
+    float loop_time);
 typedef uintptr_t(__fastcall *VoiceSharedHelperFn)(
     uintptr_t manager_obj,
     uintptr_t voice_source,
@@ -55,7 +59,7 @@ typedef char(__fastcall *VoiceQueueSubmitFn)(
     uintptr_t a4,
     uintptr_t a5,
     unsigned char *a6);
-typedef void(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
+typedef uintptr_t(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
 typedef uintptr_t(__fastcall *SubtitleRuntimeWrapperFn)(uintptr_t view, uintptr_t arg2);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
 typedef uintptr_t(__fastcall *RemoveSubtitleFn)(uintptr_t view, const uint64_t *key_pair, char mode);
@@ -100,6 +104,7 @@ static HANDLE g_hotkey_thread_handle = NULL;
 
 static PostEventIdFn g_real_post_event_id = NULL;
 static DollmanVoiceDelayScheduleFn g_real_dollman_voice_delay_schedule = NULL;
+static InvokeReactionEventFn g_real_invoke_reaction_event = NULL;
 static VoiceSharedHelperFn g_real_voice_shared_helper = NULL;
 static VoiceQueueSubmitFn g_real_voice_queue_submit = NULL;
 static DollmanVoiceDelayClosureFn g_real_dollman_voice_delay_closure = NULL;
@@ -112,7 +117,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1";
+static const char *k_build_tag = "v2.1.1";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -168,23 +173,15 @@ static uintptr_t g_last_dollman_muted_caller_rva = 0;
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
-/* Legacy broad audio hook names are kept for source continuity. On the current
- * v1.5 build, 0x00C73BF0 landed in a ThroughDollmanInstance teardown path, not
- * the live delay scheduler. For v1.6, the live Dollman delay scheduler is
- * 0x00C73E80 and the Dollman-only runtime voice closure is 0x00C73F30.
- * The old 0x00DAA410 "dispatcher" probe was a manager tick/update; the real
- * shared voice submit helper is 0x00DACCD0 in v1.6.
- * On v1.6 the Player-side path that calls the shared helper has been
- * refactored: it no longer flows through the v1.5 player closure (sub_140C73A60)
- * but through sub_140C743B0, where the call to sub_140DACCD0 sits at
- * 0x140C74438 (return RVA 0x00C7443D). The Dollman-side path still calls the
- * helper from sub_140C73F30; the call sits at 0x140C73FB9 (return 0x00C73FBE).
- * Verified by IDA xrefs to sub_140DACCD0 on the v1.6 image. */
-static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C73E80u;
-static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C73F30u;
+/* v1.6 DSRadioSentenceGroupThrough* vtable check:
+ *   PlayerInstance:  schedule 0x00C73E80, closure 0x00C73F30, helper return 0x00C73FBE
+ *   DollmanInstance: schedule 0x00C74300, closure 0x00C743B0, helper return 0x00C7443D
+ * Both closure functions call the shared helper sub_140DACCD0. */
+static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C74300u;
+static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C743B0u;
 static const uintptr_t k_rva_voice_shared_helper = 0x00DACCD0u;
-static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C7443Du;
-static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C73FBEu;
+static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C73FBEu;
+static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C7443Du;
 static const uintptr_t k_rva_voice_queue_submit = 0x00DACE30u;
 static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DACDB1u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DAB084u;
@@ -201,6 +198,16 @@ static const uintptr_t k_rva_start_talk_init = 0x003876B0u;
 static const uintptr_t k_rva_selector_dispatch = 0x00DAFDC0u;
 static const uintptr_t k_rva_talk_dispatcher = 0x00385760u;
 static const uintptr_t k_rva_gameplay_sink = 0u;
+/* Read-only probe at the reaction-event upstream entry. sub_140F03A10 is the
+ * C++ implementation of DSElevenMonthBBControllerComponent::Invoke_ElevenMonthBBReaction
+ * (registered via thunk sub_140F2C940 + sExportedMethod). It writes:
+ *   *(byte*)(component + 0x508) = force_to_override
+ *   *(int*) (component + 0x534) = reaction_event_id   (0..0x13)
+ *   *(float*)(component + 0x540) = loop_time
+ * Verified statically that sub_140F00D10 (controller process) reads this state
+ * 109 times and dispatches MsgDSStartTalk via sub_140DB05F0; voice chain does
+ * NOT read these fields. Probe is observation-only — never returns early. */
+static const uintptr_t k_rva_invoke_reaction_event = 0x00F03A10u;
 
 /* Current build gameplay Dollman mute: observed (speaker tag, ShowSubtitle
  * caller RVA) pair for the chatter path. v1.6 live sender now lands at
@@ -1895,6 +1902,37 @@ static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
     return g_real_dollman_voice_delay_schedule(instance, controller_index);
 }
 
+/* Read-only upstream probe for DSElevenMonthBBControllerComponent::Invoke_ElevenMonthBBReaction.
+ * Logs every reaction event invocation when an F8 probe window is open. Never
+ * blocks — pass-through to original. Used to verify whether reaction events
+ * correlate 1:1 with Dollman voice delay schedules in the F8 window. */
+static void __fastcall hook_invoke_reaction_event(
+    unsigned char reaction_event_id,
+    unsigned char force_to_override,
+    float loop_time)
+{
+    BOOL probe_enabled = is_stf_probe_window_open();
+    uintptr_t caller_ra = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+        ? (caller_ra - g_image_base)
+        : 0;
+
+    if (probe_enabled && g_real_invoke_reaction_event != NULL) {
+        log_line(
+            "[reaction-event] tid=%lu caller_rva=0x%llx reaction_id=%d force=%d loop_time=%.4f",
+            (unsigned long)GetCurrentThreadId(),
+            (unsigned long long)caller_rva,
+            (int)reaction_event_id,
+            (int)force_to_override,
+            (double)loop_time);
+    }
+
+    if (g_real_invoke_reaction_event == NULL) {
+        return;
+    }
+    g_real_invoke_reaction_event(reaction_event_id, force_to_override, loop_time);
+}
+
 static char __fastcall hook_voice_queue_submit(
     uintptr_t *queue_obj,
     unsigned int *request,
@@ -2154,7 +2192,7 @@ static uintptr_t __fastcall hook_voice_shared_helper(
         sentence_key);
 }
 
-static void __fastcall hook_dollman_voice_delay_closure(void *closure_state)
+static uintptr_t __fastcall hook_dollman_voice_delay_closure(void *closure_state)
 {
     log_dollman_voice_closure_probe(
         is_sender_only_dollman_radio_mute_enabled() ? "mute" : "pass",
@@ -2164,10 +2202,13 @@ static void __fastcall hook_dollman_voice_delay_closure(void *closure_state)
         log_line(
             "Muted Dollman voice closure state=%p",
             closure_state);
-        return;
+        return 0;
     }
 
-    g_real_dollman_voice_delay_closure(closure_state);
+    if (g_real_dollman_voice_delay_closure == NULL) {
+        return 0;
+    }
+    return g_real_dollman_voice_delay_closure(closure_state);
 }
 
 static uintptr_t __fastcall hook_talk_dispatcher(uintptr_t *a1, uintptr_t *i)
@@ -3419,16 +3460,28 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_dollman_voice_delay_schedule,
                 hook_dollman_voice_delay_schedule,
                 (void **)&g_real_dollman_voice_delay_schedule,
-                "DollmanVoiceDelaySchedule.sub_140C73E80")) {
+                "DollmanVoiceDelaySchedule.sub_140C74300")) {
             ++hook_count;
             if (sender_only_dollman_voice_mute) {
-                log_line("Sender-only Dollman voice mute active via schedule.sub_140C73E80");
+                log_line("Sender-only Dollman voice mute active via schedule.sub_140C74300");
             } else if (effective_dollman_radio_mute) {
-                log_line("Legacy Dollman voice mute active via schedule.sub_140C73E80");
+                log_line("Legacy Dollman voice mute active via schedule.sub_140C74300");
             }
         }
     } else {
         log_line("Dollman voice delay schedule hook disabled");
+    }
+
+    /* Always-on read-only probe for the reaction event upstream entry.
+     * Logs only when an F8 probe window is open. Never mutes — observation
+     * surface used to correlate reaction events vs Dollman voice schedules. */
+    if (install_rva_hook(
+            k_rva_invoke_reaction_event,
+            hook_invoke_reaction_event,
+            (void **)&g_real_invoke_reaction_event,
+            "InvokeElevenMonthBBReaction.sub_140F03A10")) {
+        ++hook_count;
+        log_line("Reaction-event upstream probe installed at sub_140F03A10");
     }
 
     if (need_voice_dispatch_hook) {
@@ -3460,10 +3513,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_dollman_voice_delay_closure,
                 hook_dollman_voice_delay_closure,
                 (void **)&g_real_dollman_voice_delay_closure,
-                "DollmanVoiceDelayClosure.sub_140C73F30")) {
+                "DollmanVoiceDelayClosure.sub_140C743B0")) {
             ++hook_count;
             if (sender_only_dollman_voice_mute) {
-                log_line("Sender-only Dollman voice mute active via closure.sub_140C73F30");
+                log_line("Sender-only Dollman voice mute active via closure.sub_140C743B0");
             }
         }
     } else {

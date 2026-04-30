@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.1.1
+
+- Fixed `[voice-shared]` log attribution: the two shared-helper return RVAs used to label log lines as `player` or `dollman` were stale carry-overs from `v1.5`. The Player path was refactored on `v1.6` and now flows through `sub_140C743B0`; both return RVAs are realigned to the actual `v1.6` call sites. Mute behavior was already correct - this fix only affects diagnostic log attribution.
+
 ## v2.1
 
 - Added support for game version `v1.6`.

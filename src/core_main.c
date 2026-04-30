@@ -112,7 +112,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1";
+static const char *k_build_tag = "v2.1.1";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -173,12 +173,18 @@ static const char *k_export_post_event_id =
  * the live delay scheduler. For v1.6, the live Dollman delay scheduler is
  * 0x00C73E80 and the Dollman-only runtime voice closure is 0x00C73F30.
  * The old 0x00DAA410 "dispatcher" probe was a manager tick/update; the real
- * shared voice submit helper is 0x00DACCD0 in v1.6. */
+ * shared voice submit helper is 0x00DACCD0 in v1.6.
+ * On v1.6 the Player-side path that calls the shared helper has been
+ * refactored: it no longer flows through the v1.5 player closure (sub_140C73A60)
+ * but through sub_140C743B0, where the call to sub_140DACCD0 sits at
+ * 0x140C74438 (return RVA 0x00C7443D). The Dollman-side path still calls the
+ * helper from sub_140C73F30; the call sits at 0x140C73FB9 (return 0x00C73FBE).
+ * Verified by IDA xrefs to sub_140DACCD0 on the v1.6 image. */
 static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C73E80u;
 static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C73F30u;
 static const uintptr_t k_rva_voice_shared_helper = 0x00DACCD0u;
-static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C73B3Eu;
-static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C73FBDu;
+static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C7443Du;
+static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C73FBEu;
 static const uintptr_t k_rva_voice_queue_submit = 0x00DACE30u;
 static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DACDB1u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DAB084u;

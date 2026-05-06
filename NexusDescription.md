@@ -6,12 +6,15 @@ BI*CH SHUT THE F UP
 
 ## Description
 
-**v2.0 beta notice:** supports game version `v1.5`.
+**v2.1 notice:** supports game version `v1.6`.
 
 Brief changelog:
 
+- Updated for game version `v1.6`
+- Fixed the crash after the `v1.6` game update
 - Added Dollman subtitle muting
 - Broader Dollman gameplay voice mute coverage
+- Added extra coverage for Dollman gameplay chatter variants
 
 Detailed changelog and update notes are in the discussion section.
 

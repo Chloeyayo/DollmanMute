@@ -5,11 +5,15 @@ import re
 import struct
 from collections import defaultdict
 from ctypes import wintypes as W
+from pathlib import Path
 
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 VTBL_RVA_LOCALIZED_TEXT = 0x3448E48
+DEFAULT_LOG = Path(
+    r"C:\Program Files (x86)\Steam\steamapps\common\DEATH STRANDING 2 - ON THE BEACH\DollmanMute.log"
+)
 
 KNOWN_SPEAKERS = {
     0x122A8: "Sam",
@@ -18,11 +22,21 @@ KNOWN_SPEAKERS = {
 }
 
 SHOW_RE = re.compile(
-    r"^\[(?P<ts>[^\]]+)\] \[show\] tid=(?P<tid>\d+) "
+    r"^\[(?P<ts>[^\]]+)\] \[show\] (?:surface=(?P<surface>\w+)\s+)?tid=(?P<tid>\d+) "
     r"caller_rva=0x(?P<caller>[0-9a-f]+)[^\[]*?"
     r"p=\[(?P<plist>[^\]]*)\] "
     r"p6v=0x(?P<p6v>[0-9a-f]+) p6=\[(?P<p6list>[^\]]*)\] "
     r"p7v=0x(?P<p7v>[0-9a-f]+) p7=\[(?P<p7list>[^\]]*)\]",
+    re.I,
+)
+KEY_RE = re.compile(
+    r"SubtitleKey surface=(?P<surface>\w+)\s+caller_rva=0x(?P<caller>[0-9a-f]+)\s+"
+    r"key0=0x(?P<key0>[0-9a-f]+)\s+key1=0x(?P<key1>[0-9a-f]+)\s+q2=0x(?P<q2>[0-9a-f]+)\s+q3=0x(?P<q3>[0-9a-f]+)\s+"
+    r"p6=0x(?P<p6>[0-9a-f]+)\s+p7=0x(?P<p7>[0-9a-f]+)\s+"
+    r"k0_ok=(?P<k0_ok>\d)\s+k0_tag=0x(?P<k0_tag>[0-9a-f]+)\s+k0_text=\"(?P<k0_text>[^\"]*)\"\s+"
+    r"k1_ok=(?P<k1_ok>\d)\s+k1_tag=0x(?P<k1_tag>[0-9a-f]+)\s+k1_text=\"(?P<k1_text>[^\"]*)\"\s+"
+    r"p6_ok=(?P<p6_ok>\d)\s+p6_tag=0x(?P<p6_tag>[0-9a-f]+)\s+p6_text=\"(?P<p6_text>[^\"]*)\"\s+"
+    r"p7_ok=(?P<p7_ok>\d)\s+p7_tag=0x(?P<p7_tag>[0-9a-f]+)\s+p7_text=\"(?P<p7_text>[^\"]*)\"",
     re.I,
 )
 
@@ -158,15 +172,23 @@ def auto_image_base(lines):
 
 
 def collect_boundaries(lines):
-    out = []  # list of (ts, label)
+    out = []
     for line in lines:
         m = BUILD_RE.search(line)
         if m:
-            out.append((parse_ts(m.group("ts")), "build"))
+            out.append({
+                "ts": parse_ts(m.group("ts")),
+                "label": "build",
+                "session_id": None,
+            })
             continue
         m = F8_RE.search(line)
         if m:
-            out.append((parse_ts(m.group("ts")), f"F8-{m.group('n')}"))
+            out.append({
+                "ts": parse_ts(m.group("ts")),
+                "label": f"F8-{m.group('n')}",
+                "session_id": int(m.group("n")),
+            })
     return out
 
 
@@ -174,16 +196,41 @@ def pick_window(boundaries, choice):
     if choice == "all" or not boundaries:
         return None, None, "all"
     if choice == "last":
-        start, label = boundaries[-1]
+        start = boundaries[-1]["ts"]
+        label = boundaries[-1]["label"]
         return start, None, label
-    try:
-        n = int(choice)
-    except ValueError:
-        raise SystemExit(f"invalid --session: {choice!r}")
-    if n < 1 or n > len(boundaries):
-        raise SystemExit(f"--session {n} out of range (have {len(boundaries)})")
-    start, label = boundaries[n - 1]
-    end = boundaries[n][0] if n < len(boundaries) else None
+
+    choice_key = choice.strip().lower()
+    target_index = None
+
+    if choice_key.startswith("f8-"):
+        try:
+            wanted_session_id = int(choice_key[3:])
+        except ValueError:
+            raise SystemExit(f"invalid --session: {choice!r}")
+        for idx, boundary in enumerate(boundaries):
+            if boundary["session_id"] == wanted_session_id:
+                target_index = idx
+                break
+        if target_index is None:
+            raise SystemExit(f"--session {choice!r} not found")
+    else:
+        try:
+            n = int(choice)
+        except ValueError:
+            raise SystemExit(f"invalid --session: {choice!r}")
+        for idx, boundary in enumerate(boundaries):
+            if boundary["session_id"] == n:
+                target_index = idx
+                break
+        if target_index is None:
+            if n < 1 or n > len(boundaries):
+                raise SystemExit(f"--session {n} out of range (have {len(boundaries)} boundaries)")
+            target_index = n - 1
+
+    start = boundaries[target_index]["ts"]
+    label = boundaries[target_index]["label"]
+    end = boundaries[target_index + 1]["ts"] if target_index + 1 < len(boundaries) else None
     return start, end, label
 
 
@@ -205,11 +252,11 @@ def speaker_label(ptag, observed_texts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--log", default="DollmanMute.log")
+    ap.add_argument("--log", type=Path, default=DEFAULT_LOG)
     ap.add_argument("--pid", type=int, default=0)
     ap.add_argument("--image-base", type=lambda x: int(x, 0), default=0)
     ap.add_argument("--session", default="last",
-                    help="'last' (default), 'all', or 1-based index into boundaries")
+                    help="'last' (default), 'all', actual F8 id like '12'/'F8-12', or 1-based boundary index")
     ap.add_argument("--key", default="speaker",
                     choices=["speaker", "speaker+caller"],
                     help="aggregation key")
@@ -227,15 +274,13 @@ def main():
         if not boundaries:
             print("(no session boundaries found)")
             return
-        for idx, (ts, label) in enumerate(boundaries, 1):
-            print(f"{idx:>3}  {ts}  {label}")
+        for idx, boundary in enumerate(boundaries, 1):
+            print(f"{idx:>3}  {boundary['ts']}  {boundary['label']}")
         return
 
     start, end, session_label = pick_window(boundaries, args.session)
 
     image_base = args.image_base or auto_image_base(all_lines) or 0x7FF6CDEF0000
-    pid = args.pid or find_process_by_name("DS2.exe")
-
     if start:
         def in_window(line):
             ts = line_ts(line)
@@ -250,7 +295,33 @@ def main():
     else:
         lines = all_lines
 
-    reader = Reader(pid)
+    pid = args.pid
+    reader = None
+    if pid == 0:
+        try:
+            pid = find_process_by_name("DS2.exe")
+        except Exception:
+            pid = 0
+    if pid:
+        try:
+            reader = Reader(pid)
+        except Exception:
+            reader = None
+
+    offline_text_cache = {}
+    for line in lines:
+        m = KEY_RE.search(line)
+        if not m:
+            continue
+        p6ptr = int(m.group("p6"), 16)
+        p7ptr = int(m.group("p7"), 16)
+        p6_text = m.group("p6_text")
+        p7_text = m.group("p7_text")
+        if int(m.group("p6_ok")) and p6ptr and p6_text:
+            offline_text_cache[p6ptr] = p6_text
+        if int(m.group("p7_ok")) and p7ptr and p7_text:
+            offline_text_cache[p7ptr] = p7_text
+
     text_cache = {}
 
     def resolve(ptr):
@@ -258,6 +329,12 @@ def main():
             return None
         if ptr in text_cache:
             return text_cache[ptr]
+        if ptr in offline_text_cache:
+            text_cache[ptr] = offline_text_cache[ptr]
+            return text_cache[ptr]
+        if reader is None:
+            text_cache[ptr] = None
+            return None
         t = read_localized_text(reader, image_base, ptr)
         text_cache[ptr] = t
         return t
@@ -332,11 +409,13 @@ def main():
                 u["text"] = utter_text
 
         # Header
-        print(f"pid={pid}  image_base=0x{image_base:x}")
+        print(f"pid={pid or 0}  image_base=0x{image_base:x}")
         if start:
             print(f"session={session_label}  window=[{start} .. {end or 'now'}]")
         else:
             print("session=all")
+        if reader is None:
+            print("live_text=off  source=offline-log-cache-only")
         print(f"show_events={show_events}  disp_events={sum(disp_by_tid.values())}  "
               f"buckets={len(buckets)}")
         print()
@@ -372,7 +451,8 @@ def main():
             print()
 
     finally:
-        reader.close()
+        if reader is not None:
+            reader.close()
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ $destIni = Join-Path $gameRoot 'DollmanMute.ini'
 $srcIni = Join-Path $root 'DollmanMute.ini'
 $unloadFlag = Join-Path $gameRoot 'DollmanMute.unload'
 $loadFlag = Join-Path $gameRoot 'DollmanMute.load'
-$loaderDll = Join-Path $root 'release\DollmanMute-public-release-v1-with-loader\version.dll'
+$loaderDll = Join-Path $root 'release\DollmanMute-public-release-v1.2\version.dll'
 $licenseSrc = Join-Path $root 'third_party\minhook\LICENSE.txt'
 $readmeSrc = Join-Path $root 'README.md'
 
@@ -28,6 +28,27 @@ function Get-GitShortHash {
     } catch {
     }
     return 'manual'
+}
+
+function Test-PeMachineX64 {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 0x40) {
+        return $false
+    }
+
+    $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+    if ($peOffset -lt 0 -or ($peOffset + 6) -gt $bytes.Length) {
+        return $false
+    }
+
+    $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    return $machine -eq 0x8664
 }
 
 function New-ReleasePackage {
@@ -55,8 +76,10 @@ function New-ReleasePackage {
     if (Test-Path $licenseSrc) {
         Copy-Item -LiteralPath $licenseSrc -Destination (Join-Path $packageDir 'LICENSE-MinHook.txt') -Force
     }
-    if ($IncludeLoader -and (Test-Path $loaderDll)) {
+    if ($IncludeLoader -and (Test-PeMachineX64 $loaderDll)) {
         Copy-Item -LiteralPath $loaderDll -Destination (Join-Path $packageDir 'version.dll') -Force
+    } elseif ($IncludeLoader) {
+        throw "Controlled version.dll is missing or not x64: $loaderDll"
     }
 
     Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $packageZip -Force
@@ -186,10 +209,10 @@ $withLoaderPackageZip = $null
 if (-not $CoreOnly) {
     $gitShort = Get-GitShortHash
     $cleanPackageZip = New-ReleasePackage -PackageName "DollmanMute-$gitShort-clean-build" -IncludeLoader:$false
-    if (Test-Path $loaderDll) {
+    if (Test-PeMachineX64 $loaderDll) {
         $withLoaderPackageZip = New-ReleasePackage -PackageName "DollmanMute-$gitShort-with-loader" -IncludeLoader:$true
     } else {
-        Write-Warning "Controlled version.dll not found at $loaderDll - skipping with-loader package"
+        Write-Warning "Controlled x64 version.dll not found at $loaderDll - skipping with-loader package"
     }
 }
 

@@ -59,6 +59,13 @@ typedef char(__fastcall *VoiceQueueSubmitFn)(
     uintptr_t a4,
     uintptr_t a5,
     unsigned char *a6);
+typedef void(__fastcall *VoiceEntryConsumedFn)(
+    uintptr_t manager_obj,
+    uintptr_t entry,
+    unsigned int selected_index);
+typedef void(__fastcall *VoiceManagerTickFn)(
+    uintptr_t manager_obj,
+    float delta_time);
 typedef uintptr_t(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
 typedef uintptr_t(__fastcall *SubtitleRuntimeWrapperFn)(uintptr_t view, uintptr_t arg2);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
@@ -107,6 +114,8 @@ static DollmanVoiceDelayScheduleFn g_real_dollman_voice_delay_schedule = NULL;
 static InvokeReactionEventFn g_real_invoke_reaction_event = NULL;
 static VoiceSharedHelperFn g_real_voice_shared_helper = NULL;
 static VoiceQueueSubmitFn g_real_voice_queue_submit = NULL;
+static VoiceEntryConsumedFn g_real_voice_entry_consumed = NULL;
+static VoiceManagerTickFn g_real_voice_manager_tick = NULL;
 static DollmanVoiceDelayClosureFn g_real_dollman_voice_delay_closure = NULL;
 static SubtitleRuntimeWrapperFn g_real_subtitle_runtime_wrapper = NULL;
 static ShowSubtitleFn g_real_show_subtitle = NULL;
@@ -117,7 +126,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1.1";
+static const char *k_build_tag = "v2.1.5-dev";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -169,6 +178,11 @@ static volatile LONG64 g_last_dollman_muted_subtitle_ms = 0;
 static uint32_t g_last_dollman_muted_speaker_tag = 0;
 static uint32_t g_last_dollman_muted_line_tag = 0;
 static uintptr_t g_last_dollman_muted_caller_rva = 0;
+static volatile LONG64 g_last_dollman_voice_entry_ms = 0;
+static volatile LONG g_last_dollman_voice_entry_key = 0;
+static volatile LONG g_last_dollman_voice_entry_index = 0;
+static volatile LONG g_last_dollman_voice_entry_selected = 0;
+static volatile LONG64 g_last_dollman_voice_entry_caller_rva = 0;
 
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
@@ -186,6 +200,10 @@ static const uintptr_t k_rva_voice_queue_submit = 0x00DACE30u;
 static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DACDB1u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DAB084u;
 static const uintptr_t k_rva_voice_queue_dispatcher_forward_return = 0x00DAC69Au;
+static const uintptr_t k_rva_voice_queue_periodic_chatter_a_return = 0x00DAFF37u;
+static const uintptr_t k_rva_voice_queue_periodic_chatter_b_return = 0x00DAFFF0u;
+static const uintptr_t k_rva_voice_entry_consumed = 0x00D8F180u;
+static const uintptr_t k_rva_voice_manager_tick = 0x00DAA930u;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780B40u;
 static const uintptr_t k_rva_show_subtitle = 0x00780BF0u;
 static const uintptr_t k_rva_remove_subtitle = 0x00780CF0u;
@@ -222,6 +240,18 @@ static const AkUniqueID k_scanner_event_id_2 = 4094913469u;
 static const AkUniqueID k_scanner_event_id_3 = 2611919341u;
 static const AkUniqueID k_event_id_dowser_gameplay_chatter = 2134002697u;
 static const uint64_t k_dowser_ext0_sample = 0x47f324c09ull;
+static const AkUniqueID k_event_id_dollman_gameplay_chatter = 4251155871u;
+static const uint64_t k_dollman_gameplay_chatter_ext0_sample = 0x4fd637d9full;
+static const uint32_t k_dollman_gameplay_chatter_voice_key_a = 0x341e4861u;
+static const uint32_t k_dollman_gameplay_chatter_voice_key_b = 0x4b996a15u;
+static const uint32_t k_dollman_gameplay_chatter_voice_key_c = 0x13cb325cu;
+static const int k_dollman_gameplay_chatter_voice_index_a = 124;
+static const int k_dollman_gameplay_chatter_voice_index_b = 125;
+static const int k_dollman_gameplay_chatter_voice_index_c = 126;
+static const uintptr_t k_rva_vtbl_ds_player_sentence_resource = 0x03227b98u;
+static const uintptr_t k_rva_vtbl_sentence_resource = 0x03127010u;
+static const uintptr_t k_rva_vtbl_sentence_priority_info = 0x03227b00u;
+static const uintptr_t k_rva_vtbl_notification_queue = 0x03137818u;
 static const AkUniqueID k_event_id_dollman_fall_chatter = 448888368u;
 static const uint64_t k_dollman_fall_chatter_ext0_sample = 0x41ac17e30ull;
 
@@ -323,6 +353,7 @@ static TalkDispatcherFn g_real_talk_dispatcher = NULL;
 
 static volatile LONG g_builder_hit_counts[BUILDER_ID_COUNT] = {0};
 static DWORD g_tls_last_builder = TLS_OUT_OF_INDEXES;
+static DWORD g_tls_current_voice_manager = TLS_OUT_OF_INDEXES;
 static uint32_t g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
 static SubtitleStrategyStats g_strategy_stats[SUBTITLE_STRATEGY_COUNT];
 static BOOL g_hotkey_control_prev[HOTKEY_CONTROL_COUNT] = {FALSE};
@@ -341,6 +372,7 @@ static uintptr_t safe_deref_qword(uintptr_t addr);
 static uintptr_t safe_read_ptr(uintptr_t addr);
 static uint64_t safe_read_u64(uintptr_t addr);
 static uint32_t safe_read_u32(uintptr_t addr);
+static uintptr_t ptr_to_rva(uintptr_t ptr);
 static const char *subtitle_strategy_name(uint32_t strategy);
 static const char *subtitle_strategy_desc(uint32_t strategy);
 static BOOL read_localized_text_resource(
@@ -348,6 +380,26 @@ static BOOL read_localized_text_resource(
     uint32_t *tag_out,
     char *text_buffer,
     size_t text_buffer_size);
+static BOOL find_localized_child_resource(
+    uintptr_t base,
+    uintptr_t *child_out,
+    uint32_t *offset_out,
+    uint32_t *tag_out,
+    char *text_buffer,
+    size_t text_buffer_size);
+static void log_voice_entry_resource_fields(
+    uint32_t key,
+    int request_index,
+    uintptr_t selected_ref,
+    uintptr_t selected_payload,
+    uintptr_t sentence_meta,
+    uintptr_t entry_ref48);
+static void log_voice_entry_manager_context(
+    uintptr_t manager_obj,
+    uintptr_t entry,
+    uint32_t key,
+    int request_index,
+    uintptr_t sentence_meta);
 static void log_localized_text_resource_candidate(
     const char *label,
     uintptr_t ptr);
@@ -388,6 +440,27 @@ static void note_dollman_muted_subtitle(
     uint32_t speaker_tag,
     uint32_t line_tag);
 static BOOL get_recent_dollman_muted_subtitle_delta_ms(
+    ULONGLONG now_ms,
+    ULONGLONG *delta_ms_out);
+static BOOL is_dollman_gameplay_chatter_voice_entry(
+    uint32_t key,
+    int request_index,
+    uint32_t flags20_22,
+    int entry_param,
+    uint32_t active_flags,
+    uintptr_t selected_ref,
+    uintptr_t selected_payload,
+    uintptr_t sentence_meta,
+    uintptr_t entry_ref48);
+static void note_dollman_gameplay_chatter_voice_entry(
+    uint32_t key,
+    int request_index,
+    unsigned int selected_index,
+    uintptr_t caller_rva);
+static BOOL consume_pending_dollman_gameplay_chatter_voice_entry(
+    AkUniqueID event_id,
+    uint32_t external_source_count,
+    uint64_t ext0,
     ULONGLONG now_ms,
     ULONGLONG *delta_ms_out);
 static void log_localized_hits_in_block(
@@ -787,7 +860,9 @@ static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva)
 {
     return caller_rva == k_rva_voice_queue_shared_helper_return ||
            caller_rva == k_rva_voice_queue_dispatcher_synth_return ||
-           caller_rva == k_rva_voice_queue_dispatcher_forward_return;
+           caller_rva == k_rva_voice_queue_dispatcher_forward_return ||
+           caller_rva == k_rva_voice_queue_periodic_chatter_a_return ||
+           caller_rva == k_rva_voice_queue_periodic_chatter_b_return;
 }
 
 static const char *voice_queue_probe_caller_name(uintptr_t caller_rva)
@@ -799,6 +874,10 @@ static const char *voice_queue_probe_caller_name(uintptr_t caller_rva)
         return "dispatcher-synth";
     case k_rva_voice_queue_dispatcher_forward_return:
         return "dispatcher-forward";
+    case k_rva_voice_queue_periodic_chatter_a_return:
+        return "periodic-chatter-a";
+    case k_rva_voice_queue_periodic_chatter_b_return:
+        return "periodic-chatter-b";
     default:
         return "other";
     }
@@ -879,6 +958,11 @@ static void reset_log_capture_state(void)
     g_last_dollman_muted_speaker_tag = 0;
     g_last_dollman_muted_line_tag = 0;
     g_last_dollman_muted_caller_rva = 0;
+    InterlockedExchange64(&g_last_dollman_voice_entry_ms, 0);
+    InterlockedExchange(&g_last_dollman_voice_entry_key, 0);
+    InterlockedExchange(&g_last_dollman_voice_entry_index, 0);
+    InterlockedExchange(&g_last_dollman_voice_entry_selected, 0);
+    InterlockedExchange64(&g_last_dollman_voice_entry_caller_rva, 0);
 }
 
 static void seed_hotkey_state_from_config(void)
@@ -1004,6 +1088,97 @@ static BOOL get_recent_dollman_muted_subtitle_delta_ms(
            g_last_dollman_muted_speaker_tag == k_dollman_gameplay_speaker_tag;
 }
 
+static BOOL is_dollman_gameplay_chatter_voice_entry(
+    uint32_t key,
+    int request_index,
+    uint32_t flags20_22,
+    int entry_param,
+    uint32_t active_flags,
+    uintptr_t selected_ref,
+    uintptr_t selected_payload,
+    uintptr_t sentence_meta,
+    uintptr_t entry_ref48)
+{
+    BOOL known_chatter_entry =
+        (key == k_dollman_gameplay_chatter_voice_key_a &&
+         request_index == k_dollman_gameplay_chatter_voice_index_a) ||
+        (key == k_dollman_gameplay_chatter_voice_key_b &&
+         request_index == k_dollman_gameplay_chatter_voice_index_b) ||
+        (key == k_dollman_gameplay_chatter_voice_key_c &&
+         request_index == k_dollman_gameplay_chatter_voice_index_c);
+
+    if (!known_chatter_entry ||
+        flags20_22 != 0x100u ||
+        entry_param != -1 ||
+        active_flags != 0x1u) {
+        return FALSE;
+    }
+
+    return ptr_to_rva(safe_read_ptr(selected_ref + 0x0)) == k_rva_vtbl_ds_player_sentence_resource &&
+           ptr_to_rva(safe_read_ptr(selected_payload + 0x0)) == k_rva_vtbl_sentence_resource &&
+           ptr_to_rva(safe_read_ptr(sentence_meta + 0x0)) == k_rva_vtbl_sentence_priority_info &&
+           ptr_to_rva(safe_read_ptr(entry_ref48 + 0x0)) == k_rva_vtbl_notification_queue;
+}
+
+static void note_dollman_gameplay_chatter_voice_entry(
+    uint32_t key,
+    int request_index,
+    unsigned int selected_index,
+    uintptr_t caller_rva)
+{
+    InterlockedExchange(&g_last_dollman_voice_entry_key, (LONG)key);
+    InterlockedExchange(&g_last_dollman_voice_entry_index, (LONG)request_index);
+    InterlockedExchange(&g_last_dollman_voice_entry_selected, (LONG)selected_index);
+    InterlockedExchange64(&g_last_dollman_voice_entry_caller_rva, (LONG64)caller_rva);
+    InterlockedExchange64(&g_last_dollman_voice_entry_ms, (LONG64)GetTickCount64());
+
+    if (is_stf_probe_window_open()) {
+        log_line(
+            "[voice-entry-match] caller_rva=0x%llx key=0x%x req_index=%d selected_index=%u pending_ms=250",
+            (unsigned long long)caller_rva,
+            (unsigned int)key,
+            request_index,
+            selected_index);
+    }
+}
+
+static BOOL consume_pending_dollman_gameplay_chatter_voice_entry(
+    AkUniqueID event_id,
+    uint32_t external_source_count,
+    uint64_t ext0,
+    ULONGLONG now_ms,
+    ULONGLONG *delta_ms_out)
+{
+    LONG64 last_ms;
+    ULONGLONG delta_ms = 0;
+
+    if (delta_ms_out != NULL) {
+        *delta_ms_out = 0;
+    }
+    if (!is_sender_only_dollman_radio_mute_enabled() ||
+        external_source_count != 1u ||
+        event_id != k_event_id_dollman_gameplay_chatter ||
+        ext0 != k_dollman_gameplay_chatter_ext0_sample) {
+        return FALSE;
+    }
+
+    last_ms = InterlockedCompareExchange64(&g_last_dollman_voice_entry_ms, 0, 0);
+    if (last_ms <= 0 || now_ms < (ULONGLONG)last_ms) {
+        return FALSE;
+    }
+
+    delta_ms = now_ms - (ULONGLONG)last_ms;
+    if (delta_ms_out != NULL) {
+        *delta_ms_out = delta_ms;
+    }
+    if (delta_ms > 250ull) {
+        return FALSE;
+    }
+
+    InterlockedExchange64(&g_last_dollman_voice_entry_ms, 0);
+    return TRUE;
+}
+
 static BOOL is_selected_subtitle_family(uint32_t family)
 {
     if (family == SUBTITLE_FAMILY_THROW_RECALL) {
@@ -1042,6 +1217,22 @@ static void tls_set_last_builder(uint32_t id)
         return;
     }
     TlsSetValue(g_tls_last_builder, (LPVOID)(uintptr_t)id);
+}
+
+static uintptr_t tls_get_current_voice_manager(void)
+{
+    if (g_tls_current_voice_manager == TLS_OUT_OF_INDEXES) {
+        return 0;
+    }
+    return (uintptr_t)TlsGetValue(g_tls_current_voice_manager);
+}
+
+static void tls_set_current_voice_manager(uintptr_t manager_obj)
+{
+    if (g_tls_current_voice_manager == TLS_OUT_OF_INDEXES) {
+        return;
+    }
+    TlsSetValue(g_tls_current_voice_manager, (LPVOID)manager_obj);
 }
 
 static uint32_t read_identity_hi32(uintptr_t ptr)
@@ -1727,6 +1918,7 @@ static AkPlayingID __cdecl hook_post_event_id(
          is_sender_only_dollman_radio_mute_enabled());
     BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
     BOOL blocked_sender_only = FALSE;
+    BOOL blocked_voice_entry = FALSE;
     BOOL blocked_recent_subtitle = FALSE;
     BOOL blocked = FALSE;
     BOOL dowser_event_match = FALSE;
@@ -1745,6 +1937,7 @@ static AkPlayingID __cdecl hook_post_event_id(
     uint64_t dedupe_key = 0;
     ULONGLONG dowser_delta_ms = 0;
     ULONGLONG dollman_delta_ms = 0;
+    ULONGLONG voice_entry_delta_ms = 0;
     ULONGLONG now_ms = GetTickCount64();
 
     blocked_sender_only =
@@ -1753,15 +1946,27 @@ static AkPlayingID __cdecl hook_post_event_id(
             event_id,
             external_source_count,
             ext0);
+    blocked_voice_entry =
+        g_cfg.enabled &&
+        !blocked_sender_only &&
+        consume_pending_dollman_gameplay_chatter_voice_entry(
+            event_id,
+            external_source_count,
+            ext0,
+            now_ms,
+            &voice_entry_delta_ms);
     blocked_recent_subtitle =
         g_cfg.enabled &&
         is_sender_only_dollman_radio_mute_enabled() &&
         external_source_count == 1u &&
         !blocked_sender_only &&
+        !blocked_voice_entry &&
         get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
-    blocked = blocked_legacy || blocked_sender_only || blocked_recent_subtitle;
+    blocked = blocked_legacy || blocked_sender_only || blocked_voice_entry || blocked_recent_subtitle;
     if (blocked_sender_only) {
         block_mode = "sender-only-narrow";
+    } else if (blocked_voice_entry) {
+        block_mode = "sender-only-voice-entry";
     } else if (blocked_recent_subtitle) {
         block_mode = "sender-only-recent-subtitle";
     } else if (blocked_legacy) {
@@ -1827,6 +2032,20 @@ static AkPlayingID __cdecl hook_post_event_id(
                 (unsigned long long)dollman_delta_ms,
                 (unsigned int)g_last_dollman_muted_line_tag);
         }
+        if (blocked_voice_entry) {
+            log_line(
+                "VoiceEntryDollmanPostEvent caller_rva=0x%llx entry_caller_rva=0x%llx eventId=%u extCount=%u ext0=0x%llx ext1=0x%llx deltaMs=%llu key=0x%x req_index=%d selected_index=%d",
+                (unsigned long long)caller_rva,
+                (unsigned long long)InterlockedCompareExchange64(&g_last_dollman_voice_entry_caller_rva, 0, 0),
+                (unsigned int)event_id,
+                (unsigned int)external_source_count,
+                (unsigned long long)ext0,
+                (unsigned long long)ext1,
+                (unsigned long long)voice_entry_delta_ms,
+                (unsigned int)InterlockedCompareExchange(&g_last_dollman_voice_entry_key, 0, 0),
+                (int)InterlockedCompareExchange(&g_last_dollman_voice_entry_index, 0, 0),
+                (int)InterlockedCompareExchange(&g_last_dollman_voice_entry_selected, 0, 0));
+        }
     }
 
     if (blocked) {
@@ -1878,6 +2097,7 @@ static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
     uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
         ? (caller_ra - g_image_base)
         : 0;
+    BOOL should_block = sender_only_block || legacy_block;
 
     if (probe_enabled) {
         log_line(
@@ -1886,10 +2106,10 @@ static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
             (unsigned long long)caller_rva,
             (void *)instance,
             controller_index,
-            (sender_only_block || legacy_block) ? 1 : 0);
+            should_block ? 1 : 0);
     }
 
-    if (sender_only_block || legacy_block) {
+    if (should_block) {
         log_line(
             "Muted Dollman voice delay schedule mode=%s caller_rva=0x%llx instance=%p controller=%d",
             sender_only_block ? "sender-only" : "legacy",
@@ -2072,6 +2292,278 @@ static char __fastcall hook_voice_queue_submit(
     }
 
     return g_real_voice_queue_submit(queue_obj, request, a3, a4, a5, a6);
+}
+
+static void __fastcall hook_voice_manager_tick(uintptr_t manager_obj, float delta_time)
+{
+    uintptr_t previous_manager = tls_get_current_voice_manager();
+
+    tls_set_current_voice_manager(manager_obj);
+    if (g_real_voice_manager_tick != NULL) {
+        g_real_voice_manager_tick(manager_obj, delta_time);
+    }
+    tls_set_current_voice_manager(previous_manager);
+}
+
+static void __fastcall hook_voice_entry_consumed(
+    uintptr_t manager_obj,
+    uintptr_t entry,
+    unsigned int selected_index)
+{
+    uintptr_t caller_ra = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+        ? (caller_ra - g_image_base)
+        : 0;
+    BOOL probe_enabled =
+        (g_cfg.enable_deep_probe ||
+         is_sender_only_dollman_radio_mute_enabled()) &&
+        is_stf_probe_window_open();
+    uintptr_t voice_manager = tls_get_current_voice_manager();
+
+    if (entry != 0 && is_sender_only_dollman_radio_mute_enabled()) {
+        uint32_t key = safe_read_u32(entry + 0x0);
+        int request_index = (int)safe_read_u32(entry + 0x10);
+        uint32_t flags20_22 = safe_read_u32(entry + 0x20) & 0xFFFFFFu;
+        int entry_param = (int)safe_read_u32(entry + 0x24);
+        uintptr_t selected_ref = safe_read_ptr(entry + 0x28);
+        uintptr_t sentence_meta = safe_read_ptr(entry + 0x30);
+        uint32_t active_flags = safe_read_u32(entry + 0x40) & 0xFFu;
+        uintptr_t entry_ref48 = safe_read_ptr(entry + 0x48);
+        uintptr_t selected_payload = safe_read_ptr(selected_ref + 0x20);
+
+        if (is_dollman_gameplay_chatter_voice_entry(
+                key,
+                request_index,
+                flags20_22,
+                entry_param,
+                active_flags,
+                selected_ref,
+                selected_payload,
+                sentence_meta,
+                entry_ref48)) {
+            note_dollman_gameplay_chatter_voice_entry(
+                key,
+                request_index,
+                selected_index,
+                caller_rva);
+        }
+    }
+
+    if (probe_enabled && entry != 0) {
+        uint32_t key = safe_read_u32(entry + 0x0);
+        uintptr_t request_ref = safe_read_ptr(entry + 0x8);
+        int request_index = (int)safe_read_u32(entry + 0x10);
+        uint32_t entry_flag14 = safe_read_u32(entry + 0x14) & 0xFFu;
+        uint32_t raw18 = safe_read_u32(entry + 0x18);
+        uint32_t raw1c = safe_read_u32(entry + 0x1C);
+        uint32_t flags20_22 = safe_read_u32(entry + 0x20) & 0xFFFFFFu;
+        int entry_param = (int)safe_read_u32(entry + 0x24);
+        uintptr_t selected_ref = safe_read_ptr(entry + 0x28);
+        uintptr_t sentence_meta = safe_read_ptr(entry + 0x30);
+        uint32_t raw38 = safe_read_u32(entry + 0x38);
+        uint32_t raw3c = safe_read_u32(entry + 0x3C);
+        uint32_t active_flags = safe_read_u32(entry + 0x40) & 0xFFu;
+        uintptr_t entry_ref48 = safe_read_ptr(entry + 0x48);
+        uintptr_t selected_payload = safe_read_ptr(selected_ref + 0x20);
+        uintptr_t selected_ref_vtbl = safe_read_ptr(selected_ref + 0x0);
+        uintptr_t selected_ref_vtbl_rva = (g_image_base != 0 && selected_ref_vtbl > g_image_base)
+            ? (selected_ref_vtbl - g_image_base)
+            : 0;
+        uintptr_t selected_payload_vtbl = safe_read_ptr(selected_payload + 0x0);
+        uintptr_t selected_payload_vtbl_rva = (g_image_base != 0 && selected_payload_vtbl > g_image_base)
+            ? (selected_payload_vtbl - g_image_base)
+            : 0;
+        uintptr_t entry_ref48_vtbl = safe_read_ptr(entry_ref48 + 0x0);
+        uintptr_t entry_ref48_vtbl_rva = (g_image_base != 0 && entry_ref48_vtbl > g_image_base)
+            ? (entry_ref48_vtbl - g_image_base)
+            : 0;
+        uintptr_t meta_vtbl = safe_read_ptr(sentence_meta + 0x0);
+        uintptr_t meta_vtbl_rva = (g_image_base != 0 && meta_vtbl > g_image_base)
+            ? (meta_vtbl - g_image_base)
+            : 0;
+        uint32_t meta_flags28 = safe_read_u32(sentence_meta + 0x28);
+        uint32_t meta_bytes30_33 = safe_read_u32(sentence_meta + 0x30);
+        uint32_t request_ref_tag = 0;
+        uint32_t selected_ref_tag = 0;
+        uint32_t selected_payload_tag = 0;
+        uint32_t entry_ref48_tag = 0;
+        uintptr_t selected_ref_child = 0;
+        uintptr_t selected_payload_child = 0;
+        uintptr_t entry_ref48_child = 0;
+        uint32_t selected_ref_child_off = 0;
+        uint32_t selected_payload_child_off = 0;
+        uint32_t entry_ref48_child_off = 0;
+        uint32_t selected_ref_child_tag = 0;
+        uint32_t selected_payload_child_tag = 0;
+        uint32_t entry_ref48_child_tag = 0;
+        char request_ref_text[96];
+        char selected_ref_text[96];
+        char selected_payload_text[96];
+        char entry_ref48_text[96];
+        char selected_ref_child_text[96];
+        char selected_payload_child_text[96];
+        char entry_ref48_child_text[96];
+        BOOL request_ref_ok;
+        BOOL selected_ref_ok;
+        BOOL selected_payload_ok;
+        BOOL entry_ref48_ok;
+        BOOL selected_ref_child_ok;
+        BOOL selected_payload_child_ok;
+        BOOL entry_ref48_child_ok;
+
+        ZeroMemory(request_ref_text, sizeof(request_ref_text));
+        ZeroMemory(selected_ref_text, sizeof(selected_ref_text));
+        ZeroMemory(selected_payload_text, sizeof(selected_payload_text));
+        ZeroMemory(entry_ref48_text, sizeof(entry_ref48_text));
+        ZeroMemory(selected_ref_child_text, sizeof(selected_ref_child_text));
+        ZeroMemory(selected_payload_child_text, sizeof(selected_payload_child_text));
+        ZeroMemory(entry_ref48_child_text, sizeof(entry_ref48_child_text));
+
+        request_ref_ok = read_localized_text_resource(
+            request_ref,
+            &request_ref_tag,
+            request_ref_text,
+            sizeof(request_ref_text));
+        selected_ref_ok = read_localized_text_resource(
+            selected_ref,
+            &selected_ref_tag,
+            selected_ref_text,
+            sizeof(selected_ref_text));
+        selected_payload_ok = read_localized_text_resource(
+            selected_payload,
+            &selected_payload_tag,
+            selected_payload_text,
+            sizeof(selected_payload_text));
+        entry_ref48_ok = read_localized_text_resource(
+            entry_ref48,
+            &entry_ref48_tag,
+            entry_ref48_text,
+            sizeof(entry_ref48_text));
+        selected_ref_child_ok = find_localized_child_resource(
+            selected_ref,
+            &selected_ref_child,
+            &selected_ref_child_off,
+            &selected_ref_child_tag,
+            selected_ref_child_text,
+            sizeof(selected_ref_child_text));
+        selected_payload_child_ok = find_localized_child_resource(
+            selected_payload,
+            &selected_payload_child,
+            &selected_payload_child_off,
+            &selected_payload_child_tag,
+            selected_payload_child_text,
+            sizeof(selected_payload_child_text));
+        entry_ref48_child_ok = find_localized_child_resource(
+            entry_ref48,
+            &entry_ref48_child,
+            &entry_ref48_child_off,
+            &entry_ref48_child_tag,
+            entry_ref48_child_text,
+            sizeof(entry_ref48_child_text));
+
+        log_line(
+            "[voice-entry] tid=%lu caller_rva=0x%llx ignored_rcx=0x%llx tls_manager=0x%llx entry=0x%llx key=0x%x req_ref=0x%llx req_ok=%d req_tag=0x%x req_text=\"%s\" "
+            "req_index=%d selected_index=%u flag14=0x%x raw18=0x%x raw1c=0x%x flags20_22=0x%x param=%d active=0x%x "
+            "selected_ref=0x%llx selected_vtbl_rva=0x%llx selected_ok=%d selected_tag=0x%x selected_text=\"%s\" "
+            "selected_child=0x%llx selected_child_off=0x%x selected_child_ok=%d selected_child_tag=0x%x selected_child_text=\"%s\" "
+            "selected_payload=0x%llx selected_payload_vtbl_rva=0x%llx selected_payload_ok=%d selected_payload_tag=0x%x selected_payload_text=\"%s\" "
+            "payload_child=0x%llx payload_child_off=0x%x payload_child_ok=%d payload_child_tag=0x%x payload_child_text=\"%s\" "
+            "meta=0x%llx meta_vtbl_rva=0x%llx meta_flags28=0x%x meta_bytes30_33=0x%x raw38=0x%x raw3c=0x%x "
+            "entry_ref48=0x%llx entry48_vtbl_rva=0x%llx entry48_ok=%d entry48_tag=0x%x entry48_text=\"%s\" "
+            "entry48_child=0x%llx entry48_child_off=0x%x entry48_child_ok=%d entry48_child_tag=0x%x entry48_child_text=\"%s\"",
+            (unsigned long)GetCurrentThreadId(),
+            (unsigned long long)caller_rva,
+            (unsigned long long)manager_obj,
+            (unsigned long long)voice_manager,
+            (unsigned long long)entry,
+            (unsigned int)key,
+            (unsigned long long)request_ref,
+            request_ref_ok ? 1 : 0,
+            (unsigned int)request_ref_tag,
+            request_ref_text,
+            request_index,
+            (unsigned int)selected_index,
+            (unsigned int)entry_flag14,
+            (unsigned int)raw18,
+            (unsigned int)raw1c,
+            (unsigned int)flags20_22,
+            entry_param,
+            (unsigned int)active_flags,
+            (unsigned long long)selected_ref,
+            (unsigned long long)selected_ref_vtbl_rva,
+            selected_ref_ok ? 1 : 0,
+            (unsigned int)selected_ref_tag,
+            selected_ref_text,
+            (unsigned long long)selected_ref_child,
+            (unsigned int)selected_ref_child_off,
+            selected_ref_child_ok ? 1 : 0,
+            (unsigned int)selected_ref_child_tag,
+            selected_ref_child_text,
+            (unsigned long long)selected_payload,
+            (unsigned long long)selected_payload_vtbl_rva,
+            selected_payload_ok ? 1 : 0,
+            (unsigned int)selected_payload_tag,
+            selected_payload_text,
+            (unsigned long long)selected_payload_child,
+            (unsigned int)selected_payload_child_off,
+            selected_payload_child_ok ? 1 : 0,
+            (unsigned int)selected_payload_child_tag,
+            selected_payload_child_text,
+            (unsigned long long)sentence_meta,
+            (unsigned long long)meta_vtbl_rva,
+            (unsigned int)meta_flags28,
+            (unsigned int)meta_bytes30_33,
+            (unsigned int)raw38,
+            (unsigned int)raw3c,
+            (unsigned long long)entry_ref48,
+            (unsigned long long)entry_ref48_vtbl_rva,
+            entry_ref48_ok ? 1 : 0,
+            (unsigned int)entry_ref48_tag,
+            entry_ref48_text,
+            (unsigned long long)entry_ref48_child,
+            (unsigned int)entry_ref48_child_off,
+            entry_ref48_child_ok ? 1 : 0,
+            (unsigned int)entry_ref48_child_tag,
+            entry_ref48_child_text);
+
+        log_line(
+            "[voice-entry-raw] caller_rva=0x%llx key=0x%x idx=%d entry=0x%llx "
+            "q00=0x%llx q08=0x%llx q10=0x%llx q18=0x%llx q20=0x%llx q28=0x%llx q30=0x%llx q38=0x%llx q40=0x%llx q48=0x%llx q50=0x%llx q58=0x%llx",
+            (unsigned long long)caller_rva,
+            (unsigned int)key,
+            request_index,
+            (unsigned long long)entry,
+            (unsigned long long)safe_read_u64(entry + 0x00),
+            (unsigned long long)safe_read_u64(entry + 0x08),
+            (unsigned long long)safe_read_u64(entry + 0x10),
+            (unsigned long long)safe_read_u64(entry + 0x18),
+            (unsigned long long)safe_read_u64(entry + 0x20),
+            (unsigned long long)safe_read_u64(entry + 0x28),
+            (unsigned long long)safe_read_u64(entry + 0x30),
+            (unsigned long long)safe_read_u64(entry + 0x38),
+            (unsigned long long)safe_read_u64(entry + 0x40),
+            (unsigned long long)safe_read_u64(entry + 0x48),
+            (unsigned long long)safe_read_u64(entry + 0x50),
+            (unsigned long long)safe_read_u64(entry + 0x58));
+
+            log_voice_entry_resource_fields(
+                key,
+                request_index,
+                selected_ref,
+                selected_payload,
+                sentence_meta,
+                entry_ref48);
+            log_voice_entry_manager_context(
+                voice_manager,
+                entry,
+                key,
+                request_index,
+                sentence_meta);
+    }
+
+    if (g_real_voice_entry_consumed != NULL) {
+        g_real_voice_entry_consumed(manager_obj, entry, selected_index);
+    }
 }
 
 static uintptr_t __fastcall hook_voice_shared_helper(
@@ -2412,6 +2904,164 @@ static uint32_t safe_read_u32(uintptr_t addr)
     return *(const uint32_t *)addr;
 }
 
+static uintptr_t ptr_to_rva(uintptr_t ptr)
+{
+    if (g_image_base == 0 || ptr <= g_image_base) {
+        return 0;
+    }
+    return ptr - g_image_base;
+}
+
+static void log_voice_entry_resource_fields(
+    uint32_t key,
+    int request_index,
+    uintptr_t selected_ref,
+    uintptr_t selected_payload,
+    uintptr_t sentence_meta,
+    uintptr_t entry_ref48)
+{
+    uintptr_t ds_vtbl_rva = ptr_to_rva(safe_read_ptr(selected_ref + 0x0));
+    uintptr_t sent_vtbl_rva = ptr_to_rva(safe_read_ptr(selected_payload + 0x0));
+    uintptr_t meta_vtbl_rva = ptr_to_rva(safe_read_ptr(sentence_meta + 0x0));
+    uintptr_t q_vtbl_rva = ptr_to_rva(safe_read_ptr(entry_ref48 + 0x0));
+
+    log_line(
+        "[voice-entry-dspr] key=0x%x idx=%d obj=0x%llx vtbl=0x%llx p08=0x%llx p10=0x%llx p18=0x%llx p20=0x%llx p28=0x%llx u30=0x%x raw34=0x%x",
+        (unsigned int)key,
+        request_index,
+        (unsigned long long)selected_ref,
+        (unsigned long long)ds_vtbl_rva,
+        (unsigned long long)safe_read_ptr(selected_ref + 0x08),
+        (unsigned long long)safe_read_ptr(selected_ref + 0x10),
+        (unsigned long long)safe_read_ptr(selected_ref + 0x18),
+        (unsigned long long)safe_read_ptr(selected_ref + 0x20),
+        (unsigned long long)safe_read_ptr(selected_ref + 0x28),
+        (unsigned int)safe_read_u32(selected_ref + 0x30),
+        (unsigned int)safe_read_u32(selected_ref + 0x34));
+
+    log_line(
+        "[voice-entry-sent] key=0x%x idx=%d obj=0x%llx vtbl=0x%llx p08=0x%llx p10=0x%llx p18=0x%llx u20=0x%x u24=0x%x u28=0x%x u2c=0x%x u30=0x%x raw34=0x%x p38=0x%llx p40=0x%llx p48=0x%llx p50=0x%llx p58=0x%llx",
+        (unsigned int)key,
+        request_index,
+        (unsigned long long)selected_payload,
+        (unsigned long long)sent_vtbl_rva,
+        (unsigned long long)safe_read_ptr(selected_payload + 0x08),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x10),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x18),
+        (unsigned int)safe_read_u32(selected_payload + 0x20),
+        (unsigned int)safe_read_u32(selected_payload + 0x24),
+        (unsigned int)safe_read_u32(selected_payload + 0x28),
+        (unsigned int)safe_read_u32(selected_payload + 0x2C),
+        (unsigned int)safe_read_u32(selected_payload + 0x30),
+        (unsigned int)safe_read_u32(selected_payload + 0x34),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x38),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x40),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x48),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x50),
+        (unsigned long long)safe_read_ptr(selected_payload + 0x58));
+
+    log_line(
+        "[voice-entry-meta] key=0x%x idx=%d obj=0x%llx vtbl=0x%llx p08=0x%llx p10=0x%llx p18=0x%llx u20=0x%x u24=0x%x q28=0x%llx u30=0x%x u32=0x%x u34=0x%x",
+        (unsigned int)key,
+        request_index,
+        (unsigned long long)sentence_meta,
+        (unsigned long long)meta_vtbl_rva,
+        (unsigned long long)safe_read_ptr(sentence_meta + 0x08),
+        (unsigned long long)safe_read_ptr(sentence_meta + 0x10),
+        (unsigned long long)safe_read_ptr(sentence_meta + 0x18),
+        (unsigned int)safe_read_u32(sentence_meta + 0x20),
+        (unsigned int)safe_read_u32(sentence_meta + 0x24),
+        (unsigned long long)safe_read_u64(sentence_meta + 0x28),
+        (unsigned int)safe_read_u32(sentence_meta + 0x30),
+        (unsigned int)safe_read_u32(sentence_meta + 0x32),
+        (unsigned int)safe_read_u32(sentence_meta + 0x34));
+
+    log_line(
+        "[voice-entry-queue] key=0x%x idx=%d obj=0x%llx vtbl=0x%llx q08=0x%llx q10=0x%llx q18=0x%llx q20=0x%llx q28=0x%llx q30=0x%llx",
+        (unsigned int)key,
+        request_index,
+        (unsigned long long)entry_ref48,
+        (unsigned long long)q_vtbl_rva,
+        (unsigned long long)safe_read_u64(entry_ref48 + 0x08),
+        (unsigned long long)safe_read_u64(entry_ref48 + 0x10),
+        (unsigned long long)safe_read_u64(entry_ref48 + 0x18),
+        (unsigned long long)safe_read_u64(entry_ref48 + 0x20),
+        (unsigned long long)safe_read_u64(entry_ref48 + 0x28),
+        (unsigned long long)safe_read_u64(entry_ref48 + 0x30));
+}
+
+static void log_voice_entry_manager_context(
+    uintptr_t manager_obj,
+    uintptr_t entry,
+    uint32_t key,
+    int request_index,
+    uintptr_t sentence_meta)
+{
+    uintptr_t voice_bank;
+    uintptr_t priority_table;
+    uint32_t table_count;
+    uintptr_t table_base;
+    uint32_t entry_count;
+    uint32_t entry_cap;
+    uintptr_t entry_base;
+    uintptr_t selected_table;
+    uintptr_t table_meta = 0;
+    int entry_slot = -1;
+
+    if (manager_obj == 0) {
+        return;
+    }
+
+    voice_bank = safe_read_ptr(manager_obj + 0x30);
+    priority_table = safe_read_ptr(manager_obj + 0x38);
+    table_count = safe_read_u32(priority_table + 0x30);
+    table_base = safe_read_ptr(priority_table + 0x38);
+    entry_count = safe_read_u32(manager_obj + 0x40);
+    entry_cap = safe_read_u32(manager_obj + 0x44);
+    entry_base = safe_read_ptr(manager_obj + 0x48);
+    selected_table = safe_read_ptr(manager_obj + 0x58);
+
+    if (request_index >= 0 &&
+        table_base != 0 &&
+        (uint32_t)request_index < table_count) {
+        table_meta = safe_read_ptr(table_base + ((uintptr_t)(uint32_t)request_index * sizeof(uintptr_t)));
+    }
+    if (entry_base != 0 &&
+        entry >= entry_base &&
+        ((entry - entry_base) % 0x50u) == 0) {
+        uintptr_t slot = (entry - entry_base) / 0x50u;
+        if (slot <= 0x7fffffffu) {
+            entry_slot = (int)slot;
+        }
+    }
+
+    log_line(
+        "[voice-entry-manager] manager=0x%llx voice_bank=0x%llx priority_table=0x%llx table_count=%u table_base=0x%llx "
+        "entry_count=%u entry_cap=%u entry_base=0x%llx entry_slot=%d selected_table=0x%llx "
+        "key=0x%x idx=%d table_meta=0x%llx meta=0x%llx meta_match=%d table_key=0x%x table_priority=0x%x table_q28=0x%llx table_u30=0x%x table_u32=0x%x table_u34=0x%x",
+        (unsigned long long)manager_obj,
+        (unsigned long long)voice_bank,
+        (unsigned long long)priority_table,
+        (unsigned int)table_count,
+        (unsigned long long)table_base,
+        (unsigned int)entry_count,
+        (unsigned int)entry_cap,
+        (unsigned long long)entry_base,
+        entry_slot,
+        (unsigned long long)selected_table,
+        (unsigned int)key,
+        request_index,
+        (unsigned long long)table_meta,
+        (unsigned long long)sentence_meta,
+        table_meta == sentence_meta ? 1 : 0,
+        (unsigned int)safe_read_u32(table_meta + 0x20),
+        (unsigned int)safe_read_u32(table_meta + 0x24),
+        (unsigned long long)safe_read_u64(table_meta + 0x28),
+        (unsigned int)safe_read_u32(table_meta + 0x30),
+        (unsigned int)safe_read_u32(table_meta + 0x32),
+        (unsigned int)safe_read_u32(table_meta + 0x34));
+}
+
 static BOOL read_localized_text_resource(
     uintptr_t ptr,
     uint32_t *tag_out,
@@ -2471,6 +3121,50 @@ static BOOL read_localized_text_resource(
     memcpy(text_buffer, (const void *)text_ptr, copy_len);
     text_buffer[copy_len] = '\0';
     return TRUE;
+}
+
+static BOOL find_localized_child_resource(
+    uintptr_t base,
+    uintptr_t *child_out,
+    uint32_t *offset_out,
+    uint32_t *tag_out,
+    char *text_buffer,
+    size_t text_buffer_size)
+{
+    uint32_t off;
+
+    if (child_out != NULL) {
+        *child_out = 0;
+    }
+    if (offset_out != NULL) {
+        *offset_out = 0;
+    }
+    if (tag_out != NULL) {
+        *tag_out = 0;
+    }
+    if (text_buffer != NULL && text_buffer_size > 0) {
+        text_buffer[0] = '\0';
+    }
+
+    if (base == 0 || IsBadReadPtr((const void *)base, 0x120)) {
+        return FALSE;
+    }
+
+    for (off = 0; off <= 0x118u; off += (uint32_t)sizeof(uintptr_t)) {
+        uintptr_t child = safe_read_ptr(base + off);
+        if (child != 0 &&
+            read_localized_text_resource(child, tag_out, text_buffer, text_buffer_size)) {
+            if (child_out != NULL) {
+                *child_out = child;
+            }
+            if (offset_out != NULL) {
+                *offset_out = off;
+            }
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static void log_localized_text_resource_candidate(
@@ -3390,6 +4084,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     if (g_tls_last_builder == TLS_OUT_OF_INDEXES) {
         log_line("TlsAlloc(last_builder) failed: %lu", (unsigned long)GetLastError());
     }
+    g_tls_current_voice_manager = TlsAlloc();
+    if (g_tls_current_voice_manager == TLS_OUT_OF_INDEXES) {
+        log_line("TlsAlloc(current_voice_manager) failed: %lu", (unsigned long)GetLastError());
+    }
     reset_builder_hit_counts();
     reset_strategy_stats();
     reset_hotkey_runtime_state();
@@ -3486,6 +4184,19 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
 
     if (need_voice_dispatch_hook) {
         if (install_rva_hook(
+                k_rva_voice_manager_tick,
+                hook_voice_manager_tick,
+                (void **)&g_real_voice_manager_tick,
+                "VoiceManagerTick.sub_140DAA930")) {
+            ++hook_count;
+            log_line("Voice manager tick context hook installed at sub_140DAA930");
+        }
+    } else {
+        log_line("Voice manager tick context hook disabled");
+    }
+
+    if (need_voice_dispatch_hook) {
+        if (install_rva_hook(
                 k_rva_voice_queue_submit,
                 hook_voice_queue_submit,
                 (void **)&g_real_voice_queue_submit,
@@ -3494,6 +4205,18 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         }
     } else {
         log_line("Voice queue submit hook disabled");
+    }
+
+    if (need_voice_dispatch_hook) {
+        if (install_rva_hook(
+                k_rva_voice_entry_consumed,
+                hook_voice_entry_consumed,
+                (void **)&g_real_voice_entry_consumed,
+                "VoiceEntryConsumed.sub_140D8F180")) {
+            ++hook_count;
+        }
+    } else {
+        log_line("Voice entry consume hook disabled");
     }
 
     if (need_voice_dispatch_hook) {
@@ -3734,6 +4457,8 @@ __declspec(dllexport) void core_shutdown(void)
     g_real_dollman_voice_delay_schedule = NULL;
     g_real_voice_shared_helper = NULL;
     g_real_voice_queue_submit = NULL;
+    g_real_voice_entry_consumed = NULL;
+    g_real_voice_manager_tick = NULL;
     g_real_dollman_voice_delay_closure = NULL;
     g_real_subtitle_runtime_wrapper = NULL;
     g_real_show_subtitle = NULL;
@@ -3756,6 +4481,10 @@ __declspec(dllexport) void core_shutdown(void)
     if (g_tls_last_builder != TLS_OUT_OF_INDEXES) {
         TlsFree(g_tls_last_builder);
         g_tls_last_builder = TLS_OUT_OF_INDEXES;
+    }
+    if (g_tls_current_voice_manager != TLS_OUT_OF_INDEXES) {
+        TlsFree(g_tls_current_voice_manager);
+        g_tls_current_voice_manager = TLS_OUT_OF_INDEXES;
     }
 
     g_identity_cache_count = 0;

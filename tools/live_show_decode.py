@@ -49,6 +49,34 @@ DISP_RE = re.compile(
     re.I,
 )
 
+REFPACK_RE = re.compile(
+    r"^\[(?P<ts>[^\]]+)\] \[stf-refpack-(?P<phase>[^\]]+)\] "
+    r"tid=(?P<tid>\d+) this=0x(?P<this>[0-9a-f]+) "
+    r"refpackE8=\[(?P<pack>[^\]]*)\] "
+    r"pack2_vtbl_rva=0x(?P<p2_vtbl>[0-9a-f]+) "
+    r"pack2_hi32=0x(?P<p2_hi32>[0-9a-f]+) "
+    r"pack2_ltr_ok=(?P<p2_ok>\d) pack2_tag=0x(?P<p2_tag>[0-9a-f]+) "
+    r"pack2_text=\"(?P<p2_text>[^\"]*)\" "
+    r"pack3_vtbl_rva=0x(?P<p3_vtbl>[0-9a-f]+) "
+    r"pack3_hi32=0x(?P<p3_hi32>[0-9a-f]+) "
+    r"pack3_ltr_ok=(?P<p3_ok>\d) pack3_tag=0x(?P<p3_tag>[0-9a-f]+) "
+    r"pack3_text=\"(?P<p3_text>[^\"]*)\"",
+    re.I,
+)
+
+POSTEVENT_RE = re.compile(
+    r"^\[(?P<ts>[^\]]+)\] \[postevent\] "
+    r"caller_rva=0x(?P<caller>[0-9a-f]+) "
+    r"eventId=(?P<event>\d+) "
+    r"gameObject=0x(?P<gameobject>[0-9a-f]+) "
+    r"externalSources=(?P<external>\d+) "
+    r"ext_ptr=0x(?P<extptr>[0-9a-f]+) "
+    r"ext0=0x(?P<ext0>[0-9a-f]+) "
+    r"ext1=0x(?P<ext1>[0-9a-f]+) "
+    r"blocked=(?P<blocked>\d+)",
+    re.I,
+)
+
 IMAGE_BASE_RE = re.compile(r"DollmanMute image_base=0x(?P<base>[0-9a-f]+)", re.I)
 BUILD_RE = re.compile(r"^\[(?P<ts>[^\]]+)\] DollmanMute build:")
 F8_RE = re.compile(r"^\[(?P<ts>[^\]]+)\] === session boundary F8 count=(?P<n>\d+) ===")
@@ -80,6 +108,12 @@ CloseHandle = kernel32.CloseHandle
 
 
 def parse_ts(raw):
+    raw = raw.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
     return dt.datetime.strptime(raw.split(".")[0], "%Y-%m-%d %H:%M:%S")
 
 
@@ -208,7 +242,8 @@ def pick_window(boundaries, choice):
             wanted_session_id = int(choice_key[3:])
         except ValueError:
             raise SystemExit(f"invalid --session: {choice!r}")
-        for idx, boundary in enumerate(boundaries):
+        for idx in range(len(boundaries) - 1, -1, -1):
+            boundary = boundaries[idx]
             if boundary["session_id"] == wanted_session_id:
                 target_index = idx
                 break
@@ -219,7 +254,8 @@ def pick_window(boundaries, choice):
             n = int(choice)
         except ValueError:
             raise SystemExit(f"invalid --session: {choice!r}")
-        for idx, boundary in enumerate(boundaries):
+        for idx in range(len(boundaries) - 1, -1, -1):
+            boundary = boundaries[idx]
             if boundary["session_id"] == n:
                 target_index = idx
                 break
@@ -352,6 +388,8 @@ def main():
         })
         disp_only_by_tid = 0
         show_events = 0
+        refpack_events = []
+        postevent_events = []
 
         # [disp] telemetry (no selector in current schema, but keep counts for sanity)
         disp_by_tid = defaultdict(int)
@@ -359,6 +397,39 @@ def main():
             m = DISP_RE.search(line)
             if m:
                 disp_by_tid[int(m.group("tid"))] += 1
+
+            m = REFPACK_RE.search(line)
+            if m:
+                refpack_events.append({
+                    "ts": parse_ts(m.group("ts")),
+                    "phase": m.group("phase"),
+                    "tid": int(m.group("tid")),
+                    "this": int(m.group("this"), 16),
+                    "pack": parse_qwords(m.group("pack")),
+                    "p2_vtbl": int(m.group("p2_vtbl"), 16),
+                    "p2_hi32": int(m.group("p2_hi32"), 16),
+                    "p2_ok": int(m.group("p2_ok")),
+                    "p2_tag": int(m.group("p2_tag"), 16),
+                    "p2_text": m.group("p2_text"),
+                    "p3_vtbl": int(m.group("p3_vtbl"), 16),
+                    "p3_hi32": int(m.group("p3_hi32"), 16),
+                    "p3_ok": int(m.group("p3_ok")),
+                    "p3_tag": int(m.group("p3_tag"), 16),
+                    "p3_text": m.group("p3_text"),
+                })
+
+            m = POSTEVENT_RE.search(line)
+            if m:
+                postevent_events.append({
+                    "ts": parse_ts(m.group("ts")),
+                    "caller": int(m.group("caller"), 16),
+                    "event": int(m.group("event")),
+                    "gameobject": int(m.group("gameobject"), 16),
+                    "external": int(m.group("external")),
+                    "ext0": int(m.group("ext0"), 16),
+                    "ext1": int(m.group("ext1"), 16),
+                    "blocked": int(m.group("blocked")),
+                })
 
         for line in lines:
             m = SHOW_RE.search(line)
@@ -417,8 +488,56 @@ def main():
         if reader is None:
             print("live_text=off  source=offline-log-cache-only")
         print(f"show_events={show_events}  disp_events={sum(disp_by_tid.values())}  "
+              f"refpack_events={len(refpack_events)}  "
+              f"postevents={len(postevent_events)}  "
               f"buckets={len(buckets)}")
         print()
+
+        if refpack_events:
+            print("== STF refpack samples ==")
+            for evt in refpack_events[: args.samples]:
+                pack_s = ", ".join(f"0x{x:x}" for x in evt["pack"])
+                p2_text = evt["p2_text"] if evt["p2_text"] else ""
+                p3_text = evt["p3_text"] if evt["p3_text"] else ""
+                print(
+                    f"[{evt['phase']}] tid={evt['tid']} this=0x{evt['this']:x} "
+                    f"refpackE8=[{pack_s}] "
+                    f"pack2(tag=0x{evt['p2_tag']:x},hi32=0x{evt['p2_hi32']:x},"
+                    f"vtbl=0x{evt['p2_vtbl']:x},text=\"{p2_text}\") "
+                    f"pack3(tag=0x{evt['p3_tag']:x},hi32=0x{evt['p3_hi32']:x},"
+                    f"vtbl=0x{evt['p3_vtbl']:x},text=\"{p3_text}\")"
+                )
+            if len(refpack_events) > args.samples:
+                print(f"... +{len(refpack_events) - args.samples} more refpack events")
+            print()
+
+        if refpack_events and postevent_events:
+            refpack_by_pack3 = defaultdict(list)
+            for evt in refpack_events:
+                if len(evt["pack"]) >= 4 and evt["pack"][3] != 0:
+                    refpack_by_pack3[evt["pack"][3]].append(evt)
+
+            links = []
+            for pevt in postevent_events:
+                for revt in refpack_by_pack3.get(pevt["gameobject"], []):
+                    delta_ms = int((pevt["ts"] - revt["ts"]).total_seconds() * 1000)
+                    if -250 <= delta_ms <= 1000:
+                        links.append((delta_ms, revt, pevt))
+
+            if links:
+                print("== Refpack -> PostEvent gameObject links ==")
+                for delta_ms, revt, pevt in links[: args.samples]:
+                    pack2_text = revt["p2_text"] if revt["p2_text"] else ""
+                    print(
+                        f"dt={delta_ms:+d}ms phase={revt['phase']} tid={revt['tid']} "
+                        f"pack3/gameObject=0x{pevt['gameobject']:x} "
+                        f"pack2_tag=0x{revt['p2_tag']:x} pack2_text=\"{pack2_text}\" "
+                        f"eventId={pevt['event']} ext0=0x{pevt['ext0']:x} "
+                        f"external={pevt['external']} blocked={pevt['blocked']}"
+                    )
+                if len(links) > args.samples:
+                    print(f"... +{len(links) - args.samples} more links")
+                print()
 
         if not buckets:
             print("(no [show] lines in window)")

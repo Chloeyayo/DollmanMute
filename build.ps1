@@ -72,7 +72,11 @@ function New-ReleasePackage {
     Copy-Item -LiteralPath $proxyOut -Destination (Join-Path $packageDir 'DollmanMute.asi') -Force
     Copy-Item -LiteralPath $coreOut -Destination (Join-Path $packageDir 'DollmanMuteCore.dll') -Force
     Copy-Item -LiteralPath $srcIni -Destination (Join-Path $packageDir 'DollmanMute.ini') -Force
-    Copy-Item -LiteralPath $readmeSrc -Destination (Join-Path $packageDir 'README.md') -Force
+    if (Test-Path $readmeSrc) {
+        Copy-Item -LiteralPath $readmeSrc -Destination (Join-Path $packageDir 'README.md') -Force
+    } else {
+        Write-Warning "README.md missing; package will omit README.md"
+    }
     if (Test-Path $licenseSrc) {
         Copy-Item -LiteralPath $licenseSrc -Destination (Join-Path $packageDir 'LICENSE-MinHook.txt') -Force
     }

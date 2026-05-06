@@ -1,7 +1,7 @@
 # DollmanMute 研究笔记
 
 > 最后更新: 2026-05-07
-> 当前源码 build tag: `v2.1.5-dev`
+> 当前源码 build tag: `v2.1.6-dev`
 > 这份文件只记录对终极目标有帮助的事实:找到并利用 Dollman gameplay 字幕与语音的共同身份/上游。
 
 ## 0. 终极目标
@@ -16,6 +16,19 @@
 - native 层还没有找到一个能同时直接管住字幕和语音的单一函数。
 - 字幕和语音更像被更高层 script/dialog 系统分别触发。
 - 因此当前主线不是继续堆末端 hook，而是把两侧都提升到身份相关层，再做相关拦截。
+
+完成审计:
+
+| 条件 | 当前证据 | 状态 |
+|---|---|---|
+| Dollman gameplay subtitle mute | `speaker_tag=0x12B6F / line_tag=0x1F4` 已 mute 4 次 | 部分完成 |
+| Dollman gameplay voice mute | `sender-only-narrow`、`voice-entry`、`refpack[3] -> PostEvent.gameObject` 均有证据 | 部分完成 |
+| Sam 不误伤 | 同 sender Sam `speaker_tag=0x122A8` 命中 10 次、mute 0 次；F8-5 Sam external-source PostEvent blocked=0 | 部分完成 |
+| NPC/private-room/cutscene 不误伤 | Dollman story-like `caller_rva=0x202FA6F` 命中 43 次、mute 0 次；仍缺 private-room/cutscene 单动作样本 | 部分完成 |
+| 共同身份/上游 | `throw/0x1F4` 已证明 refpack 同时解释 subtitle line/speaker 与 voice gameObject | 只完成 throw family |
+| 不依赖末端签名 | throw 已有 refpack 投影候选；random/dialogue 仍依赖 voice-entry/event/ext0 样本族 | 未完成 |
+
+结论: 终极目标未完成；不能把当前 build 或单个 throw 链路当最终完成。
 
 ## 1. 当前最重要结论
 
@@ -50,7 +63,8 @@ Invoke_ElevenMonthBBReaction
   - `speaker_tag = 0x12B6F`
 - 已知 line/family:
   - `line_tag = 0x01F4` = throw/recall/equip family
-  - `line_tag = 0x222C / 0x4377` = gameplay dialogue samples
+  - `line_tag = 0x4377` 已在 `caller_rva=0x202FA6F` story-like 面出现 10 次且 mute 0 次；不能只凭 line tag 当 gameplay 身份
+  - `line_tag = 0x222C / 0x4377` 仍需重新用可控 gameplay session 分类
 
 工程判断:
 
@@ -137,6 +151,49 @@ AK::SoundEngine::PostEvent
 - 比 subtitle pair 更靠近实际发声路径，因为不要求字幕先出现。
 - 给了一个可以和 subtitle sender 同窗验证的 voice 侧身份投影。
 
+### 2.1 当前不误伤证据
+
+已有日志里，同一个 `ShowSubtitle sender caller_rva=0x385C5B` 上出现过 Sam 负样本:
+
+- Sam: `speaker_tag=0x122A8`, `line_tag=0x7993`, `family=none`, 命中 10 次。
+- Sam mute 次数: 0。
+- Dollman: `speaker_tag=0x12B6F`, `line_tag=0x1F4`, `family=throwRecall`, mute 次数 4。
+
+这说明当前 subtitle pair 规则没有把同 sender 面上的 Sam 误判为 Dollman。
+
+F8-5 里还有一条 Sam voice/refpack 负链:
+
+```text
+voice-entry
+  key=0x7BD37461, idx=436
+  selected/meta p08=0x799300000002 / 0x799300000006
+
+StartTalk Sam
+  speaker_tag=0x122A8
+  refpackE8=[0,0,0,0]
+
+PostEvent +2ms
+  eventId=4059710847, ext0=0x4F1FA457F, gameObject=0x438A33C4980, externalSources=1, blocked=0
+```
+
+这条负链的意义:
+
+- Sam voice-entry 的 `(key,index)` 不属于当前 Dollman gameplay chatter 样本族。
+- Sam StartTalk 没有形成 Dollman throw 的 `refpack[3] -> gameObject` 形状。
+- Sam external-source PostEvent 未被当前规则拦截。
+
+但这还不是最终 negative proof:
+
+- 这些 Sam 样本来自历史日志，不是本轮 `Y` 单动作 session。
+- 还没有覆盖 NPC / private-room / cutscene。
+
+另一个弱安全证据:
+
+- Dollman story-like sender `caller_rva=0x202FA6F` 命中 43 次。
+- 这些 `speaker_tag=0x12B6F` 的非 gameplay/story-like 字幕 mute 次数为 0。
+- 其中 `line_tag=0x4377` 命中 10 次、mute 0 次，说明 `0x4377` 不能单独作为 gameplay mute 条件。
+- 这支持当前 gameplay pair 没有 blanket mute 全部 Dollman，但它不能替代 private-room / cutscene 定点样本。
+
 仍未证明:
 
 - 这组 `(key,index)` 是否覆盖所有 Dollman gameplay chatter。
@@ -189,10 +246,46 @@ voice 侧可能对应投影:
 - `source+0x20`: 更像语义资源主键。
 - `sub_140D8F180` 的 `key/index/resource shape`: 当前最接近 voice 侧 live 身份投影。
 
+### 3.1 已证明的 throw/refpack -> voice 投影
+
+F8-5 `Dollman throw` 样本证明了一条很窄但非常强的链:
+
+```text
+StartTalk sti-post
+  refpackE8[0] = 0x1950288e098  -> Dollman speaker resource
+  refpackE8[2] = 0x19556ac90d8  -> line resource, tag=0x1F4, text="Wee!"
+  refpackE8[3] = 0x4392d480700  -> voice PostEvent gameObject
+
+ShowSubtitle sender
+  speaker_tag=0x12B6F, line_tag=0x1F4, text="Wee!"
+
+PostEvent +2ms
+  eventId=2978848044, ext0=0x4B18D9D2C, gameObject=0x4392d480700, externalSources=1, blocked=1
+```
+
+这条证据的意义:
+
+- `refpack[2]` 与 subtitle sender 的 line resource/tag/text 对上。
+- `refpack[0]` 与 subtitle sender 的 Dollman speaker resource 对上。
+- `refpack[3]` 与随后 voice `PostEvent.gameObject` 完全相等，延迟约 2ms。
+- 对 throw/equip family 来说，StartTalk ref-pack 已经不是只解释 subtitle，它也携带 voice 投影对象。
+
+当前代码形态:
+
+- `hook_start_talk_init` 在 `sti-post` 识别 Dollman throw/refpack 后记录 1 秒 pending voice object。
+- `PostEventID` 会输出 `RefpackDollmanPostEvent` 证据行；若该 event 没被更窄的 sender/eventId 或 voice-entry 规则先拦住，可用 `sender-only-refpack-object` 拦截。
+- 这仍是候选路径，不应删除现有 `sender-only-narrow` 与 `voice-entry` 保护层。
+
+仍不能直接推广:
+
+- 这只证明 `line_tag=0x1F4` 的 Dollman throw 单样本。
+- 还没证明 random/dialogue family 也用同样的 `refpack[3] -> gameObject` 投影。
+- 还没证明 Sam `Y` 负样本不会出现同样的 Dollman refpack 形状。
+
 下一步要证明的是:
 
-- 同一轮 F8 中，StartTalk/ref-pack 身份是否与 subtitle sender Dollman pair 同窗出现。
-- 同一轮 F8 中，同一身份是否随后对应 voice-entry / PostEventID。
+- 同一轮 F8 中，StartTalk/ref-pack 身份是否与 subtitle sender Dollman pair 同窗出现。`throw/0x1F4` 已证明。
+- 同一轮 F8 中，同一身份是否随后对应 voice-entry / PostEventID。`throw/0x1F4` 已证明 `refpack[3] -> PostEvent.gameObject`。
 - 非 Dollman chatter 是否不满足这组身份。
 
 ## 4. 当前运行时速查
@@ -220,20 +313,34 @@ ScannerMode=0
 | shared helper | `sub_140DACCD0` | Player / Dollman 共用 helper，只能强约束使用 |
 | subtitle sender | `sub_140780BF0` | subtitle 侧验证/静音面 |
 | subtitle remove sender | `sub_140780CF0` | sender 配对面 |
+| StartTalk init/producer | `sub_1403876B0` / slot15 producer | F8 中记录 `pack48`、`pair120`、`obj136` 与 `refpackE8[0..3]` |
+| selector dispatch | `sub_140DAFDC0` | F8 中记录 selector/pending/ref500/count |
+
+当前研究开关:
+
+- `EnableSubtitleProducerProbe=1`
+- `EnableSelectorProbe=1`
+- `EnableDeepProbe=1`
+- 不默认打开 `EnableBuilderProbe`，避免 heavy dump 干扰单动作 session。
 
 热键:
 
 - `F8` = 打 session 边界并打开短 probe window。
+- 创建游戏根目录 `DollmanMute.session` = 同样打 session 边界；用于脚本控制时替代不可靠的键盘注入。
 - `F9` = 清空 `DollmanMute.log`。
 
 最有用的本地命令:
 
 ```powershell
+.\tools\game_input.ps1 sam
+.\tools\game_input.ps1 throw -HoldRightMs 1600
+.\tools\capture_session.ps1 sam-y -DurationSec 8 -AutoAction sam
 .\tools\exp.ps1 sessions
 .\tools\exp.ps1 summary F8-<N> -Top 4
 .\tools\exp.ps1 show F8-<N> -Samples 3
 .\tools\exp.ps1 combo F8-<N> 3 4
 .\tools\exp.ps1 watch
+python .\tools\goal_audit.py
 ```
 
 ## 5. 当前不可再浪费时间的路线
@@ -254,11 +361,11 @@ ScannerMode=0
 
 1. 保持当前 voice-entry -> PostEventID 二段式拦截，继续收样本。
 2. 精简源码里的 heavy `[voice-entry-*]` dump，只保留能判断身份相关性的日志。
-3. 在 StartTalk/ref-pack 层加窄 probe，目标是把 `qword,qword / pack[2] / pack[3]` 和 subtitle/voice 两侧同窗相关起来。
-4. 用 F8 单动作 session 验证三类样本:
-   - Dollman random gameplay chatter
-   - throw/recall/equip
-   - 非 Dollman / private-room / cutscene
+3. 已加 StartTalk/ref-pack 窄 probe: F8 日志现在会输出 `[stf-refpack-*] refpackE8=[0..3]`，并解 `pack[2] / pack[3]` 的 vtable、hi32、LocalizedTextResource 线索。
+4. 放弃等待 random；random 虽然有 trigger，但光等会浪费时间。下一步只用可控单动作 session:
+   - `Y` = Sam 说话，作为非 Dollman 负样本。
+   - `按住右键后左键` = 丢出 Dollman，作为 Dollman throw 正样本。
+   - 后续再补 private-room / cutscene，不把它和当前 gameplay 单动作混在一轮。
 5. 只有当同一身份能同时解释 subtitle pair 和 voice-entry/PostEventID 时，才把它提升成最终规则。
 
 当前判断:

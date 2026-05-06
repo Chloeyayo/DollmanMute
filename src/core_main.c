@@ -105,6 +105,7 @@ static BOOL g_log_lock_inited = FALSE;
 static Config g_cfg;
 static char g_ini_path[MAX_PATH];
 static char g_log_path[MAX_PATH];
+static char g_session_trigger_path[MAX_PATH];
 static ProxyContext g_proxy_ctx;
 static volatile LONG g_core_shutting_down = 0;
 static HANDLE g_hotkey_thread_handle = NULL;
@@ -126,7 +127,7 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1.5-dev";
+static const char *k_build_tag = "v2.1.6-dev";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -183,6 +184,9 @@ static volatile LONG g_last_dollman_voice_entry_key = 0;
 static volatile LONG g_last_dollman_voice_entry_index = 0;
 static volatile LONG g_last_dollman_voice_entry_selected = 0;
 static volatile LONG64 g_last_dollman_voice_entry_caller_rva = 0;
+static volatile LONG64 g_last_dollman_refpack_voice_object = 0;
+static volatile LONG64 g_last_dollman_refpack_ms = 0;
+static volatile LONG g_last_dollman_refpack_line_tag = 0;
 
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
@@ -463,6 +467,14 @@ static BOOL consume_pending_dollman_gameplay_chatter_voice_entry(
     uint64_t ext0,
     ULONGLONG now_ms,
     ULONGLONG *delta_ms_out);
+static void note_dollman_refpack_voice_object(uintptr_t this_obj, const char *phase);
+static BOOL get_recent_dollman_refpack_voice_object_delta_ms(
+    AkGameObjectID game_object_id,
+    uint32_t external_source_count,
+    uint64_t ext0,
+    ULONGLONG now_ms,
+    ULONGLONG *delta_ms_out,
+    uint32_t *line_tag_out);
 static void log_localized_hits_in_block(
     uintptr_t caller_rva,
     const char *label,
@@ -542,6 +554,26 @@ static void join_path(char *buffer, size_t buffer_size, const char *dir, const c
     snprintf(buffer, buffer_size, "%s\\%s", dir, file_name != NULL ? file_name : "");
 }
 
+static void init_session_trigger_path(void)
+{
+    char dir[MAX_PATH];
+    char *last_slash = NULL;
+
+    g_session_trigger_path[0] = '\0';
+    if (g_log_path[0] == '\0') {
+        return;
+    }
+
+    snprintf(dir, sizeof(dir), "%s", g_log_path);
+    dir[MAX_PATH - 1] = '\0';
+    last_slash = strrchr(dir, '\\');
+    if (last_slash == NULL) {
+        return;
+    }
+    *last_slash = '\0';
+    join_path(g_session_trigger_path, sizeof(g_session_trigger_path), dir, "DollmanMute.session");
+}
+
 static void init_paths(void)
 {
     char module_path[MAX_PATH];
@@ -549,6 +581,7 @@ static void init_paths(void)
 
     g_ini_path[0] = '\0';
     g_log_path[0] = '\0';
+    g_session_trigger_path[0] = '\0';
 
     if (g_proxy_ctx.ini_path != NULL && g_proxy_ctx.ini_path[0] != '\0') {
         snprintf(g_ini_path, sizeof(g_ini_path), "%s", g_proxy_ctx.ini_path);
@@ -558,6 +591,7 @@ static void init_paths(void)
     }
 
     if (g_ini_path[0] != '\0' && g_log_path[0] != '\0') {
+        init_session_trigger_path();
         return;
     }
 
@@ -580,6 +614,7 @@ static void init_paths(void)
     if (g_log_path[0] == '\0') {
         join_path(g_log_path, sizeof(g_log_path), module_path, "DollmanMute.log");
     }
+    init_session_trigger_path();
 }
 
 static void ensure_default_ini(void)
@@ -672,6 +707,41 @@ static void load_config(void)
         "EnableSubtitleMute",
         "EnableSubtitleRuntimeHooks",
         g_cfg.enable_subtitle_runtime_hooks);
+    g_cfg.enable_subtitle_family_tracking = read_ini_bool_compat(
+        "General",
+        "EnableSubtitleFamilyTracking",
+        NULL,
+        g_cfg.enable_subtitle_family_tracking);
+    g_cfg.enable_subtitle_producer_probe = read_ini_bool_compat(
+        "General",
+        "EnableSubtitleProducerProbe",
+        NULL,
+        g_cfg.enable_subtitle_producer_probe);
+    g_cfg.enable_builder_probe = read_ini_bool_compat(
+        "General",
+        "EnableBuilderProbe",
+        NULL,
+        g_cfg.enable_builder_probe);
+    g_cfg.enable_selector_probe = read_ini_bool_compat(
+        "General",
+        "EnableSelectorProbe",
+        NULL,
+        g_cfg.enable_selector_probe);
+    g_cfg.enable_deep_probe = read_ini_bool_compat(
+        "General",
+        "EnableDeepProbe",
+        NULL,
+        g_cfg.enable_deep_probe);
+    g_cfg.enable_talk_dispatcher_probe = read_ini_bool_compat(
+        "General",
+        "EnableTalkDispatcherProbe",
+        NULL,
+        g_cfg.enable_talk_dispatcher_probe);
+    g_cfg.enable_legacy_runtime_wrapper = read_ini_bool_compat(
+        "General",
+        "EnableLegacyRuntimeWrapper",
+        NULL,
+        g_cfg.enable_legacy_runtime_wrapper);
     {
         int scanner_mode_value = read_ini_int_compat(
             "General",
@@ -963,6 +1033,9 @@ static void reset_log_capture_state(void)
     InterlockedExchange(&g_last_dollman_voice_entry_index, 0);
     InterlockedExchange(&g_last_dollman_voice_entry_selected, 0);
     InterlockedExchange64(&g_last_dollman_voice_entry_caller_rva, 0);
+    InterlockedExchange64(&g_last_dollman_refpack_voice_object, 0);
+    InterlockedExchange64(&g_last_dollman_refpack_ms, 0);
+    InterlockedExchange(&g_last_dollman_refpack_line_tag, 0);
 }
 
 static void seed_hotkey_state_from_config(void)
@@ -1177,6 +1250,102 @@ static BOOL consume_pending_dollman_gameplay_chatter_voice_entry(
 
     InterlockedExchange64(&g_last_dollman_voice_entry_ms, 0);
     return TRUE;
+}
+
+static void note_dollman_refpack_voice_object(uintptr_t this_obj, const char *phase)
+{
+    uintptr_t speaker_ref;
+    uintptr_t line_ref;
+    uintptr_t voice_object;
+    uint32_t speaker_tag = 0;
+    uint32_t line_tag = 0;
+    char line_text[96];
+    BOOL speaker_ok;
+    BOOL line_ok;
+    uint32_t family;
+
+    if (this_obj == 0) {
+        return;
+    }
+
+    ZeroMemory(line_text, sizeof(line_text));
+    speaker_ref = safe_read_ptr(this_obj + 0xE8);
+    line_ref = safe_read_ptr(this_obj + 0xF8);
+    voice_object = safe_read_ptr(this_obj + 0x100);
+    if (speaker_ref == 0 || line_ref == 0 || voice_object == 0) {
+        return;
+    }
+
+    speaker_ok = read_localized_text_resource(speaker_ref, &speaker_tag, NULL, 0);
+    line_ok = read_localized_text_resource(line_ref, &line_tag, line_text, sizeof(line_text));
+    family = classify_subtitle_family_from_identity_tag(line_tag);
+    if (!speaker_ok ||
+        !line_ok ||
+        speaker_tag != k_dollman_gameplay_speaker_tag ||
+        family != SUBTITLE_FAMILY_THROW_RECALL) {
+        return;
+    }
+
+    InterlockedExchange64(&g_last_dollman_refpack_voice_object, (LONG64)voice_object);
+    InterlockedExchange64(&g_last_dollman_refpack_ms, (LONG64)GetTickCount64());
+    InterlockedExchange(&g_last_dollman_refpack_line_tag, (LONG)line_tag);
+
+    if (is_stf_probe_window_open()) {
+        log_line(
+            "[refpack-voice-object] phase=%s tid=%lu this=0x%llx speaker_tag=0x%x line_tag=0x%x line_text=\"%s\" gameObject=0x%llx pending_ms=1000",
+            phase != NULL ? phase : "?",
+            (unsigned long)GetCurrentThreadId(),
+            (unsigned long long)this_obj,
+            (unsigned int)speaker_tag,
+            (unsigned int)line_tag,
+            line_text,
+            (unsigned long long)voice_object);
+    }
+}
+
+static BOOL get_recent_dollman_refpack_voice_object_delta_ms(
+    AkGameObjectID game_object_id,
+    uint32_t external_source_count,
+    uint64_t ext0,
+    ULONGLONG now_ms,
+    ULONGLONG *delta_ms_out,
+    uint32_t *line_tag_out)
+{
+    LONG64 last_ms;
+    LONG64 last_object;
+    ULONGLONG delta_ms = 0;
+
+    if (delta_ms_out != NULL) {
+        *delta_ms_out = 0;
+    }
+    if (line_tag_out != NULL) {
+        *line_tag_out = 0;
+    }
+    if (!is_sender_only_dollman_radio_mute_enabled() ||
+        external_source_count != 1u ||
+        ext0 == 0 ||
+        game_object_id == 0) {
+        return FALSE;
+    }
+
+    last_ms = InterlockedCompareExchange64(&g_last_dollman_refpack_ms, 0, 0);
+    last_object = InterlockedCompareExchange64(&g_last_dollman_refpack_voice_object, 0, 0);
+    if (last_ms <= 0 ||
+        last_object == 0 ||
+        now_ms < (ULONGLONG)last_ms ||
+        (AkGameObjectID)last_object != game_object_id) {
+        return FALSE;
+    }
+
+    delta_ms = now_ms - (ULONGLONG)last_ms;
+    if (delta_ms_out != NULL) {
+        *delta_ms_out = delta_ms;
+    }
+    if (line_tag_out != NULL) {
+        *line_tag_out = (uint32_t)InterlockedCompareExchange(&g_last_dollman_refpack_line_tag, 0, 0);
+    }
+
+    return delta_ms <= 1000ull;
 }
 
 static BOOL is_selected_subtitle_family(uint32_t family)
@@ -1704,18 +1873,29 @@ static void update_hotkey_mute_state(void)
 {
     BOOL key_control_down[HOTKEY_CONTROL_COUNT];
     uint32_t i;
+    BOOL file_session_mark = FALSE;
 
     for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
         key_control_down[i] = is_vk_down(k_hotkey_control_vks[i]);
     }
 
-    if (key_control_down[HOTKEY_CONTROL_SESSION_MARK] &&
-        !g_hotkey_control_prev[HOTKEY_CONTROL_SESSION_MARK]) {
+    if (g_session_trigger_path[0] != '\0' &&
+        GetFileAttributesA(g_session_trigger_path) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileA(g_session_trigger_path);
+        file_session_mark = TRUE;
+    }
+
+    if ((key_control_down[HOTKEY_CONTROL_SESSION_MARK] &&
+         !g_hotkey_control_prev[HOTKEY_CONTROL_SESSION_MARK]) ||
+        file_session_mark) {
         LONG counter = InterlockedIncrement(&g_session_counter);
         ULONGLONG until_ms = GetTickCount64() + 5000ull;
         InterlockedExchange64(&g_stf_probe_window_until_ms, (LONG64)until_ms);
         reset_log_capture_state();
         log_line("=== session boundary F8 count=%ld ===", (long)counter);
+        if (file_session_mark) {
+            log_line("Session trigger consumed: DollmanMute.session");
+        }
     }
 
     for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
@@ -1919,6 +2099,8 @@ static AkPlayingID __cdecl hook_post_event_id(
     BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
     BOOL blocked_sender_only = FALSE;
     BOOL blocked_voice_entry = FALSE;
+    BOOL blocked_refpack_voice_object = FALSE;
+    BOOL refpack_voice_object_match = FALSE;
     BOOL blocked_recent_subtitle = FALSE;
     BOOL blocked = FALSE;
     BOOL dowser_event_match = FALSE;
@@ -1938,6 +2120,8 @@ static AkPlayingID __cdecl hook_post_event_id(
     ULONGLONG dowser_delta_ms = 0;
     ULONGLONG dollman_delta_ms = 0;
     ULONGLONG voice_entry_delta_ms = 0;
+    ULONGLONG refpack_voice_delta_ms = 0;
+    uint32_t refpack_voice_line_tag = 0;
     ULONGLONG now_ms = GetTickCount64();
 
     blocked_sender_only =
@@ -1955,18 +2139,34 @@ static AkPlayingID __cdecl hook_post_event_id(
             ext0,
             now_ms,
             &voice_entry_delta_ms);
+    refpack_voice_object_match =
+        get_recent_dollman_refpack_voice_object_delta_ms(
+            game_object_id,
+            external_source_count,
+            ext0,
+            now_ms,
+            &refpack_voice_delta_ms,
+            &refpack_voice_line_tag);
+    blocked_refpack_voice_object =
+        g_cfg.enabled &&
+        !blocked_sender_only &&
+        !blocked_voice_entry &&
+        refpack_voice_object_match;
     blocked_recent_subtitle =
         g_cfg.enabled &&
         is_sender_only_dollman_radio_mute_enabled() &&
         external_source_count == 1u &&
         !blocked_sender_only &&
         !blocked_voice_entry &&
+        !blocked_refpack_voice_object &&
         get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
-    blocked = blocked_legacy || blocked_sender_only || blocked_voice_entry || blocked_recent_subtitle;
+    blocked = blocked_legacy || blocked_sender_only || blocked_voice_entry || blocked_refpack_voice_object || blocked_recent_subtitle;
     if (blocked_sender_only) {
         block_mode = "sender-only-narrow";
     } else if (blocked_voice_entry) {
         block_mode = "sender-only-voice-entry";
+    } else if (blocked_refpack_voice_object) {
+        block_mode = "sender-only-refpack-object";
     } else if (blocked_recent_subtitle) {
         block_mode = "sender-only-recent-subtitle";
     } else if (blocked_legacy) {
@@ -2045,6 +2245,19 @@ static AkPlayingID __cdecl hook_post_event_id(
                 (unsigned int)InterlockedCompareExchange(&g_last_dollman_voice_entry_key, 0, 0),
                 (int)InterlockedCompareExchange(&g_last_dollman_voice_entry_index, 0, 0),
                 (int)InterlockedCompareExchange(&g_last_dollman_voice_entry_selected, 0, 0));
+        }
+        if (refpack_voice_object_match) {
+            log_line(
+                "RefpackDollmanPostEvent caller_rva=0x%llx eventId=%u gameObject=0x%llx extCount=%u ext0=0x%llx ext1=0x%llx deltaMs=%llu line_tag=0x%x blocked=%d",
+                (unsigned long long)caller_rva,
+                (unsigned int)event_id,
+                (unsigned long long)game_object_id,
+                (unsigned int)external_source_count,
+                (unsigned long long)ext0,
+                (unsigned long long)ext1,
+                (unsigned long long)refpack_voice_delta_ms,
+                (unsigned int)refpack_voice_line_tag,
+                blocked_refpack_voice_object ? 1 : 0);
         }
     }
 
@@ -3439,6 +3652,22 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
     uintptr_t pack_obj136_vtbl_rva = 0;
     uint32_t pack_u144;
     uint32_t pack_u148;
+    uintptr_t refpack0;
+    uintptr_t refpack1;
+    uintptr_t refpack2;
+    uintptr_t refpack3;
+    uintptr_t refpack2_vtbl;
+    uintptr_t refpack2_vtbl_rva = 0;
+    uintptr_t refpack3_vtbl;
+    uintptr_t refpack3_vtbl_rva = 0;
+    uint32_t refpack2_hi32;
+    uint32_t refpack3_hi32;
+    uint32_t refpack2_tag = 0;
+    uint32_t refpack3_tag = 0;
+    char refpack2_text[120];
+    char refpack3_text[120];
+    BOOL refpack2_text_ok;
+    BOOL refpack3_text_ok;
     uintptr_t line_loc;
     uintptr_t speaker_wrap;
     uintptr_t speaker_wrap_vtbl;
@@ -3461,6 +3690,8 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
 
     ZeroMemory(line_text, sizeof(line_text));
     ZeroMemory(speaker_text, sizeof(speaker_text));
+    ZeroMemory(refpack2_text, sizeof(refpack2_text));
+    ZeroMemory(refpack3_text, sizeof(refpack3_text));
 
     p200 = safe_deref_qword(this_obj + 200);
     desc = safe_deref_qword(p200);
@@ -3495,6 +3726,22 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
     }
     pack_u144 = safe_read_u32(this_obj + 144);
     pack_u148 = safe_read_u32(this_obj + 148);
+    refpack0 = safe_read_ptr(this_obj + 0xE8);
+    refpack1 = safe_read_ptr(this_obj + 0xF0);
+    refpack2 = safe_read_ptr(this_obj + 0xF8);
+    refpack3 = safe_read_ptr(this_obj + 0x100);
+    refpack2_vtbl = safe_read_ptr(refpack2 + 0x0);
+    if (g_image_base != 0 && refpack2_vtbl > g_image_base) {
+        refpack2_vtbl_rva = refpack2_vtbl - g_image_base;
+    }
+    refpack3_vtbl = safe_read_ptr(refpack3 + 0x0);
+    if (g_image_base != 0 && refpack3_vtbl > g_image_base) {
+        refpack3_vtbl_rva = refpack3_vtbl - g_image_base;
+    }
+    refpack2_hi32 = read_identity_hi32(refpack2);
+    refpack3_hi32 = read_identity_hi32(refpack3);
+    refpack2_text_ok = read_localized_text_resource(refpack2, &refpack2_tag, refpack2_text, sizeof(refpack2_text));
+    refpack3_text_ok = read_localized_text_resource(refpack3, &refpack3_tag, refpack3_text, sizeof(refpack3_text));
 
     line_loc = safe_deref_qword(desc + 0x48);
     speaker_wrap = safe_deref_qword(desc + 0x50);
@@ -3563,6 +3810,28 @@ static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_o
         speaker_ok ? 1 : 0,
         (unsigned int)speaker_tag,
         speaker_text);
+
+    log_line(
+        "[stf-refpack-%s] tid=%lu this=0x%llx refpackE8=[0x%llx,0x%llx,0x%llx,0x%llx] "
+        "pack2_vtbl_rva=0x%llx pack2_hi32=0x%x pack2_ltr_ok=%d pack2_tag=0x%x pack2_text=\"%s\" "
+        "pack3_vtbl_rva=0x%llx pack3_hi32=0x%x pack3_ltr_ok=%d pack3_tag=0x%x pack3_text=\"%s\"",
+        phase != NULL ? phase : "?",
+        (unsigned long)GetCurrentThreadId(),
+        (unsigned long long)this_obj,
+        (unsigned long long)refpack0,
+        (unsigned long long)refpack1,
+        (unsigned long long)refpack2,
+        (unsigned long long)refpack3,
+        (unsigned long long)refpack2_vtbl_rva,
+        (unsigned int)refpack2_hi32,
+        refpack2_text_ok ? 1 : 0,
+        (unsigned int)refpack2_tag,
+        refpack2_text,
+        (unsigned long long)refpack3_vtbl_rva,
+        (unsigned int)refpack3_hi32,
+        refpack3_text_ok ? 1 : 0,
+        (unsigned int)refpack3_tag,
+        refpack3_text);
 }
 
 static void log_dollman_voice_closure_probe(const char *phase, uintptr_t closure_state)
@@ -3763,6 +4032,7 @@ static uintptr_t __fastcall hook_start_talk_init(uintptr_t this_obj)
     if (probe_enabled) {
         log_start_talk_function_snapshot("sti-post", this_obj);
     }
+    note_dollman_refpack_voice_object(this_obj, "sti-post");
 
     return result;
 }

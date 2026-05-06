@@ -143,7 +143,8 @@ def select_sessions(sessions: list[dict], choice: str) -> list[dict]:
     if choice.lower().startswith("f8-"):
         choice = choice[3:]
     wanted = int(choice)
-    return [s for s in meaningful if s["id"] == wanted]
+    matches = [s for s in meaningful if s["id"] == wanted]
+    return matches[-1:] if matches else []
 
 
 def print_session(session: dict, top_n: int) -> None:

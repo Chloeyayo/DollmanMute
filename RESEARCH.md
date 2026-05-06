@@ -46,7 +46,7 @@ Invoke_ElevenMonthBBReaction
 - `sub_140780BF0` = subtitle sender
 - `sub_140780CF0` = subtitle remove sender
 - Dollman gameplay sender pair:
-  - `caller_rva = 0x385C1B`
+  - `caller_rva = 0x385C5B`
   - `speaker_tag = 0x12B6F`
 - 已知 line/family:
   - `line_tag = 0x01F4` = throw/recall/equip family

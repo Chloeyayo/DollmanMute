@@ -6,18 +6,20 @@ BI*CH SHUT THE F UP
 
 ## Description
 
-**v2.0 beta notice:** supports game version `v1.5`.
+**v2.1.6 hotfix notice:** supports game version `v1.6`.
 
 Brief changelog:
 
+- Private-room story-rest hotfix
 - Added Dollman subtitle muting
-- Broader Dollman gameplay voice mute coverage
+- Known Dollman gameplay voice mute coverage
+- Added verified hat/equip gameplay line coverage
 
 Detailed changelog and update notes are in the discussion section.
 
 **DollmanMute** exists for one reason: to shut Dollman up during normal gameplay.
 
-This mod mutes Dollman's repetitive and annoying gameplay voice lines, including his chatter during normal play, the lines that play when you throw him, and his voice lines after mission failure.
+This mod mutes known repetitive Dollman gameplay voice lines, including his chatter during normal play, the lines that play when you throw him, and his voice lines after mission failure.
 
 Under normal circumstances, it should not affect Dollman's dialogue in story scenes.
 
@@ -45,7 +47,7 @@ Then launch the game.
 ## Main Features
 
 
-- Mutes all Dollman gameplay audios and subtitles
+- Mutes known Dollman gameplay audios and subtitles
 - Keeps ambient and world audio intact
 - Intended not to affect cutscenes or private-room dialogue under normal use
 - Lightweight native ASI mod

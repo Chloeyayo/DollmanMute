@@ -42,10 +42,6 @@ typedef AkPlayingID(__cdecl *PostEventIdFn)(
 typedef uintptr_t(__fastcall *DollmanVoiceDelayScheduleFn)(
     uintptr_t instance,
     int controller_index);
-typedef void(__fastcall *InvokeReactionEventFn)(
-    unsigned char reaction_event_id,
-    unsigned char force_to_override,
-    float loop_time);
 typedef uintptr_t(__fastcall *VoiceSharedHelperFn)(
     uintptr_t manager_obj,
     uintptr_t voice_source,
@@ -59,7 +55,7 @@ typedef char(__fastcall *VoiceQueueSubmitFn)(
     uintptr_t a4,
     uintptr_t a5,
     unsigned char *a6);
-typedef uintptr_t(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
+typedef void(__fastcall *DollmanVoiceDelayClosureFn)(void *closure_state);
 typedef uintptr_t(__fastcall *SubtitleRuntimeWrapperFn)(uintptr_t view, uintptr_t arg2);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
 typedef uintptr_t(__fastcall *RemoveSubtitleFn)(uintptr_t view, const uint64_t *key_pair, char mode);
@@ -104,7 +100,6 @@ static HANDLE g_hotkey_thread_handle = NULL;
 
 static PostEventIdFn g_real_post_event_id = NULL;
 static DollmanVoiceDelayScheduleFn g_real_dollman_voice_delay_schedule = NULL;
-static InvokeReactionEventFn g_real_invoke_reaction_event = NULL;
 static VoiceSharedHelperFn g_real_voice_shared_helper = NULL;
 static VoiceQueueSubmitFn g_real_voice_queue_submit = NULL;
 static DollmanVoiceDelayClosureFn g_real_dollman_voice_delay_closure = NULL;
@@ -117,12 +112,12 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1.6-hat-refpack-hotfix";
+static const char *k_build_tag = "v2.1.17";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
 static uintptr_t g_image_size = 0;
-static const uintptr_t k_rva_localized_text_resource_vtbl = 0x0344ACA0u;
+static const uintptr_t k_rva_localized_text_resource_vtbl = 0x0344AC78u;
 
 static const char *classify_builder_c_msg(
     uintptr_t msg_vtbl_rva,
@@ -165,52 +160,47 @@ static uint64_t g_last_dowser_key2 = 0;
 static uint64_t g_last_dowser_key3 = 0;
 static uintptr_t g_last_dowser_p6 = 0;
 static uintptr_t g_last_dowser_p7 = 0;
-static volatile LONG64 g_last_dollman_refpack_voice_object = 0;
-static volatile LONG64 g_last_dollman_refpack_ms = 0;
-static volatile LONG g_last_dollman_refpack_line_tag = 0;
+static volatile LONG64 g_last_dollman_muted_subtitle_ms = 0;
+static uint32_t g_last_dollman_muted_speaker_tag = 0;
+static uint32_t g_last_dollman_muted_line_tag = 0;
+static uintptr_t g_last_dollman_muted_caller_rva = 0;
+
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
-/* v1.6 DSRadioSentenceGroupThrough* vtable check:
- *   PlayerInstance:  schedule 0x00C73E80, closure 0x00C73F30, helper return 0x00C73FBE
- *   DollmanInstance: schedule 0x00C74300, closure 0x00C743B0, helper return 0x00C7443D
- * Both closure functions call the shared helper sub_140DACCD0, which can
- * submit voice requests and emit talk/voice notifications. These schedule and
- * closure functions are not safe production mute seams; keep them pass-through
- * and rely on narrower PostEvent/subtitle identities for muting. */
-static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C74300u;
-static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C743B0u;
+/* Legacy broad audio hook names are kept for source continuity. On the current
+ * v1.5 build, 0x00C73BF0 landed in a ThroughDollmanInstance teardown path, not
+ * the live delay scheduler. For v1.6, the live Dollman delay scheduler is
+ * 0x00C73E80 and the Dollman-only runtime voice closure is 0x00C73F30.
+ * The old 0x00DAA410 "dispatcher" probe was a manager tick/update; the real
+ * shared voice submit helper is 0x00DACCD0 in v1.6.
+ * On v1.6 the Player-side path that calls the shared helper has been
+ * refactored: it no longer flows through the v1.5 player closure (sub_140C73A60)
+ * but through sub_140C743B0, where the call to sub_140DACCD0 sits at
+ * 0x140C74438 (return RVA 0x00C7443D). The Dollman-side path still calls the
+ * helper from sub_140C73F30; the call sits at 0x140C73FB9 (return 0x00C73FBE).
+ * Verified by IDA xrefs to sub_140DACCD0 on the v1.6 image. */
+static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C73E80u;
+static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C73F30u;
 static const uintptr_t k_rva_voice_shared_helper = 0x00DACCD0u;
-static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C73FBEu;
-static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C7443Du;
+static const uintptr_t k_rva_voice_shared_helper_player_return = 0x00C7443Du;
+static const uintptr_t k_rva_voice_shared_helper_dollman_return = 0x00C73FBEu;
 static const uintptr_t k_rva_voice_queue_submit = 0x00DACE30u;
 static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DACDB1u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DAB084u;
 static const uintptr_t k_rva_voice_queue_dispatcher_forward_return = 0x00DAC69Au;
-static const uintptr_t k_rva_voice_queue_periodic_chatter_a_return = 0x00DAFF37u;
-static const uintptr_t k_rva_voice_queue_periodic_chatter_b_return = 0x00DAFFF0u;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780B40u;
 static const uintptr_t k_rva_show_subtitle = 0x00780BF0u;
 static const uintptr_t k_rva_remove_subtitle = 0x00780CF0u;
 static const uintptr_t k_rva_subtitle_render = 0x00780D50u;
 static const uintptr_t k_rva_subtitle_prepare = 0x0025A980u;
 static const uintptr_t k_rva_subtitle_runtime_context = 0x062308B8u;
-static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x0318ADD8u;
+static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x0318AD68u;
 static const uintptr_t k_rva_subtitle_producer = 0x00387300u;
 static const uintptr_t k_rva_start_talk_init = 0x003876B0u;
 static const uintptr_t k_rva_selector_dispatch = 0x00DAFDC0u;
 static const uintptr_t k_rva_talk_dispatcher = 0x00385760u;
 static const uintptr_t k_rva_gameplay_sink = 0u;
-/* Read-only probe at the reaction-event upstream entry. sub_140F03A10 is the
- * C++ implementation of DSElevenMonthBBControllerComponent::Invoke_ElevenMonthBBReaction
- * (registered via thunk sub_140F2C940 + sExportedMethod). It writes:
- *   *(byte*)(component + 0x508) = force_to_override
- *   *(int*) (component + 0x534) = reaction_event_id   (0..0x13)
- *   *(float*)(component + 0x540) = loop_time
- * Verified statically that sub_140F00D10 (controller process) reads this state
- * 109 times and dispatches MsgDSStartTalk via sub_140DB05F0; voice chain does
- * NOT read these fields. Probe is observation-only — never returns early. */
-static const uintptr_t k_rva_invoke_reaction_event = 0x00F03A10u;
 
 /* Current build gameplay Dollman mute: observed (speaker tag, ShowSubtitle
  * caller RVA) pair for the chatter path. v1.6 live sender now lands at
@@ -225,8 +215,6 @@ static const AkUniqueID k_scanner_event_id_2 = 4094913469u;
 static const AkUniqueID k_scanner_event_id_3 = 2611919341u;
 static const AkUniqueID k_event_id_dowser_gameplay_chatter = 2134002697u;
 static const uint64_t k_dowser_ext0_sample = 0x47f324c09ull;
-static const AkUniqueID k_event_id_dollman_gameplay_chatter = 4251155871u;
-static const uint64_t k_dollman_gameplay_chatter_ext0_sample = 0x4fd637d9full;
 static const AkUniqueID k_event_id_dollman_fall_chatter = 448888368u;
 static const uint64_t k_dollman_fall_chatter_ext0_sample = 0x41ac17e30ull;
 
@@ -278,8 +266,6 @@ typedef struct SubtitleStrategyMeta {
 } SubtitleStrategyMeta;
 
 static const uint32_t k_identity_tag_throw_recall = 0x01F4u;
-static const uint32_t k_identity_tag_hold_sadness_summary = 0x357Du;
-static const uint32_t k_identity_tag_random_summary = 0x3745u;
 static const uint32_t k_identity_tag_dialogue_a = 0x222Cu;
 static const uint32_t k_identity_tag_dialogue_b = 0x4377u;
 static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COUNT] = {
@@ -390,15 +376,13 @@ static void note_dowser_gameplay_subtitle(
 static BOOL get_recent_dowser_subtitle_delta_ms(
     ULONGLONG now_ms,
     ULONGLONG *delta_ms_out);
-static void note_dollman_refpack_voice_object(uintptr_t this_obj, const char *phase);
-static BOOL get_recent_dollman_refpack_voice_object_delta_ms(
-    AkUniqueID event_id,
-    AkGameObjectID game_object_id,
-    uint32_t external_source_count,
-    uint64_t ext0,
+static void note_dollman_muted_subtitle(
+    uintptr_t caller_rva,
+    uint32_t speaker_tag,
+    uint32_t line_tag);
+static BOOL get_recent_dollman_muted_subtitle_delta_ms(
     ULONGLONG now_ms,
-    ULONGLONG *delta_ms_out,
-    uint32_t *line_tag_out);
+    ULONGLONG *delta_ms_out);
 static void log_localized_hits_in_block(
     uintptr_t caller_rva,
     const char *label,
@@ -796,9 +780,7 @@ static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva)
 {
     return caller_rva == k_rva_voice_queue_shared_helper_return ||
            caller_rva == k_rva_voice_queue_dispatcher_synth_return ||
-           caller_rva == k_rva_voice_queue_dispatcher_forward_return ||
-           caller_rva == k_rva_voice_queue_periodic_chatter_a_return ||
-           caller_rva == k_rva_voice_queue_periodic_chatter_b_return;
+           caller_rva == k_rva_voice_queue_dispatcher_forward_return;
 }
 
 static const char *voice_queue_probe_caller_name(uintptr_t caller_rva)
@@ -810,10 +792,6 @@ static const char *voice_queue_probe_caller_name(uintptr_t caller_rva)
         return "dispatcher-synth";
     case k_rva_voice_queue_dispatcher_forward_return:
         return "dispatcher-forward";
-    case k_rva_voice_queue_periodic_chatter_a_return:
-        return "periodic-chatter-a";
-    case k_rva_voice_queue_periodic_chatter_b_return:
-        return "periodic-chatter-b";
     default:
         return "other";
     }
@@ -890,9 +868,10 @@ static void reset_log_capture_state(void)
     g_last_dowser_key3 = 0;
     g_last_dowser_p6 = 0;
     g_last_dowser_p7 = 0;
-    InterlockedExchange64(&g_last_dollman_refpack_voice_object, 0);
-    InterlockedExchange64(&g_last_dollman_refpack_ms, 0);
-    InterlockedExchange(&g_last_dollman_refpack_line_tag, 0);
+    InterlockedExchange64(&g_last_dollman_muted_subtitle_ms, 0);
+    g_last_dollman_muted_speaker_tag = 0;
+    g_last_dollman_muted_line_tag = 0;
+    g_last_dollman_muted_caller_rva = 0;
 }
 
 static void seed_hotkey_state_from_config(void)
@@ -983,103 +962,28 @@ static BOOL get_recent_dowser_subtitle_delta_ms(
     return delta_ms <= 500ull;
 }
 
-static BOOL is_dollman_refpack_voice_line(uint32_t line_tag)
+static void note_dollman_muted_subtitle(
+    uintptr_t caller_rva,
+    uint32_t speaker_tag,
+    uint32_t line_tag)
 {
-    return line_tag == k_identity_tag_throw_recall ||
-           line_tag == k_identity_tag_random_summary ||
-           line_tag == k_identity_tag_hold_sadness_summary;
+    g_last_dollman_muted_caller_rva = caller_rva;
+    g_last_dollman_muted_speaker_tag = speaker_tag;
+    g_last_dollman_muted_line_tag = line_tag;
+    InterlockedExchange64(&g_last_dollman_muted_subtitle_ms, (LONG64)GetTickCount64());
 }
 
-static void note_dollman_refpack_voice_object(uintptr_t this_obj, const char *phase)
-{
-    uintptr_t speaker_ref;
-    uintptr_t line_ref;
-    uintptr_t voice_object;
-    uint32_t speaker_tag = 0;
-    uint32_t line_tag = 0;
-    char line_text[96];
-    BOOL speaker_ok;
-    BOOL line_ok;
-    LONG64 previous_object;
-    LONG previous_line_tag;
-
-    if (this_obj == 0) {
-        return;
-    }
-
-    ZeroMemory(line_text, sizeof(line_text));
-    speaker_ref = safe_read_ptr(this_obj + 0xE8);
-    line_ref = safe_read_ptr(this_obj + 0xF8);
-    voice_object = safe_read_ptr(this_obj + 0x100);
-    if (speaker_ref == 0 || line_ref == 0 || voice_object == 0) {
-        return;
-    }
-
-    speaker_ok = read_localized_text_resource(speaker_ref, &speaker_tag, NULL, 0);
-    line_ok = read_localized_text_resource(line_ref, &line_tag, line_text, sizeof(line_text));
-    if (!speaker_ok ||
-        !line_ok ||
-        speaker_tag != k_dollman_gameplay_speaker_tag ||
-        !is_dollman_refpack_voice_line(line_tag)) {
-        return;
-    }
-
-    previous_object = InterlockedCompareExchange64(&g_last_dollman_refpack_voice_object, 0, 0);
-    previous_line_tag = InterlockedCompareExchange(&g_last_dollman_refpack_line_tag, 0, 0);
-
-    InterlockedExchange64(&g_last_dollman_refpack_voice_object, (LONG64)voice_object);
-    InterlockedExchange64(&g_last_dollman_refpack_ms, (LONG64)GetTickCount64());
-    InterlockedExchange(&g_last_dollman_refpack_line_tag, (LONG)line_tag);
-
-    if ((uintptr_t)previous_object != voice_object ||
-        (uint32_t)previous_line_tag != line_tag ||
-        is_stf_probe_window_open()) {
-        log_line(
-            "[refpack-voice-object] phase=%s tid=%lu this=0x%llx speaker_tag=0x%x line_tag=0x%x line_text=\"%s\" gameObject=0x%llx pending_ms=1000",
-            phase != NULL ? phase : "?",
-            (unsigned long)GetCurrentThreadId(),
-            (unsigned long long)this_obj,
-            (unsigned int)speaker_tag,
-            (unsigned int)line_tag,
-            line_text,
-            (unsigned long long)voice_object);
-    }
-}
-
-static BOOL get_recent_dollman_refpack_voice_object_delta_ms(
-    AkUniqueID event_id,
-    AkGameObjectID game_object_id,
-    uint32_t external_source_count,
-    uint64_t ext0,
+static BOOL get_recent_dollman_muted_subtitle_delta_ms(
     ULONGLONG now_ms,
-    ULONGLONG *delta_ms_out,
-    uint32_t *line_tag_out)
+    ULONGLONG *delta_ms_out)
 {
-    LONG64 last_ms;
-    LONG64 last_object;
+    LONG64 last_ms = InterlockedCompareExchange64(&g_last_dollman_muted_subtitle_ms, 0, 0);
     ULONGLONG delta_ms = 0;
-
-    (void)event_id;
 
     if (delta_ms_out != NULL) {
         *delta_ms_out = 0;
     }
-    if (line_tag_out != NULL) {
-        *line_tag_out = 0;
-    }
-    if (!is_sender_only_dollman_radio_mute_enabled() ||
-        external_source_count != 1u ||
-        ext0 == 0 ||
-        game_object_id == 0) {
-        return FALSE;
-    }
-
-    last_ms = InterlockedCompareExchange64(&g_last_dollman_refpack_ms, 0, 0);
-    last_object = InterlockedCompareExchange64(&g_last_dollman_refpack_voice_object, 0, 0);
-    if (last_ms <= 0 ||
-        last_object == 0 ||
-        now_ms < (ULONGLONG)last_ms ||
-        (AkGameObjectID)last_object != game_object_id) {
+    if (last_ms <= 0 || now_ms < (ULONGLONG)last_ms) {
         return FALSE;
     }
 
@@ -1087,11 +991,10 @@ static BOOL get_recent_dollman_refpack_voice_object_delta_ms(
     if (delta_ms_out != NULL) {
         *delta_ms_out = delta_ms;
     }
-    if (line_tag_out != NULL) {
-        *line_tag_out = (uint32_t)InterlockedCompareExchange(&g_last_dollman_refpack_line_tag, 0, 0);
-    }
 
-    return delta_ms <= 1000ull;
+    return delta_ms <= 1500ull &&
+           g_last_dollman_muted_caller_rva == k_dollman_gameplay_caller_rva &&
+           g_last_dollman_muted_speaker_tag == k_dollman_gameplay_speaker_tag;
 }
 
 static BOOL is_selected_subtitle_family(uint32_t family)
@@ -1169,10 +1072,8 @@ static BOOL is_gameplay_dollman_pair(
 
 static BOOL should_mute_gameplay_throw_recall_preamble(const ShowStrategyContext *ctx)
 {
-    return ctx != NULL &&
-           !ctx->speaker_tag_valid &&
-           ctx->caller_rva == k_dollman_gameplay_caller_rva &&
-           ctx->current_family == SUBTITLE_FAMILY_THROW_RECALL;
+    (void)ctx;
+    return FALSE;
 }
 
 static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy)
@@ -1217,9 +1118,6 @@ static BOOL is_sender_only_random_chatter_event(
 
     if (event_id == k_event_id_dollman_fall_chatter) {
         return ext0 == k_dollman_fall_chatter_ext0_sample;
-    }
-    if (event_id == k_event_id_dollman_gameplay_chatter) {
-        return ext0 == k_dollman_gameplay_chatter_ext0_sample;
     }
 
     return FALSE;
@@ -1498,6 +1396,9 @@ static BOOL process_subtitle_payload(
         strategy_results[active_strategy]) {
         actual_mute = TRUE;
         InterlockedIncrement(&g_strategy_stats[active_strategy].actual_mute);
+        if (speaker_tag_valid && line_tag_valid) {
+            note_dollman_muted_subtitle(caller_rva, speaker_tag, line_tag);
+        }
         log_line(
             "Muted subtitle surface=%s strategy=%s caller_rva=0x%llx speaker_ok=%d speaker_tag=0x%x line_ok=%d line_tag=0x%x family=%s builder=%s",
             surface != NULL ? surface : "?",
@@ -1817,8 +1718,7 @@ static AkPlayingID __cdecl hook_post_event_id(
          is_sender_only_dollman_radio_mute_enabled());
     BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
     BOOL blocked_sender_only = FALSE;
-    BOOL blocked_refpack_voice_object = FALSE;
-    BOOL refpack_voice_object_match = FALSE;
+    BOOL blocked_recent_subtitle = FALSE;
     BOOL blocked = FALSE;
     BOOL dowser_event_match = FALSE;
     BOOL dowser_ext_match = FALSE;
@@ -1835,8 +1735,7 @@ static AkPlayingID __cdecl hook_post_event_id(
     uint64_t ext3 = safe_read_u64(ext_ptr + 0x18);
     uint64_t dedupe_key = 0;
     ULONGLONG dowser_delta_ms = 0;
-    ULONGLONG refpack_voice_delta_ms = 0;
-    uint32_t refpack_voice_line_tag = 0;
+    ULONGLONG dollman_delta_ms = 0;
     ULONGLONG now_ms = GetTickCount64();
 
     blocked_sender_only =
@@ -1845,24 +1744,17 @@ static AkPlayingID __cdecl hook_post_event_id(
             event_id,
             external_source_count,
             ext0);
-    refpack_voice_object_match =
-        get_recent_dollman_refpack_voice_object_delta_ms(
-            event_id,
-            game_object_id,
-            external_source_count,
-            ext0,
-            now_ms,
-            &refpack_voice_delta_ms,
-            &refpack_voice_line_tag);
-    blocked_refpack_voice_object =
+    blocked_recent_subtitle =
         g_cfg.enabled &&
+        is_sender_only_dollman_radio_mute_enabled() &&
+        external_source_count == 1u &&
         !blocked_sender_only &&
-        refpack_voice_object_match;
-    blocked = blocked_legacy || blocked_sender_only || blocked_refpack_voice_object;
+        get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
+    blocked = blocked_legacy || blocked_sender_only || blocked_recent_subtitle;
     if (blocked_sender_only) {
         block_mode = "sender-only-narrow";
-    } else if (blocked_refpack_voice_object) {
-        block_mode = "sender-only-refpack-object";
+    } else if (blocked_recent_subtitle) {
+        block_mode = "sender-only-recent-subtitle";
     } else if (blocked_legacy) {
         block_mode = "legacy";
     }
@@ -1915,18 +1807,16 @@ static AkPlayingID __cdecl hook_post_event_id(
                 (unsigned long long)g_last_dowser_p7,
                 blocked ? 1 : 0);
         }
-        if (refpack_voice_object_match) {
+        if (blocked_recent_subtitle) {
             log_line(
-                "RefpackDollmanPostEvent caller_rva=0x%llx eventId=%u gameObject=0x%llx extCount=%u ext0=0x%llx ext1=0x%llx deltaMs=%llu line_tag=0x%x blocked=%d",
+                "RecentDollmanSubtitlePostEvent caller_rva=0x%llx eventId=%u extCount=%u ext0=0x%llx ext1=0x%llx deltaMs=%llu line_tag=0x%x",
                 (unsigned long long)caller_rva,
                 (unsigned int)event_id,
-                (unsigned long long)game_object_id,
                 (unsigned int)external_source_count,
                 (unsigned long long)ext0,
                 (unsigned long long)ext1,
-                (unsigned long long)refpack_voice_delta_ms,
-                (unsigned int)refpack_voice_line_tag,
-                blocked_refpack_voice_object ? 1 : 0);
+                (unsigned long long)dollman_delta_ms,
+                (unsigned int)g_last_dollman_muted_line_tag);
         }
     }
 
@@ -1982,57 +1872,25 @@ static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
 
     if (probe_enabled) {
         log_line(
-            "[voice-delay-schedule] tid=%lu caller_rva=0x%llx instance=%p controller=%d pass_through=1",
+            "[voice-delay-schedule] tid=%lu caller_rva=0x%llx instance=%p controller=%d block=%d",
             (unsigned long)GetCurrentThreadId(),
             (unsigned long long)caller_rva,
             (void *)instance,
-            controller_index);
+            controller_index,
+            (sender_only_block || legacy_block) ? 1 : 0);
     }
 
     if (sender_only_block || legacy_block) {
-        log_verbose(
-            "Dollman voice delay schedule pass-through mode=%s caller_rva=0x%llx instance=%p controller=%d",
+        log_line(
+            "Muted Dollman voice delay schedule mode=%s caller_rva=0x%llx instance=%p controller=%d",
             sender_only_block ? "sender-only" : "legacy",
             (unsigned long long)caller_rva,
             (void *)instance,
             controller_index);
-    }
-
-    if (g_real_dollman_voice_delay_schedule == NULL) {
         return 0;
     }
+
     return g_real_dollman_voice_delay_schedule(instance, controller_index);
-}
-
-/* Read-only upstream probe for DSElevenMonthBBControllerComponent::Invoke_ElevenMonthBBReaction.
- * Logs every reaction event invocation when an F8 probe window is open. Never
- * blocks — pass-through to original. Used to verify whether reaction events
- * correlate 1:1 with Dollman voice delay schedules in the F8 window. */
-static void __fastcall hook_invoke_reaction_event(
-    unsigned char reaction_event_id,
-    unsigned char force_to_override,
-    float loop_time)
-{
-    BOOL probe_enabled = is_stf_probe_window_open();
-    uintptr_t caller_ra = get_return_address_value();
-    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
-        ? (caller_ra - g_image_base)
-        : 0;
-
-    if (probe_enabled && g_real_invoke_reaction_event != NULL) {
-        log_line(
-            "[reaction-event] tid=%lu caller_rva=0x%llx reaction_id=%d force=%d loop_time=%.4f",
-            (unsigned long)GetCurrentThreadId(),
-            (unsigned long long)caller_rva,
-            (int)reaction_event_id,
-            (int)force_to_override,
-            (double)loop_time);
-    }
-
-    if (g_real_invoke_reaction_event == NULL) {
-        return;
-    }
-    g_real_invoke_reaction_event(reaction_event_id, force_to_override, loop_time);
 }
 
 static char __fastcall hook_voice_queue_submit(
@@ -2294,22 +2152,20 @@ static uintptr_t __fastcall hook_voice_shared_helper(
         sentence_key);
 }
 
-static uintptr_t __fastcall hook_dollman_voice_delay_closure(void *closure_state)
+static void __fastcall hook_dollman_voice_delay_closure(void *closure_state)
 {
     log_dollman_voice_closure_probe(
-        "pass",
+        is_sender_only_dollman_radio_mute_enabled() ? "mute" : "pass",
         (uintptr_t)closure_state);
 
     if (is_sender_only_dollman_radio_mute_enabled()) {
-        log_verbose(
-            "Dollman voice closure pass-through state=%p",
+        log_line(
+            "Muted Dollman voice closure state=%p",
             closure_state);
+        return;
     }
 
-    if (g_real_dollman_voice_delay_closure == NULL) {
-        return 0;
-    }
-    return g_real_dollman_voice_delay_closure(closure_state);
+    g_real_dollman_voice_delay_closure(closure_state);
 }
 
 static uintptr_t __fastcall hook_talk_dispatcher(uintptr_t *a1, uintptr_t *i)
@@ -3170,7 +3026,6 @@ static uintptr_t __fastcall hook_start_talk_init(uintptr_t this_obj)
     if (probe_enabled) {
         log_start_talk_function_snapshot("sti-post", this_obj);
     }
-    note_dollman_refpack_voice_object(this_obj, "sti-post");
 
     return result;
 }
@@ -3454,7 +3309,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     BOOL need_voice_delay_schedule_hook = FALSE;
     BOOL need_voice_dispatch_hook = FALSE;
     BOOL need_voice_closure_hook = FALSE;
-    BOOL need_refpack_voice_object_hook = FALSE;
 
     ZeroMemory(&g_proxy_ctx, sizeof(g_proxy_ctx));
     if (ctx != NULL) {
@@ -3509,13 +3363,14 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         !sender_only_runtime_mode &&
         g_cfg.enable_legacy_runtime_wrapper;
     need_deep_probe = g_cfg.enable_deep_probe;
-    need_voice_delay_schedule_hook = need_deep_probe;
-    need_voice_dispatch_hook = need_deep_probe;
-    need_voice_closure_hook = need_deep_probe;
-    need_refpack_voice_object_hook =
+    need_voice_delay_schedule_hook =
+        effective_dollman_radio_mute ||
         sender_only_dollman_voice_mute ||
-        g_cfg.enable_subtitle_producer_probe ||
         need_deep_probe;
+    need_voice_dispatch_hook =
+        sender_only_dollman_voice_mute ||
+        need_deep_probe;
+    need_voice_closure_hook = sender_only_dollman_voice_mute || need_deep_probe;
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
@@ -3562,28 +3417,16 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_dollman_voice_delay_schedule,
                 hook_dollman_voice_delay_schedule,
                 (void **)&g_real_dollman_voice_delay_schedule,
-                "DollmanVoiceDelaySchedule.sub_140C74300")) {
+                "DollmanVoiceDelaySchedule.sub_140C73E80")) {
             ++hook_count;
             if (sender_only_dollman_voice_mute) {
-                log_line("Dollman voice delay schedule probe active via sub_140C74300 (pass-through)");
+                log_line("Sender-only Dollman voice mute active via schedule.sub_140C73E80");
             } else if (effective_dollman_radio_mute) {
-                log_line("Legacy Dollman voice delay schedule probe active via sub_140C74300 (pass-through)");
+                log_line("Legacy Dollman voice mute active via schedule.sub_140C73E80");
             }
         }
     } else {
         log_line("Dollman voice delay schedule hook disabled");
-    }
-
-    /* Always-on read-only probe for the reaction event upstream entry.
-     * Logs only when an F8 probe window is open. Never mutes — observation
-     * surface used to correlate reaction events vs Dollman voice schedules. */
-    if (install_rva_hook(
-            k_rva_invoke_reaction_event,
-            hook_invoke_reaction_event,
-            (void **)&g_real_invoke_reaction_event,
-            "InvokeElevenMonthBBReaction.sub_140F03A10")) {
-        ++hook_count;
-        log_line("Reaction-event upstream probe installed at sub_140F03A10");
     }
 
     if (need_voice_dispatch_hook) {
@@ -3615,10 +3458,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_dollman_voice_delay_closure,
                 hook_dollman_voice_delay_closure,
                 (void **)&g_real_dollman_voice_delay_closure,
-                "DollmanVoiceDelayClosure.sub_140C743B0")) {
+                "DollmanVoiceDelayClosure.sub_140C73F30")) {
             ++hook_count;
             if (sender_only_dollman_voice_mute) {
-                log_line("Dollman voice closure probe active via sub_140C743B0 (pass-through)");
+                log_line("Sender-only Dollman voice mute active via closure.sub_140C73F30");
             }
         }
     } else {
@@ -3691,7 +3534,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("ShowSubtitle payload family classification active: producer-side family tracking not required for active strategy");
     }
 
-    if (need_refpack_voice_object_hook) {
+    if (g_cfg.enable_subtitle_producer_probe || need_deep_probe) {
         if (install_rva_hook(
                 k_rva_start_talk_init,
                 hook_start_talk_init,

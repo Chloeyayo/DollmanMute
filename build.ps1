@@ -63,6 +63,30 @@ function New-ReleasePackage {
     return $packageZip
 }
 
+function Show-HotReloadMessage {
+    param(
+        [string]$Message
+    )
+
+    try {
+        $payload = @"
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.MessageBox]::Show(@'
+$Message
+'@, 'DollmanMute hot reload', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+"@
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($payload))
+        Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile',
+            '-STA',
+            '-EncodedCommand',
+            $encoded
+        ) | Out-Null
+    } catch {
+        Write-Warning "Hot reload MessageBox failed: $($_.Exception.Message)"
+    }
+}
+
 $zigCandidates = @()
 if ($Zig) { $zigCandidates += $Zig }
 if ($env:ZIG_EXE) { $zigCandidates += $env:ZIG_EXE }
@@ -165,6 +189,7 @@ if (-not $copied) {
     }
     Write-Output "Core replaced; triggering proxy load via $loadFlag"
     New-Item -ItemType File -Path $loadFlag -Force | Out-Null
+    Show-HotReloadMessage "DollmanMute Core has been replaced and hot reload was triggered."
 }
 if (-not $CoreOnly) {
     $proxyInstalled = $false

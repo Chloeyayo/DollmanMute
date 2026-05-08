@@ -112,12 +112,12 @@ static GameplaySinkFn g_real_gameplay_sink = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1.1";
+static const char *k_build_tag = "v2.1.17";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
 static uintptr_t g_image_size = 0;
-static const uintptr_t k_rva_localized_text_resource_vtbl = 0x0344ACA0u;
+static const uintptr_t k_rva_localized_text_resource_vtbl = 0x0344AC78u;
 
 static const char *classify_builder_c_msg(
     uintptr_t msg_vtbl_rva,
@@ -195,7 +195,7 @@ static const uintptr_t k_rva_remove_subtitle = 0x00780CF0u;
 static const uintptr_t k_rva_subtitle_render = 0x00780D50u;
 static const uintptr_t k_rva_subtitle_prepare = 0x0025A980u;
 static const uintptr_t k_rva_subtitle_runtime_context = 0x062308B8u;
-static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x0318ADD8u;
+static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x0318AD68u;
 static const uintptr_t k_rva_subtitle_producer = 0x00387300u;
 static const uintptr_t k_rva_start_talk_init = 0x003876B0u;
 static const uintptr_t k_rva_selector_dispatch = 0x00DAFDC0u;
@@ -1072,10 +1072,8 @@ static BOOL is_gameplay_dollman_pair(
 
 static BOOL should_mute_gameplay_throw_recall_preamble(const ShowStrategyContext *ctx)
 {
-    return ctx != NULL &&
-           !ctx->speaker_tag_valid &&
-           ctx->caller_rva == k_dollman_gameplay_caller_rva &&
-           ctx->current_family == SUBTITLE_FAMILY_THROW_RECALL;
+    (void)ctx;
+    return FALSE;
 }
 
 static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy)

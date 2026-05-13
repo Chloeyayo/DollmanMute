@@ -163,10 +163,12 @@ powershell .\tools\voice_identity_probe.ps1 -Status
 powershell .\tools\voice_identity_probe.ps1 -Enable
 powershell .\tools\voice_identity_probe.ps1 -Disable
 python .\tools\voice_identity_report.py --tail 400
+powershell .\tools\watch_voice_identity.ps1 -Tail 800 -EnableProbe -DisableProbeOnExit
 ```
 
 `-Enable` 会同时写 `EnableVoiceQueueIdentityProbe=1` 和 `HookVoiceQueueSubmit=1`；`-Disable` 会恢复两个值为 `0`。
 `voice_identity_report.py` 用来汇总 `[dollman-voice-sentence-group]` / `[voice-queue-identity]`，并提示是否还缺 schedule、sentence group 或 queue identity 样本。
+`watch_voice_identity.ps1` 不弹 MessageBox，只轮询 `DollmanMute.log` 并在日志变化时刷新 report；可选 `-EnableProbe` / `-DisableProbeOnExit` 用于一次 runtime 采样会话。
 
 ### 2.5 当前 runtime probe 方向
 

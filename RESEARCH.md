@@ -194,6 +194,10 @@ python .\tools\voice_identity_report.py --tail 400
   - 用 `controller_index` 只读尝试索引 `source+0x88 -> SentenceGroupResource+0x30`
   - 如果 in-bounds，记录候选 `SentenceResource+0x30/+0x38/+0x40/+0x48/+0x50/+0x58`
   - 这只是验证 controller 是否能作为句子数组下标，不能预设它一定成立
+- `dollman-voice-sentence-scan`
+  - 仅 `EnableVoiceQueueIdentityProbe=1` 时额外记录。
+  - 扫描 `SentenceGroupResource+0x30` 前 16 个 `SentenceResource`，记录每项 `sound/text/voice_fallback/voice`。
+  - 目标是判断 request/controller/catalog key 是否能和句组中的某一条内容身份稳定对齐。
 
 第一条已有 probe 结果:
 
@@ -235,7 +239,16 @@ source resource 字段来自 type descriptor:
 | `source+0x80` | `Ref_GraphProgramResource` |
 | `source+0x88` | `Ref_SentenceGroupResource`，当前最值得和具体句组关联 |
 | `source+0x90/+0x91` | `SentenceGroup` / `DoNotRepeat` bool 类字段 |
-| `source+0xA0` | Dollman resource 自身 bool 字段 |
+| `source+0xA0` | Dollman resource 反射 bool 字段；`0x140C793A0` 默认写 0，字段名仍有解析歧义，不能单独当 Dollman 身份 |
+
+`DSRadioSentenceGroupThroughDollmanResource_Init 0x140C793A0` 静态初始化边界:
+
+- size `0xB0`，vtable 最终写为 `DSRadioSentenceGroupThroughDollmanResource`。
+- `+0x64` 默认写 1。
+- `+0x68/+0x70/+0x78/+0x80/+0x88` 默认写 0。
+- `+0x90` 默认写 0。
+- `+0xA0` 默认写 0。
+- 因此 runtime 里 `source+0x88` 是否非零、`source+0xA0` 是否被 authored loader 改写，都必须靠实际 probe 采样确认。
 
 `SentenceGroupResource` 字段来自 type descriptor:
 
@@ -263,6 +276,11 @@ source resource 字段来自 type descriptor:
 - `owner+0x38+0x2C` 是表容量/掩码来源。
 - 命中后 `owner+0x38+0x38[catalog_index]` 返回 catalog entry。
 - 因此 `request+0x00` 是 voice catalog key 候选，不是已证明的 `SentenceGroupResource` 数组下标。
+- `VoiceQueueSubmit_Candidate` 里的 `r13` 是 `DSSentenceSituationPriorityInfoResource` / voice policy entry 一类的 catalog entry，不是 sentence/resource/event 指针本身。
+- `0x140DAD486` 明确读取 `entry+0x24` 并把它用于队列比较/插入排序；`sub_140DAF580` 也用同一偏移和已有队列 entry 比较。
+- type dump 把同一类型列为 `DSSentenceSituationPriorityInfoResource`，字段名包括 `SituationHash/Priority/Flag/Flag2/IsDialogue/IsNeedContextCheckDialogue/IsReactionVoice`，但当前静态行为和字段名存在 4 字节解释歧义。
+- 因此 probe 采用 offset-first 命名: `u20/u24_sort/u28/u2c/u30/b30/b32/b33/b34`。后续报告可以结合 runtime 值再决定哪些字段是 `SituationHash`、`Priority` 或 flag，不能先把它当内容身份。
+- 当前 probe 也补了 catalog entry `+0x40/+0x48` 以及 `q08/q40/q48` 的 vtable 快照；报告脚本会按 `blocked=` 合并 `[voice-queue-identity]` / `[voice-catalog-entry]`，并把 entry qword 与最近的 `SentenceResource` 候选字段做等值提示。
 
 额外静态证据:
 
@@ -295,7 +313,7 @@ source resource 字段来自 type descriptor:
 
 - 还没拿到 random Dollman 每一句的稳定内容身份。
 - 还没证明 `VoiceSharedHelper` 前的哪个字段能稳定映射到 `SentenceResource`、`DSRadioPlayInfo` 或 sound resource。
-- 还没证明所有未测到的 random 都一定走同一条 `0x140C74300 -> 0x140C743B0` 链，虽然目前这条链的命中证据很强。
+- 还没证明所有未测到的 random 都一定走同一条 `0x140C74300 -> 0x140C743B0` 链，虽然目前这条链是很强的正向 Dollman gameplay radio classifier。
 - 还没证明具体 `VoiceQueueSubmit` request 一定能反推最终 AK event id。
 - 还没证明当前只读 probe 长时间游玩完全无性能副作用。
 
@@ -303,6 +321,7 @@ source resource 字段来自 type descriptor:
 
 - **当前已经证明 random Dollman gameplay voice 有一条更早、更窄的 Dollman-only delay closure 路径。**
 - **当前还缺的是内容身份映射，而不是 mute 主路径本身。**
+- **静态分析不能把这条路径升级成全集边界；EXE 里仍存在 story/private-room/cutscene/talk surface，资产级引用需要 runtime 样本或资源枚举证明。**
 
 ## 4. 下一步打法
 

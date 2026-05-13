@@ -1310,6 +1310,23 @@ static uintptr_t __fastcall hook_dollman_voice_schedule(uintptr_t self, int cont
                 (unsigned long long)indexed_text,
                 (unsigned long long)indexed_voice_fallback,
                 (unsigned long long)indexed_voice);
+            if (g_cfg.enable_voice_queue_identity_probe && sg_items != 0) {
+                uint32_t scan_limit = sg_count < 16u ? sg_count : 16u;
+                for (uint32_t i = 0; i < scan_limit; ++i) {
+                    uintptr_t sentence = safe_read_ptr(sg_items + (uintptr_t)i * 8u);
+                    log_line(
+                        "[dollman-voice-sentence-scan] seen=%ld idx=%u sentence=0x%llx gate=0x%x sound=0x%llx callback=0x%llx text=0x%llx voice_fallback=0x%llx voice=0x%llx",
+                        (long)seen,
+                        (unsigned)i,
+                        (unsigned long long)sentence,
+                        (unsigned)safe_read_u8(sentence + 0x30),
+                        (unsigned long long)safe_read_ptr(sentence + 0x38),
+                        (unsigned long long)safe_read_ptr(sentence + 0x40),
+                        (unsigned long long)safe_read_ptr(sentence + 0x48),
+                        (unsigned long long)safe_read_ptr(sentence + 0x50),
+                        (unsigned long long)safe_read_ptr(sentence + 0x58));
+                }
+            }
         }
     }
     if (g_real_dollman_voice_schedule == NULL) {
@@ -1363,7 +1380,11 @@ static uint8_t __fastcall hook_voice_queue_submit(
         uint32_t req_18 = safe_read_u32(request + 0x18);
         uint32_t req_1c = safe_read_u32(request + 0x1C);
         uint32_t req_flags = safe_read_u32(request + 0x20);
+        uint8_t req_flag20 = safe_read_u8(request + 0x20);
+        uint8_t req_flag21 = safe_read_u8(request + 0x21);
+        uint8_t req_flag22 = safe_read_u8(request + 0x22);
         int32_t req_order = (int32_t)safe_read_u32(request + 0x24);
+        uintptr_t req_ref_vtbl = safe_read_ptr(req_ref);
         uintptr_t owner38 = safe_read_ptr(queue_owner + 0x38);
         uintptr_t catalog_hash = safe_read_ptr(owner38 + 0x20);
         uint32_t catalog_hash_cap = safe_read_u32(owner38 + 0x2C);
@@ -1388,6 +1409,20 @@ static uint8_t __fastcall hook_voice_queue_submit(
         uintptr_t catalog_entry_28 = 0;
         uintptr_t catalog_entry_30 = 0;
         uintptr_t catalog_entry_38 = 0;
+        uintptr_t catalog_entry_40 = 0;
+        uintptr_t catalog_entry_48 = 0;
+        uintptr_t catalog_entry_08_vtbl = 0;
+        uintptr_t catalog_entry_40_vtbl = 0;
+        uintptr_t catalog_entry_48_vtbl = 0;
+        uint32_t catalog_entry_u20 = 0;
+        uint32_t catalog_entry_u24_sort = 0;
+        uint32_t catalog_entry_u28 = 0;
+        uint32_t catalog_entry_u2c = 0;
+        uint32_t catalog_entry_u30 = 0;
+        uint8_t catalog_entry_b30 = 0;
+        uint8_t catalog_entry_b32 = 0;
+        uint8_t catalog_entry_b33 = 0;
+        uint8_t catalog_entry_b34 = 0;
         if (catalog_hash != 0 && catalog_hash_cap != 0) {
             uint32_t mask = catalog_hash_cap - 1u;
             uint32_t hash = _mm_crc32_u32(0, req_id) | 0x80000000u;
@@ -1417,6 +1452,20 @@ static uint8_t __fastcall hook_voice_queue_submit(
                         catalog_entry_28 = safe_read_ptr(catalog_entry + 0x28);
                         catalog_entry_30 = safe_read_ptr(catalog_entry + 0x30);
                         catalog_entry_38 = safe_read_ptr(catalog_entry + 0x38);
+                        catalog_entry_40 = safe_read_ptr(catalog_entry + 0x40);
+                        catalog_entry_48 = safe_read_ptr(catalog_entry + 0x48);
+                        catalog_entry_08_vtbl = safe_read_ptr(catalog_entry_08);
+                        catalog_entry_40_vtbl = safe_read_ptr(catalog_entry_40);
+                        catalog_entry_48_vtbl = safe_read_ptr(catalog_entry_48);
+                        catalog_entry_u20 = safe_read_u32(catalog_entry + 0x20);
+                        catalog_entry_u24_sort = safe_read_u32(catalog_entry + 0x24);
+                        catalog_entry_u28 = safe_read_u32(catalog_entry + 0x28);
+                        catalog_entry_u2c = safe_read_u32(catalog_entry + 0x2C);
+                        catalog_entry_u30 = safe_read_u32(catalog_entry + 0x30);
+                        catalog_entry_b30 = safe_read_u8(catalog_entry + 0x30);
+                        catalog_entry_b32 = safe_read_u8(catalog_entry + 0x32);
+                        catalog_entry_b33 = safe_read_u8(catalog_entry + 0x33);
+                        catalog_entry_b34 = safe_read_u8(catalog_entry + 0x34);
                     }
                     break;
                 }
@@ -1427,17 +1476,21 @@ static uint8_t __fastcall hook_voice_queue_submit(
             *out_status = 0;
         }
         log_line(
-            "[voice-queue-identity] blocked=%ld queue=0x%llx request=0x%llx id=0x%x ref=0x%llx index=%d lane=0x%x raw18=0x%x raw1c=0x%x flags=0x%x order=%d force=%u source=0x%llx refctx=0x%llx out=0x%llx catalog_slot=%u catalog_index=%d catalog_entry=0x%llx catalog_key=0x%x catalog_hash=0x%x",
+            "[voice-queue-identity] blocked=%ld queue=0x%llx request=0x%llx id=0x%x ref=0x%llx ref_vtbl=0x%llx index=%d lane=0x%x raw18=0x%x raw1c=0x%x flags=0x%x flag20=0x%x flag21=0x%x flag22=0x%x order=%d force=%u source=0x%llx refctx=0x%llx out=0x%llx catalog_slot=%u catalog_index=%d catalog_entry=0x%llx catalog_key=0x%x catalog_hash=0x%x",
             (long)seen,
             (unsigned long long)queue_owner,
             (unsigned long long)request,
             (unsigned)req_id,
             (unsigned long long)req_ref,
+            (unsigned long long)req_ref_vtbl,
             (int)req_index,
             (unsigned)req_lane,
             (unsigned)req_18,
             (unsigned)req_1c,
             (unsigned)req_flags,
+            (unsigned)req_flag20,
+            (unsigned)req_flag21,
+            (unsigned)req_flag22,
             (int)req_order,
             (unsigned)force_flag,
             (unsigned long long)source,
@@ -1462,18 +1515,32 @@ static uint8_t __fastcall hook_voice_queue_submit(
             (unsigned)owner64,
             (unsigned)owner1ef);
         log_line(
-            "[voice-catalog-entry] blocked=%ld entry=0x%llx vtbl=0x%llx type=0x%llx q08=0x%llx q10=0x%llx q18=0x%llx q20=0x%llx q28=0x%llx q30=0x%llx q38=0x%llx",
+            "[voice-catalog-entry] blocked=%ld entry=0x%llx vtbl=0x%llx type=0x%llx q08=0x%llx q08_vtbl=0x%llx q10=0x%llx q18=0x%llx q20=0x%llx q28=0x%llx q30=0x%llx q38=0x%llx q40=0x%llx q40_vtbl=0x%llx q48=0x%llx q48_vtbl=0x%llx u20=0x%x u24_sort=0x%x u28=0x%x u2c=0x%x u30=0x%x b30=0x%x b32=0x%x b33=0x%x b34=0x%x",
             (long)seen,
             (unsigned long long)catalog_entry,
             (unsigned long long)catalog_entry_vtbl,
             (unsigned long long)catalog_entry_type,
             (unsigned long long)catalog_entry_08,
+            (unsigned long long)catalog_entry_08_vtbl,
             (unsigned long long)catalog_entry_10,
             (unsigned long long)catalog_entry_18,
             (unsigned long long)catalog_entry_20,
             (unsigned long long)catalog_entry_28,
             (unsigned long long)catalog_entry_30,
-            (unsigned long long)catalog_entry_38);
+            (unsigned long long)catalog_entry_38,
+            (unsigned long long)catalog_entry_40,
+            (unsigned long long)catalog_entry_40_vtbl,
+            (unsigned long long)catalog_entry_48,
+            (unsigned long long)catalog_entry_48_vtbl,
+            (unsigned)catalog_entry_u20,
+            (unsigned)catalog_entry_u24_sort,
+            (unsigned)catalog_entry_u28,
+            (unsigned)catalog_entry_u2c,
+            (unsigned)catalog_entry_u30,
+            (unsigned)catalog_entry_b30,
+            (unsigned)catalog_entry_b32,
+            (unsigned)catalog_entry_b33,
+            (unsigned)catalog_entry_b34);
         return 1;
     }
     if (g_real_voice_queue_submit == NULL) {
@@ -1499,6 +1566,13 @@ static uint8_t __fastcall hook_voice_shared_helper(
         unsigned int id = event_id != NULL ? *event_id : 0;
         LONG consumed = InterlockedIncrement(&g_voice_helper_consumed);
         if (consumed <= 64 || g_cfg.verbose_log) {
+            uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+            uint32_t caller_rva = (g_image_base != 0 && caller >= g_image_base)
+                ? (uint32_t)(caller - g_image_base)
+                : 0;
+            uintptr_t source_vtbl = safe_read_ptr(voice_controller);
+            uintptr_t source_type_getter = safe_read_ptr(source_vtbl);
+            uintptr_t expected_dollman_type = g_image_base + 0x04331370u;
             uintptr_t vc08 = safe_read_ptr(voice_controller + 0x08);
             uintptr_t vc10 = safe_read_ptr(voice_controller + 0x10);
             uintptr_t vc18 = safe_read_ptr(voice_controller + 0x18);
@@ -1521,10 +1595,14 @@ static uint8_t __fastcall hook_voice_shared_helper(
             uint32_t helper60 = safe_read_u32(helper + 0x60);
             uint32_t helper64 = safe_read_u32(helper + 0x64);
             log_line(
-                "[voice-helper] consumed=%ld dollman helper=0x%llx source=0x%llx queue=0x%llx output=%d event=%u",
+                "[voice-helper] consumed=%ld dollman caller_rva=0x%x helper=0x%llx source=0x%llx source_vtbl=0x%llx type_getter=0x%llx expected_type=0x%llx queue=0x%llx output=%d event=%u",
                 (long)consumed,
+                (unsigned)caller_rva,
                 (unsigned long long)helper,
                 (unsigned long long)voice_controller,
+                (unsigned long long)source_vtbl,
+                (unsigned long long)source_type_getter,
+                (unsigned long long)expected_dollman_type,
                 (unsigned long long)notification_queue,
                 output_type,
                 id);

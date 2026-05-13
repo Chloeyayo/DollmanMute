@@ -11,23 +11,19 @@
  * of binding to garbage.
  *
  * Mute architecture:
- *   1. Hook DSRadioSentenceGroupThroughDollmanInstance::vtable[2] (the shared
- *      voice-delay dispatcher). On entry, if the instance vtable matches the
- *      Dollman radio class, mark a TLS flag.
- *   2. Hook DSTalkManagerImpl_QueueStartTalkFunction. On exit, if the TLS flag
- *      from step 1 is set, set bit 1 of the new StartTalkFunction's +0x68 byte
- *      and store the StartTalkFunction pointer in a small set. Engine itself
- *      reads +0x68 bit 1 in StartTalkFunction_UpdateAdvance and skips subtitle
- *      sender context build naturally. No subtitle-side hook required.
- *   3. Hook StartTalkFunction::vtable[15] (UpdateAdvance). On entry, if `this`
- *      is in the set or has +0x68 bit 1 set, mark a per-call TLS flag.
- *   4. Hook TalkSound_CreateSoundInstanceWrapper. On entry, if the per-call
- *      TLS flag is set, write *out=0 and return without invoking the original.
- *      No wrapper means no Wwise sound instance and no PostEvent.
+ *   1. Hook DSRadioSentenceGroupThroughDollmanInstance::vtable[8], the current
+ *      random gameplay voice delay scheduler, for observation.
+ *   2. Hook the v1.7 Dollman voice delay closure. While it invokes the shared
+ *      helper, mark a TLS flag proving this call came from the current Dollman
+ *      random path.
+ *   3. Hook VoiceSharedHelper. If the Dollman closure TLS flag is set, return
+ *      success before the helper builds and submits a voice queue request.
+ *   4. Keep the older StartTalk/TalkSound path as a compatibility probe path,
+ *      but do not treat it as the current random voice proof boundary.
  *
- * Both subtitle suppression (via engine's natural +0x68 gate) and voice
- * suppression (via wrapper substitution) leave the StartTalkFunction's other
- * lifecycle work intact, so private-room/story scene completion remains safe.
+ * The current random voice mute point is intentionally earlier than Wwise
+ * PostEvent, so the hook normally sees event id 0. Content identity has to be
+ * recovered from the group instance/resource/request fields upstream.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -58,6 +54,7 @@ static const uintptr_t k_v17_rva_echoback_enqueue = 0x00389200u;
 static const uintptr_t k_v17_rva_talk_sound_create_wrapper = 0x003899C0u;
 static const uintptr_t k_v17_rva_dollman_voice_closure = 0x00C743B0u;
 static const uintptr_t k_v17_rva_voice_shared_helper = 0x00DACCD0u;
+static const uintptr_t k_v17_rva_voice_queue_submit = 0x00DACE30u;
 static const uint8_t k_v17_queue_start_talk_prefix[] = {
     0x40, 0x53, 0x48, 0x83, 0xec, 0x40, 0x48, 0x89,
     0x6c, 0x24, 0x50, 0x48, 0x8d, 0x59, 0x10, 0x48
@@ -78,6 +75,10 @@ static const uint8_t k_v17_voice_shared_helper_prefix[] = {
     0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74,
     0x24, 0x18, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x55
 };
+static const uint8_t k_v17_voice_queue_submit_prefix[] = {
+    0x4c, 0x89, 0x4c, 0x24, 0x20, 0x44, 0x88, 0x44,
+    0x24, 0x18, 0x55, 0x53, 0x41, 0x55, 0x41, 0x56
+};
 
 /* ------------------------------------------------------------------------- */
 /* Globals                                                                    */
@@ -96,6 +97,8 @@ typedef struct Config {
     BOOL hook_dollman_voice_schedule;
     BOOL hook_dollman_voice_closure;
     BOOL hook_voice_shared_helper;
+    BOOL hook_voice_queue_submit;
+    BOOL enable_voice_queue_identity_probe;
     int toggle_hotkey_vk;
 } Config;
 
@@ -236,6 +239,8 @@ static const char *k_default_ini =
     "HookDollmanVoiceSchedule=1\n"
     "HookDollmanVoiceClosure=1\n"
     "HookVoiceSharedHelper=1\n"
+    "HookVoiceQueueSubmit=0\n"
+    "EnableVoiceQueueIdentityProbe=0\n"
     "ToggleHotkeyVK=119\n";
 
 static void join_path(char *buffer, size_t buffer_size, const char *dir, const char *file_name)
@@ -328,6 +333,8 @@ static void load_config(void)
     g_cfg.hook_dollman_voice_schedule = TRUE;
     g_cfg.hook_dollman_voice_closure = TRUE;
     g_cfg.hook_voice_shared_helper = TRUE;
+    g_cfg.hook_voice_queue_submit = FALSE;
+    g_cfg.enable_voice_queue_identity_probe = FALSE;
     g_cfg.toggle_hotkey_vk = VK_F8;
     ensure_default_ini();
     g_cfg.enabled = read_ini_bool("General", "Enabled", g_cfg.enabled);
@@ -342,6 +349,11 @@ static void load_config(void)
     g_cfg.hook_dollman_voice_schedule = read_ini_bool("General", "HookDollmanVoiceSchedule", g_cfg.hook_dollman_voice_schedule);
     g_cfg.hook_dollman_voice_closure = read_ini_bool("General", "HookDollmanVoiceClosure", g_cfg.hook_dollman_voice_closure);
     g_cfg.hook_voice_shared_helper = read_ini_bool("General", "HookVoiceSharedHelper", g_cfg.hook_voice_shared_helper);
+    g_cfg.hook_voice_queue_submit = read_ini_bool("General", "HookVoiceQueueSubmit", g_cfg.hook_voice_queue_submit);
+    g_cfg.enable_voice_queue_identity_probe = read_ini_bool("General", "EnableVoiceQueueIdentityProbe", g_cfg.enable_voice_queue_identity_probe);
+    if (g_cfg.enable_voice_queue_identity_probe && !g_cfg.hook_voice_queue_submit) {
+        g_cfg.hook_voice_queue_submit = TRUE;
+    }
     g_cfg.toggle_hotkey_vk = read_ini_int("General", "ToggleHotkeyVK", g_cfg.toggle_hotkey_vk);
 }
 
@@ -363,6 +375,14 @@ static uint32_t safe_read_u32(uintptr_t addr)
         return 0;
     }
     return *(uint32_t *)addr;
+}
+
+static uint8_t safe_read_u8(uintptr_t addr)
+{
+    if (addr == 0 || IsBadReadPtr((const void *)addr, sizeof(uint8_t))) {
+        return 0;
+    }
+    return *(uint8_t *)addr;
 }
 
 static BOOL bytes_match(uintptr_t addr, const uint8_t *expected, size_t size)
@@ -595,6 +615,7 @@ typedef struct ResolvedTargets {
     uintptr_t fn_talksound_create_wrapper; /* hardcoded v1.7, pending dynamic resolver */
     uintptr_t fn_dollman_voice_closure; /* hardcoded v1.7 Dollman delay closure body */
     uintptr_t fn_voice_shared_helper; /* hardcoded v1.7 shared voice queue helper */
+    uintptr_t fn_voice_queue_submit; /* hardcoded v1.7 voice queue submit, diagnostic only */
     uintptr_t ptr_dstalk_manager_global; /* RIP-relative global used by echoback enqueue */
 } ResolvedTargets;
 
@@ -627,13 +648,17 @@ static BOOL fixed_fallback_bytes_match(
     uintptr_t echoback_enqueue,
     uintptr_t wrapper,
     uintptr_t dollman_voice_closure,
-    uintptr_t voice_shared_helper)
+    uintptr_t voice_shared_helper,
+    uintptr_t voice_queue_submit,
+    BOOL check_voice_queue_submit)
 {
     if (!is_text_range(queue, sizeof(k_v17_queue_start_talk_prefix)) ||
         !is_text_range(echoback_enqueue, sizeof(k_v17_echoback_enqueue_prefix)) ||
         !is_text_range(wrapper, sizeof(k_v17_talk_sound_wrapper_prefix)) ||
         !is_text_range(dollman_voice_closure, sizeof(k_v17_dollman_voice_closure_prefix)) ||
-        !is_text_range(voice_shared_helper, sizeof(k_v17_voice_shared_helper_prefix))) {
+        !is_text_range(voice_shared_helper, sizeof(k_v17_voice_shared_helper_prefix)) ||
+        (check_voice_queue_submit &&
+         !is_text_range(voice_queue_submit, sizeof(k_v17_voice_queue_submit_prefix)))) {
         log_line("v1.7 fallback byte check failed: target outside .text");
         return FALSE;
     }
@@ -655,6 +680,11 @@ static BOOL fixed_fallback_bytes_match(
     }
     if (!bytes_match(voice_shared_helper, k_v17_voice_shared_helper_prefix, sizeof(k_v17_voice_shared_helper_prefix))) {
         log_line("v1.7 fallback byte check failed: VoiceSharedHelper prefix mismatch");
+        return FALSE;
+    }
+    if (check_voice_queue_submit &&
+        !bytes_match(voice_queue_submit, k_v17_voice_queue_submit_prefix, sizeof(k_v17_voice_queue_submit_prefix))) {
+        log_line("v1.7 fallback byte check failed: VoiceQueueSubmit prefix mismatch");
         return FALSE;
     }
     log_line("v1.7 fallback byte check passed for TimeDateStamp 0x%08x", (unsigned)g_ds2_timedatestamp);
@@ -709,13 +739,15 @@ static BOOL resolve_all(void)
             g_image_base + k_v17_rva_dollman_voice_closure;
         g_targets.fn_voice_shared_helper =
             g_image_base + k_v17_rva_voice_shared_helper;
+        g_targets.fn_voice_queue_submit =
+            g_image_base + k_v17_rva_voice_queue_submit;
         manager_disp = *(int32_t *)(g_targets.fn_echoback_enqueue + 14);
         g_targets.ptr_dstalk_manager_global =
             g_targets.fn_echoback_enqueue + 18 + (intptr_t)manager_disp;
     }
 
     log_line(
-        "Resolved fns: radio_disp=0x%llx schedule=0x%llx echoback_enq=0x%llx echoback_exec=0x%llx update_adv=0x%llx queue=0x%llx wrap=0x%llx dollman_closure=0x%llx voice_helper=0x%llx manager_ptr=0x%llx",
+        "Resolved fns: radio_disp=0x%llx schedule=0x%llx echoback_enq=0x%llx echoback_exec=0x%llx update_adv=0x%llx queue=0x%llx wrap=0x%llx dollman_closure=0x%llx voice_helper=0x%llx voice_queue=0x%llx manager_ptr=0x%llx",
         (unsigned long long)g_targets.fn_radio_voice_dispatcher,
         (unsigned long long)g_targets.fn_dollman_voice_schedule,
         (unsigned long long)g_targets.fn_echoback_enqueue,
@@ -725,6 +757,7 @@ static BOOL resolve_all(void)
         (unsigned long long)g_targets.fn_talksound_create_wrapper,
         (unsigned long long)g_targets.fn_dollman_voice_closure,
         (unsigned long long)g_targets.fn_voice_shared_helper,
+        (unsigned long long)g_targets.fn_voice_queue_submit,
         (unsigned long long)g_targets.ptr_dstalk_manager_global);
 
     if (g_targets.vtbl_dollman_instance == 0 ||
@@ -741,10 +774,12 @@ static BOOL resolve_all(void)
         !is_in_text_range(g_targets.fn_queue_starttalk_function) ||
         !is_in_text_range(g_targets.fn_talksound_create_wrapper) ||
         !is_in_text_range(g_targets.fn_dollman_voice_closure) ||
-        !is_in_text_range(g_targets.fn_voice_shared_helper)) {
+        !is_in_text_range(g_targets.fn_voice_shared_helper) ||
+        (g_cfg.hook_voice_queue_submit &&
+         !is_in_text_range(g_targets.fn_voice_queue_submit))) {
         log_line(
             "Resolver failed: function target outside .text range "
-            "(radio_disp=0x%llx echoback_enq=0x%llx echoback_exec=0x%llx update_adv=0x%llx queue=0x%llx wrap=0x%llx dollman_closure=0x%llx voice_helper=0x%llx text=[0x%llx,0x%llx))",
+            "(radio_disp=0x%llx echoback_enq=0x%llx echoback_exec=0x%llx update_adv=0x%llx queue=0x%llx wrap=0x%llx dollman_closure=0x%llx voice_helper=0x%llx voice_queue=0x%llx text=[0x%llx,0x%llx))",
             (unsigned long long)g_targets.fn_radio_voice_dispatcher,
             (unsigned long long)g_targets.fn_echoback_enqueue,
             (unsigned long long)g_targets.fn_echoback_execute,
@@ -753,6 +788,7 @@ static BOOL resolve_all(void)
             (unsigned long long)g_targets.fn_talksound_create_wrapper,
             (unsigned long long)g_targets.fn_dollman_voice_closure,
             (unsigned long long)g_targets.fn_voice_shared_helper,
+            (unsigned long long)g_targets.fn_voice_queue_submit,
             (unsigned long long)g_text_start,
             (unsigned long long)g_text_end);
         return FALSE;
@@ -762,7 +798,9 @@ static BOOL resolve_all(void)
             g_targets.fn_echoback_enqueue,
             g_targets.fn_talksound_create_wrapper,
             g_targets.fn_dollman_voice_closure,
-            g_targets.fn_voice_shared_helper)) {
+            g_targets.fn_voice_shared_helper,
+            g_targets.fn_voice_queue_submit,
+            g_cfg.hook_voice_queue_submit)) {
         return FALSE;
     }
     return TRUE;
@@ -912,6 +950,7 @@ static volatile LONG g_voice_wrapper_substituted = 0;
 static volatile LONG g_dollman_voice_schedule_seen = 0;
 static volatile LONG g_dollman_voice_closure_seen = 0;
 static volatile LONG g_voice_helper_consumed = 0;
+static volatile LONG g_voice_queue_identity_blocked = 0;
 static volatile LONG g_subtitle_engine_skipped = 0;
 
 /* ------------------------------------------------------------------------- */
@@ -932,6 +971,13 @@ typedef uint8_t (__fastcall *VoiceSharedHelperFn)(
     uintptr_t notification_queue,
     int output_type,
     unsigned int *event_id);
+typedef uint8_t (__fastcall *VoiceQueueSubmitFn)(
+    uintptr_t queue_owner,
+    uintptr_t request,
+    uint8_t force_flag,
+    uintptr_t source,
+    uintptr_t ref_context,
+    uint8_t *out_status);
 
 static RadioVoiceDispatcherFn   g_real_radio_voice_dispatcher = NULL;
 static EchobackEnqueueFn        g_real_echoback_enqueue = NULL;
@@ -942,6 +988,7 @@ static TalkSoundCreateWrapperFn g_real_talksound_create_wrapper = NULL;
 static DollmanVoiceScheduleFn   g_real_dollman_voice_schedule = NULL;
 static DollmanVoiceClosureFn    g_real_dollman_voice_closure = NULL;
 static VoiceSharedHelperFn      g_real_voice_shared_helper = NULL;
+static VoiceQueueSubmitFn       g_real_voice_queue_submit = NULL;
 
 /* ------------------------------------------------------------------------- */
 /* Hook implementations                                                       */
@@ -1157,45 +1204,112 @@ static uintptr_t __fastcall hook_dollman_voice_schedule(uintptr_t self, int cont
         seen = InterlockedIncrement(&g_dollman_voice_schedule_seen);
         if (seen <= 64 || g_cfg.verbose_log) {
             uintptr_t self_vtbl = safe_read_ptr(self);
-            uintptr_t voice_controller = safe_read_ptr(self + 0x10);
+            uintptr_t source_resource = safe_read_ptr(self + 0x10);
             uintptr_t playback_object = safe_read_ptr(self + 0x18);
             uintptr_t notification_queue = safe_read_ptr(self + 0x20);
-            uintptr_t voice_vtbl = safe_read_ptr(voice_controller);
+            uintptr_t source_vtbl = safe_read_ptr(source_resource);
             uintptr_t playback_vtbl = safe_read_ptr(playback_object);
             uintptr_t queue_vtbl = safe_read_ptr(notification_queue);
-            uintptr_t voice_list = safe_read_ptr(voice_controller + 0x70);
-            uintptr_t voice_list0 = safe_read_ptr(voice_list);
-            uintptr_t voice_list1 = safe_read_ptr(voice_list + 8);
-            uintptr_t voice_list2 = safe_read_ptr(voice_list + 16);
-            uint32_t voice_count = safe_read_u32(voice_controller + 0x60);
-            uint32_t voice_flags = safe_read_u32(voice_controller + 0x64);
-            uint32_t voice_list_count = safe_read_u32(voice_controller + 0x68);
+            uint32_t resource60 = safe_read_u32(source_resource + 0x60);
+            uint8_t resource64 = safe_read_u8(source_resource + 0x64);
+            uintptr_t resource68 = safe_read_ptr(source_resource + 0x68);
+            uintptr_t resource70 = safe_read_ptr(source_resource + 0x70);
+            uintptr_t resource78 = safe_read_ptr(source_resource + 0x78);
+            uintptr_t resource80 = safe_read_ptr(source_resource + 0x80);
+            uintptr_t resource88 = safe_read_ptr(source_resource + 0x88);
+            uintptr_t resource78_vtbl = safe_read_ptr(resource78);
+            uintptr_t resource80_vtbl = safe_read_ptr(resource80);
+            uintptr_t resource88_vtbl = safe_read_ptr(resource88);
+            uint8_t resource90 = safe_read_u8(source_resource + 0x90);
+            uint8_t resource91 = safe_read_u8(source_resource + 0x91);
+            uint8_t resource_a0 = safe_read_u8(source_resource + 0xA0);
+            uint32_t sg_type = safe_read_u32(resource88 + 0x20);
+            uint32_t sg_count = safe_read_u32(resource88 + 0x28);
+            uintptr_t sg_items = safe_read_ptr(resource88 + 0x30);
+            uintptr_t sg38 = safe_read_ptr(resource88 + 0x38);
+            uintptr_t sg40 = safe_read_ptr(resource88 + 0x40);
+            uintptr_t sg_first0 = safe_read_ptr(sg_items);
+            uintptr_t sg_first1 = safe_read_ptr(sg_items + 8);
+            uintptr_t sg_first2 = safe_read_ptr(sg_items + 16);
+            uintptr_t sentence0_sound = safe_read_ptr(sg_first0 + 0x38);
+            uintptr_t sentence0_text = safe_read_ptr(sg_first0 + 0x48);
+            uintptr_t sentence0_voice_fallback = safe_read_ptr(sg_first0 + 0x50);
+            uintptr_t sentence0_voice = safe_read_ptr(sg_first0 + 0x58);
+            BOOL controller_in_bounds =
+                controller_index >= 0 &&
+                (uint32_t)controller_index < sg_count &&
+                sg_items != 0;
+            uintptr_t indexed_sentence = controller_in_bounds
+                ? safe_read_ptr(sg_items + (uintptr_t)(uint32_t)controller_index * 8u)
+                : 0;
+            uint8_t indexed_subtitle_gate = safe_read_u8(indexed_sentence + 0x30);
+            uintptr_t indexed_sound = safe_read_ptr(indexed_sentence + 0x38);
+            uintptr_t indexed_callback = safe_read_ptr(indexed_sentence + 0x40);
+            uintptr_t indexed_text = safe_read_ptr(indexed_sentence + 0x48);
+            uintptr_t indexed_voice_fallback = safe_read_ptr(indexed_sentence + 0x50);
+            uintptr_t indexed_voice = safe_read_ptr(indexed_sentence + 0x58);
             uint32_t group_count = safe_read_u32(self + 0x40);
             uint32_t group_flags = safe_read_u32(self + 0x44);
             log_line(
-                "[dollman-voice-schedule] seen=%ld self=0x%llx vtbl=0x%llx controller=%d voice=0x%llx playback=0x%llx queue=0x%llx group_count=%u group_flags=0x%x",
+                "[dollman-voice-schedule] seen=%ld self=0x%llx vtbl=0x%llx controller=%d source=0x%llx playback=0x%llx queue=0x%llx group_count=%u group_flags=0x%x",
                 (long)seen,
                 (unsigned long long)self,
                 (unsigned long long)self_vtbl,
                 controller_index,
-                (unsigned long long)voice_controller,
+                (unsigned long long)source_resource,
                 (unsigned long long)playback_object,
                 (unsigned long long)notification_queue,
                 (unsigned)group_count,
                 (unsigned)group_flags);
             log_line(
-                "[dollman-voice-probe] seen=%ld voice_vtbl=0x%llx playback_vtbl=0x%llx queue_vtbl=0x%llx voice_count=%u voice_flags=0x%x voice_list_count=%u voice_list=0x%llx list0=0x%llx list1=0x%llx list2=0x%llx",
+                "[dollman-voice-resource] seen=%ld source_vtbl=0x%llx playback_vtbl=0x%llx queue_vtbl=0x%llx r60=0x%x r64=0x%x r68=0x%llx r70=0x%llx r78=0x%llx r78_vtbl=0x%llx r80=0x%llx r80_vtbl=0x%llx r88=0x%llx r88_vtbl=0x%llx r90=0x%x r91=0x%x rA0=0x%x",
                 (long)seen,
-                (unsigned long long)voice_vtbl,
+                (unsigned long long)source_vtbl,
                 (unsigned long long)playback_vtbl,
                 (unsigned long long)queue_vtbl,
-                (unsigned)voice_count,
-                (unsigned)voice_flags,
-                (unsigned)voice_list_count,
-                (unsigned long long)voice_list,
-                (unsigned long long)voice_list0,
-                (unsigned long long)voice_list1,
-                (unsigned long long)voice_list2);
+                (unsigned)resource60,
+                (unsigned)resource64,
+                (unsigned long long)resource68,
+                (unsigned long long)resource70,
+                (unsigned long long)resource78,
+                (unsigned long long)resource78_vtbl,
+                (unsigned long long)resource80,
+                (unsigned long long)resource80_vtbl,
+                (unsigned long long)resource88,
+                (unsigned long long)resource88_vtbl,
+                (unsigned)resource90,
+                (unsigned)resource91,
+                (unsigned)resource_a0);
+            log_line(
+                "[dollman-voice-sentence-group] seen=%ld sg=0x%llx sg_vtbl=0x%llx sg_type=0x%x sg_count=%u sg_items=0x%llx sg38=0x%llx sg40=0x%llx first=[0x%llx,0x%llx,0x%llx] s0_sound=0x%llx s0_text=0x%llx s0_voice_fallback=0x%llx s0_voice=0x%llx",
+                (long)seen,
+                (unsigned long long)resource88,
+                (unsigned long long)resource88_vtbl,
+                (unsigned)sg_type,
+                (unsigned)sg_count,
+                (unsigned long long)sg_items,
+                (unsigned long long)sg38,
+                (unsigned long long)sg40,
+                (unsigned long long)sg_first0,
+                (unsigned long long)sg_first1,
+                (unsigned long long)sg_first2,
+                (unsigned long long)sentence0_sound,
+                (unsigned long long)sentence0_text,
+                (unsigned long long)sentence0_voice_fallback,
+                (unsigned long long)sentence0_voice);
+            log_line(
+                "[dollman-voice-sentence-index] seen=%ld controller=%d in_bounds=%d sg_count=%u sentence=0x%llx gate=0x%x sound=0x%llx callback=0x%llx text=0x%llx voice_fallback=0x%llx voice=0x%llx",
+                (long)seen,
+                controller_index,
+                controller_in_bounds ? 1 : 0,
+                (unsigned)sg_count,
+                (unsigned long long)indexed_sentence,
+                (unsigned)indexed_subtitle_gate,
+                (unsigned long long)indexed_sound,
+                (unsigned long long)indexed_callback,
+                (unsigned long long)indexed_text,
+                (unsigned long long)indexed_voice_fallback,
+                (unsigned long long)indexed_voice);
         }
     }
     if (g_real_dollman_voice_schedule == NULL) {
@@ -1227,6 +1341,149 @@ static void __fastcall hook_dollman_voice_closure(uintptr_t closure_payload)
     if (active) {
         tls_set_bool(g_tls_radio_is_dollman, FALSE);
     }
+}
+
+static uint8_t __fastcall hook_voice_queue_submit(
+    uintptr_t queue_owner,
+    uintptr_t request,
+    uint8_t force_flag,
+    uintptr_t source,
+    uintptr_t ref_context,
+    uint8_t *out_status)
+{
+    if (runtime_enabled() &&
+        g_cfg.enable_voice_mute &&
+        g_cfg.enable_voice_queue_identity_probe &&
+        tls_get_bool(g_tls_radio_is_dollman)) {
+        LONG seen = InterlockedIncrement(&g_voice_queue_identity_blocked);
+        uint32_t req_id = safe_read_u32(request + 0x00);
+        uintptr_t req_ref = safe_read_ptr(request + 0x08);
+        int32_t req_index = (int32_t)safe_read_u32(request + 0x10);
+        uint32_t req_lane = safe_read_u32(request + 0x14);
+        uint32_t req_18 = safe_read_u32(request + 0x18);
+        uint32_t req_1c = safe_read_u32(request + 0x1C);
+        uint32_t req_flags = safe_read_u32(request + 0x20);
+        int32_t req_order = (int32_t)safe_read_u32(request + 0x24);
+        uintptr_t owner38 = safe_read_ptr(queue_owner + 0x38);
+        uintptr_t catalog_hash = safe_read_ptr(owner38 + 0x20);
+        uint32_t catalog_hash_cap = safe_read_u32(owner38 + 0x2C);
+        uintptr_t catalog_items = safe_read_ptr(owner38 + 0x38);
+        uint32_t owner40 = safe_read_u32(queue_owner + 0x40);
+        uint32_t owner44 = safe_read_u32(queue_owner + 0x44);
+        uintptr_t owner48 = safe_read_ptr(queue_owner + 0x48);
+        uint32_t owner60 = safe_read_u32(queue_owner + 0x60);
+        uint32_t owner64 = safe_read_u32(queue_owner + 0x64);
+        uint8_t owner1ef = safe_read_u8(queue_owner + 0x1EF);
+        uint32_t catalog_slot = 0xFFFFFFFFu;
+        int32_t catalog_index = -1;
+        uintptr_t catalog_entry = 0;
+        uint32_t catalog_entry_key = 0;
+        uint32_t catalog_entry_hash = 0;
+        uintptr_t catalog_entry_vtbl = 0;
+        uintptr_t catalog_entry_type = 0;
+        uintptr_t catalog_entry_08 = 0;
+        uintptr_t catalog_entry_10 = 0;
+        uintptr_t catalog_entry_18 = 0;
+        uintptr_t catalog_entry_20 = 0;
+        uintptr_t catalog_entry_28 = 0;
+        uintptr_t catalog_entry_30 = 0;
+        uintptr_t catalog_entry_38 = 0;
+        if (catalog_hash != 0 && catalog_hash_cap != 0) {
+            uint32_t mask = catalog_hash_cap - 1u;
+            uint32_t hash = _mm_crc32_u32(0, req_id) | 0x80000000u;
+            uint32_t start = hash & mask;
+            uint32_t slot = start;
+            do {
+                uintptr_t bucket = catalog_hash + (uintptr_t)slot * 12u;
+                uint32_t bucket_key = safe_read_u32(bucket);
+                uint32_t bucket_index = safe_read_u32(bucket + 4);
+                uint32_t bucket_hash = safe_read_u32(bucket + 8);
+                if (bucket_hash == 0) {
+                    break;
+                }
+                if (bucket_hash == hash && bucket_key == req_id) {
+                    catalog_slot = slot;
+                    catalog_index = (int32_t)bucket_index;
+                    catalog_entry_key = bucket_key;
+                    catalog_entry_hash = bucket_hash;
+                    if (catalog_items != 0) {
+                        catalog_entry = safe_read_ptr(catalog_items + (uintptr_t)bucket_index * 8u);
+                        catalog_entry_vtbl = safe_read_ptr(catalog_entry);
+                        catalog_entry_type = safe_read_ptr(catalog_entry_vtbl);
+                        catalog_entry_08 = safe_read_ptr(catalog_entry + 0x08);
+                        catalog_entry_10 = safe_read_ptr(catalog_entry + 0x10);
+                        catalog_entry_18 = safe_read_ptr(catalog_entry + 0x18);
+                        catalog_entry_20 = safe_read_ptr(catalog_entry + 0x20);
+                        catalog_entry_28 = safe_read_ptr(catalog_entry + 0x28);
+                        catalog_entry_30 = safe_read_ptr(catalog_entry + 0x30);
+                        catalog_entry_38 = safe_read_ptr(catalog_entry + 0x38);
+                    }
+                    break;
+                }
+                slot = (slot + 1u) & mask;
+            } while (slot != start);
+        }
+        if (out_status != NULL) {
+            *out_status = 0;
+        }
+        log_line(
+            "[voice-queue-identity] blocked=%ld queue=0x%llx request=0x%llx id=0x%x ref=0x%llx index=%d lane=0x%x raw18=0x%x raw1c=0x%x flags=0x%x order=%d force=%u source=0x%llx refctx=0x%llx out=0x%llx catalog_slot=%u catalog_index=%d catalog_entry=0x%llx catalog_key=0x%x catalog_hash=0x%x",
+            (long)seen,
+            (unsigned long long)queue_owner,
+            (unsigned long long)request,
+            (unsigned)req_id,
+            (unsigned long long)req_ref,
+            (int)req_index,
+            (unsigned)req_lane,
+            (unsigned)req_18,
+            (unsigned)req_1c,
+            (unsigned)req_flags,
+            (int)req_order,
+            (unsigned)force_flag,
+            (unsigned long long)source,
+            (unsigned long long)ref_context,
+            (unsigned long long)(uintptr_t)out_status,
+            (unsigned)catalog_slot,
+            (int)catalog_index,
+            (unsigned long long)catalog_entry,
+            (unsigned)catalog_entry_key,
+            (unsigned)catalog_entry_hash);
+        log_line(
+            "[voice-queue-owner] blocked=%ld owner38=0x%llx catalog_hash=0x%llx catalog_cap=%u catalog_items=0x%llx owner40=%u owner44=%u owner48=0x%llx owner60=%u owner64=%u owner1ef=0x%x",
+            (long)seen,
+            (unsigned long long)owner38,
+            (unsigned long long)catalog_hash,
+            (unsigned)catalog_hash_cap,
+            (unsigned long long)catalog_items,
+            (unsigned)owner40,
+            (unsigned)owner44,
+            (unsigned long long)owner48,
+            (unsigned)owner60,
+            (unsigned)owner64,
+            (unsigned)owner1ef);
+        log_line(
+            "[voice-catalog-entry] blocked=%ld entry=0x%llx vtbl=0x%llx type=0x%llx q08=0x%llx q10=0x%llx q18=0x%llx q20=0x%llx q28=0x%llx q30=0x%llx q38=0x%llx",
+            (long)seen,
+            (unsigned long long)catalog_entry,
+            (unsigned long long)catalog_entry_vtbl,
+            (unsigned long long)catalog_entry_type,
+            (unsigned long long)catalog_entry_08,
+            (unsigned long long)catalog_entry_10,
+            (unsigned long long)catalog_entry_18,
+            (unsigned long long)catalog_entry_20,
+            (unsigned long long)catalog_entry_28,
+            (unsigned long long)catalog_entry_30,
+            (unsigned long long)catalog_entry_38);
+        return 1;
+    }
+    if (g_real_voice_queue_submit == NULL) {
+        if (out_status != NULL) {
+            *out_status = 0;
+        }
+        return 1;
+    }
+    return g_real_voice_queue_submit(
+        queue_owner, request, force_flag, source, ref_context, out_status);
 }
 
 static uint8_t __fastcall hook_voice_shared_helper(
@@ -1264,7 +1521,7 @@ static uint8_t __fastcall hook_voice_shared_helper(
             uint32_t helper60 = safe_read_u32(helper + 0x60);
             uint32_t helper64 = safe_read_u32(helper + 0x64);
             log_line(
-                "[voice-helper] consumed=%ld dollman helper=0x%llx controller=0x%llx queue=0x%llx output=%d event=%u",
+                "[voice-helper] consumed=%ld dollman helper=0x%llx source=0x%llx queue=0x%llx output=%d event=%u",
                 (long)consumed,
                 (unsigned long long)helper,
                 (unsigned long long)voice_controller,
@@ -1272,7 +1529,7 @@ static uint8_t __fastcall hook_voice_shared_helper(
                 output_type,
                 id);
             log_line(
-                "[voice-helper-probe] consumed=%ld vc08=0x%llx vc10=0x%llx vc18=0x%llx vc20=0x%llx vc28=0x%llx vc30=0x%llx vc38=0x%llx vc40=0x%llx vc48=0x%llx vc50=0x%llx vc58=0x%llx",
+                "[voice-helper-probe] consumed=%ld src08=0x%llx src10=0x%llx src18=0x%llx src20=0x%llx src28=0x%llx src30=0x%llx src38=0x%llx src40=0x%llx src48=0x%llx src50=0x%llx src58=0x%llx",
                 (long)consumed,
                 (unsigned long long)vc08,
                 (unsigned long long)vc10,
@@ -1286,7 +1543,7 @@ static uint8_t __fastcall hook_voice_shared_helper(
                 (unsigned long long)vc50,
                 (unsigned long long)vc58);
             log_line(
-                "[voice-helper-state] consumed=%ld vc80=0x%llx vc88=0x%llx vc90=0x%x vc94=0x%x vc98=0x%x helper38=0x%llx helper40=%u helper48=0x%llx helper60=%u helper64=%u",
+                "[voice-helper-state] consumed=%ld src80=0x%llx src88=0x%llx src90=0x%x src94=0x%x src98=0x%x helper38=0x%llx helper40=%u helper48=0x%llx helper60=%u helper64=%u",
                 (long)consumed,
                 (unsigned long long)vc80,
                 (unsigned long long)vc88,
@@ -1299,7 +1556,9 @@ static uint8_t __fastcall hook_voice_shared_helper(
                 (unsigned)helper60,
                 (unsigned)helper64);
         }
-        return 1;
+        if (!g_cfg.enable_voice_queue_identity_probe) {
+            return 1;
+        }
     }
     if (g_real_voice_shared_helper == NULL) {
         return 0;
@@ -1378,6 +1637,12 @@ static int install_hooks(void)
           (void **)&g_real_voice_shared_helper,
           FALSE,
           g_cfg.hook_voice_shared_helper },
+        { "VoiceQueueSubmit (v1.7 RVA fallback)",
+          g_targets.fn_voice_queue_submit,
+          (void *)hook_voice_queue_submit,
+          (void **)&g_real_voice_queue_submit,
+          FALSE,
+          g_cfg.hook_voice_queue_submit },
     };
     int installed = 0;
     size_t i;
@@ -1485,7 +1750,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line(
-        "Config: enabled=%d verbose=%d voice=%d subtitle=%d toggle_vk=0x%x hooks={radio=%d echoback=%d queue=%d update=%d wrap=%d schedule=%d closure=%d helper=%d}",
+        "Config: enabled=%d verbose=%d voice=%d subtitle=%d toggle_vk=0x%x hooks={radio=%d echoback=%d queue=%d update=%d wrap=%d schedule=%d closure=%d helper=%d voice_queue=%d} identity_probe=%d",
         g_cfg.enabled ? 1 : 0,
         g_cfg.verbose_log ? 1 : 0,
         g_cfg.enable_voice_mute ? 1 : 0,
@@ -1498,7 +1763,9 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         g_cfg.hook_talksound_wrapper ? 1 : 0,
         g_cfg.hook_dollman_voice_schedule ? 1 : 0,
         g_cfg.hook_dollman_voice_closure ? 1 : 0,
-        g_cfg.hook_voice_shared_helper ? 1 : 0);
+        g_cfg.hook_voice_shared_helper ? 1 : 0,
+        g_cfg.hook_voice_queue_submit ? 1 : 0,
+        g_cfg.enable_voice_queue_identity_probe ? 1 : 0);
 
     if (!g_cfg.enabled) {
         log_line("Disabled via config; skipping hook install");
@@ -1547,7 +1814,7 @@ __declspec(dllexport) void core_shutdown(void)
     }
     InterlockedExchange(&g_hooks_runtime_enabled, 0);
     log_line(
-        "Counters: radio_dollman=%ld echoback_marked=%ld echoback_exec=%ld queue_seen=%ld queue_tls=%ld starttalk_marked=%ld voice_substituted=%ld schedule_seen=%ld closure_seen=%ld helper_consumed=%ld subtitle_skipped=%ld",
+        "Counters: radio_dollman=%ld echoback_marked=%ld echoback_exec=%ld queue_seen=%ld queue_tls=%ld starttalk_marked=%ld voice_substituted=%ld schedule_seen=%ld closure_seen=%ld helper_consumed=%ld queue_identity_blocked=%ld subtitle_skipped=%ld",
         (long)g_radio_dispatcher_dollman_hits,
         (long)g_echoback_marked_dollman,
         (long)g_echoback_executed_dollman,
@@ -1558,6 +1825,7 @@ __declspec(dllexport) void core_shutdown(void)
         (long)g_dollman_voice_schedule_seen,
         (long)g_dollman_voice_closure_seen,
         (long)g_voice_helper_consumed,
+        (long)g_voice_queue_identity_blocked,
         (long)g_subtitle_engine_skipped);
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();

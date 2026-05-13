@@ -40,6 +40,8 @@ HookTalkSoundWrapper=1
 HookDollmanVoiceSchedule=1
 HookDollmanVoiceClosure=1
 HookVoiceSharedHelper=1
+HookVoiceQueueSubmit=0
+EnableVoiceQueueIdentityProbe=0
 ToggleHotkeyVK=119
 ```
 
@@ -55,6 +57,7 @@ ToggleHotkeyVK=119
 | Dollman delay schedule | `0x140C74300` | 当前 random Dollman gameplay voice 的关键上游入口。 |
 | Dollman delay closure | `0x140C743B0` | 当前最硬的 random Dollman-only voice TLS 标记点。 |
 | VoiceSharedHelper | `0x140DACCD0` | 当前早期消费 random Dollman voice queue 的点。必须由 Dollman closure TLS 约束。 |
+| VoiceQueueSubmit | `0x140DACE30` | 默认不安装的 identity probe；只在 Dollman TLS 诊断模式下记录 request，不是 release 默认 mute 点。 |
 
 当前热键:
 
@@ -89,7 +92,7 @@ DSRadioSentenceGroupThroughDollmanInstance.vtable[8] 0x140C74300
 - payload `+0x00` 是 `DSRadioSentenceGroupThroughDollmanInstance*`。
 - payload `+0x08` 是 controller index。
 - `0x140C743B0` 从 group instance 读取:
-  - `self+0x10` -> voice controller/source object
+  - `self+0x10` -> `DSRadioSentenceGroupThroughDollmanResource`，作为 `VoiceSharedHelper` 的 voice source 参数传入
   - `self+0x20` -> notification queue
   - 然后调用 `VoiceSharedHelper`。
 
@@ -122,9 +125,50 @@ DSRadioSentenceGroupThroughDollmanInstance.vtable[8] 0x140C74300
 
 - `event=0` 不是 hook 失败。
 - 它说明我们拦得早，具体 Wwise event/request 还没生成。
-- 要知道“屏蔽了什么内容”，必须继续往上游 group instance / voice controller / resource refs 摸，而不是指望这个 hook 点直接给最终 eventId。
+- 要知道“屏蔽了什么内容”，必须继续往上游 group instance / source resource / resource refs 摸，而不是指望这个 hook 点直接给最终 eventId。
 
-### 2.4 当前 runtime probe 方向
+当前静态边界:
+
+- `VoiceSharedHelper` 里的 request descriptor 是现场合成的，不是一个已经完整存在的语义对象直传下来。
+- request `+0x00` 来自传入的 `sentence_key`；为 0 时才按 output type 填 fallback id。
+- request `+0x10 = -1`、`+0x24 = -1` 是默认合成状态，不能直接当内容身份。
+- 当前能稳定证明的是 caller/closure 路径身份，不是最终内容 id。
+
+`0x140C743B0` 到 helper 的具体传参:
+
+- closure payload `+0x08` 先写入局部 `v17`。
+- `&v17` 作为 `VoiceSharedHelper` 第 5 参数传入。
+- helper 读取 `*a5`，写成 request descriptor `+0x00`。
+- 因此 `voice-queue-identity id=` 能验证 `controller_index` 是否就是具体 request id；如果 `controller_index=0`，helper 会按 output type 写 fallback id。
+
+### 2.4 VoiceQueueSubmit 诊断边界
+
+`0x140DACE30 VoiceQueueSubmit_Candidate` 已接成默认关闭的 identity probe:
+
+- `EnableVoiceQueueIdentityProbe=0` 时，行为不变：Dollman TLS 内 `VoiceSharedHelper` 直接早退 `return 1`。
+- `EnableVoiceQueueIdentityProbe=1` 时，Dollman TLS 内允许 `VoiceSharedHelper` 继续构造 request descriptor。
+- 随后 `VoiceQueueSubmit` hook 只在同一个 Dollman TLS 内记录 request / owner 字段，并写 `out_status=0`、`return 1`，阻止真正入队。
+- 这个模式的目标是拿内容身份，不是 release 默认路径。
+
+Kepler 静态核对结论:
+
+- `VoiceQueueSubmit` 返回 `1` 表示上层认为提交成功/已处理。
+- 返回 `0` 才触发 `VoiceSharedHelper` 和 closure 的失败 fallback。
+- 第 6 参数 out status 成功语义是 `0`；原函数只在特定失败/冲突分支写 `0x3A`。
+
+开关工具:
+
+```powershell
+powershell .\tools\voice_identity_probe.ps1 -Status
+powershell .\tools\voice_identity_probe.ps1 -Enable
+powershell .\tools\voice_identity_probe.ps1 -Disable
+python .\tools\voice_identity_report.py --tail 400
+```
+
+`-Enable` 会同时写 `EnableVoiceQueueIdentityProbe=1` 和 `HookVoiceQueueSubmit=1`；`-Disable` 会恢复两个值为 `0`。
+`voice_identity_report.py` 用来汇总 `[dollman-voice-sentence-group]` / `[voice-queue-identity]`，并提示是否还缺 schedule、sentence group 或 queue identity 样本。
+
+### 2.5 当前 runtime probe 方向
 
 当前只读 probe 已加入/待游戏加载:
 
@@ -132,26 +176,102 @@ DSRadioSentenceGroupThroughDollmanInstance.vtable[8] 0x140C74300
   - 记录 `self`
   - `self+0x10/+0x18/+0x20`
   - `self+0x40/+0x44`
-  - voice/playback/queue vtable
+  - source resource `+0x60/+0x64/+0x68/+0x70/+0x78/+0x80/+0x88/+0x90/+0x91/+0xA0`
+  - `source+0x88` 指向的 `SentenceGroupResource+0x20/+0x28/+0x30/+0x38/+0x40`
+  - source/playback/queue vtable
 - `dollman-voice-closure`
   - 记录 payload、self、controller
 - `voice-helper-probe/state`
-  - 记录 voice controller 的一组低风险字段
+  - 记录 source resource 的一组低风险字段
   - 记录 helper queue 相关状态
+- `voice-queue-identity`
+  - 仅 `EnableVoiceQueueIdentityProbe=1` 时出现
+  - 记录 request `+0x00/+0x08/+0x10/+0x14/+0x18/+0x1C/+0x20/+0x24`
+  - 只读复刻 `sub_140DA8720(owner+0x38, request_id, -1)` 的哈希查找，记录 `catalog_slot/index/entry`
+  - 如果解析到 catalog entry，记录 entry vtable/type 和 `+0x08..+0x38` 的 qword 快照
+  - 记录 owner `+0x38/+0x40/+0x44/+0x48/+0x60/+0x64/+0x1EF`
+- `dollman-voice-sentence-index`
+  - 用 `controller_index` 只读尝试索引 `source+0x88 -> SentenceGroupResource+0x30`
+  - 如果 in-bounds，记录候选 `SentenceResource+0x30/+0x38/+0x40/+0x48/+0x50/+0x58`
+  - 这只是验证 controller 是否能作为句子数组下标，不能预设它一定成立
 
 第一条已有 probe 结果:
 
 ```text
-self+0x10 == VoiceSharedHelper controller 参数
+self+0x10 == VoiceSharedHelper source 参数
 self+0x20 == VoiceSharedHelper queue 参数
 self+0x18 == 0
-voice+0x70 == 0
 event == 0
 ```
 
-这说明第一次猜测的 `self+0x18` / `voice+0x70` 还不是内容身份来源，后续要继续看 voice controller 自身字段或更晚的 guarded `VoiceQueueSubmit` request。
+这说明第一次猜测的 `self+0x18` / `source+0x70` 还不是内容身份来源，后续要继续看 resource 字段或更晚的 guarded `VoiceQueueSubmit` request。
 
-### 2.5 字幕侧当前定位
+### 2.6 DSRadioSentenceGroupThroughDollmanInstance 字段边界
+
+IDA 目前把 instance 的构造点收敛到 `0x140C79430`:
+
+- 分配 `0x48` 字节 instance。
+- `+0x10 = DSRadioSentenceGroupThroughDollmanResource*`，并 AddRef。
+- 如果 `resource+0x80` 存在，调用其 vtable `+0x20`，结果写到 `+0x18`。
+- `+0x20 = 0`，后续由 `0x140C735C0` lazy allocate notification queue。
+- `+0x40/+0x44` 是 runtime counter/state flag。
+
+字段判断:
+
+| 字段 | 当前判断 | 内容身份价值 |
+|---|---|---|
+| `self+0x10` | Dollman sentence group resource，传给 `VoiceSharedHelper` arg2 | 最高；稳定来源，但不是单句 |
+| `self+0x18` | 来自 `resource+0x80` vcall，和 `PlaybackEvent` 查询有关 | 中等；更像 playback graph / playinfo metadata |
+| `self+0x20` | notification queue | 低；队列/状态，不是内容身份 |
+| `self+0x40/+0x44` | active counter / state flag | 低；runtime 状态 |
+
+source resource 字段来自 type descriptor:
+
+| 字段 | 当前判断 |
+|---|---|
+| `source+0x60/+0x64` | `DSRadioBaseResource` 的基础调度/禁用类字段 |
+| `source+0x68/+0x70` | `Array_Ref_BooleanFact` 容器 |
+| `source+0x78` | `Ref_RTTIRefObject`，可能是 debug/info/disable fact 相关 |
+| `source+0x80` | `Ref_GraphProgramResource` |
+| `source+0x88` | `Ref_SentenceGroupResource`，当前最值得和具体句组关联 |
+| `source+0x90/+0x91` | `SentenceGroup` / `DoNotRepeat` bool 类字段 |
+| `source+0xA0` | Dollman resource 自身 bool 字段 |
+
+`SentenceGroupResource` 字段来自 type descriptor:
+
+| 字段 | 当前判断 |
+|---|---|
+| `group+0x20` | `ESentenceGroupType` |
+| `group+0x28` | `Array_Ref_SentenceResource` count |
+| `group+0x30` | `Array_Ref_SentenceResource` item pointer |
+| `group+0x38/+0x40` | array capacity / auxiliary storage fields |
+
+`SentenceGroupResource_ExportedGetVoices 0x1402911B0 -> 0x140291960` 静态证明:
+
+- `0x140291960` 读取 `group+0x20` 判断 group type。
+- `group+0x28` 作为句子数量读取。
+- `group+0x30` 作为 `SentenceResource*` 数组读取。
+- 每个 `SentenceResource` 优先取 `+0x58` voice ref，缺失时取 `+0x50` fallback voice ref。
+- 这个函数做的是“句组里有哪些 voice resource”的导出/汇总，不直接证明 `controller_index` 是句子数组下标。
+
+下一轮 runtime 要重点看 `source+0x88` 是否非零、`group+0x30` 是否指向稳定句子数组，以及 `voice-queue-identity id=` 是否能作为这个数组的索引或 key。
+
+`VoiceQueueSubmit` catalog key 静态边界:
+
+- `sub_140DA8720(owner+0x38, request_id, &out_index)` 用 `request_id` 做哈希表查找。
+- `owner+0x38+0x20` 是 12 字节 bucket 表，bucket 形态为 `{ key, catalog_index, crc/hash }`。
+- `owner+0x38+0x2C` 是表容量/掩码来源。
+- 命中后 `owner+0x38+0x38[catalog_index]` 返回 catalog entry。
+- 因此 `request+0x00` 是 voice catalog key 候选，不是已证明的 `SentenceGroupResource` 数组下标。
+
+额外静态证据:
+
+- Dollman resource vtable[0] `0x140C72570` 返回 `word_144331370`。
+- `VoiceSharedHelper` 会拿传入 source 的 vtable[0] 返回值和 `word_144331370` 比较。
+- `0x140C76520` / `0x140C77110` 的 radio update/type-mask 逻辑也把 `word_144331370` 作为一个独立 radio resource 类型分支处理。
+- 所以 `self+0x10` 作为 Dollman source resource 的稳定性很强；但它仍然只是资源类型/组身份，不是单句内容身份。
+
+### 2.7 字幕侧当前定位
 
 当前 random gameplay voice 主线不再依赖字幕 mute 成功与否来证明。
 
@@ -200,7 +320,7 @@ VoiceSharedHelper
 
 优先级:
 
-1. 用 read-only probe 确认 `self+0x10/+0x18/+0x20/+0x40/+0x44` 和 voice controller 字段。
+1. 用 read-only probe 确认 `self+0x10/+0x18/+0x20/+0x40/+0x44` 和 source resource 字段。
 2. 把稳定字段和 `DS2_V1.7_AUDIO_SUBTITLE_MAP.md` 里的资源布局对齐:
    - `SentenceResource+0x38/+0x48/+0x50/+0x58`
    - `DSRadioSentenceGroupThroughDollmanResource`
@@ -217,8 +337,9 @@ VoiceSharedHelper
 
 - 只在 Dollman TLS 为真时记录。
 - 只做 identity capture。
-- 不把它作为第一 mute 点。
+- 不把它作为 release 默认 mute 点。
 - 不扩大到非 Dollman helper caller。
+- hook 直接返回成功时必须写 `out_status=0`，避免触发上层 fallback。
 
 成功标准:
 

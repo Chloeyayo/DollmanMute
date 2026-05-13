@@ -189,7 +189,9 @@ if (-not $copied) {
     }
     Write-Output "Core replaced; triggering proxy load via $loadFlag"
     New-Item -ItemType File -Path $loadFlag -Force | Out-Null
-    Show-HotReloadMessage "DollmanMute Core has been replaced and hot reload was triggered."
+    if ($env:DOLLMANMUTE_HOTRELOAD_MESSAGEBOX -eq '1') {
+        Show-HotReloadMessage "DollmanMute Core has been replaced and hot reload was triggered."
+    }
 }
 if (-not $CoreOnly) {
     $proxyInstalled = $false

@@ -1,525 +1,330 @@
 # DollmanMute 研究笔记
 
-> 最后更新: 2026-04-26
-> 当前源码 build tag: `research-v3.27f-postevent-narrow-block`
-> 这份文件只保留当前仍有价值的事实、思路、速查和死路。
-> 更老的探针史、旧偏移试错、长篇考古，统一留给 git 历史，不再堆在这里。
+> 最后更新: 2026-05-13
+> 当前源码 build tag: `v3.0-dynamic-resolution-dev`
+> 当前目标版本: DS2 v1.7.76
+> 详细静态总图见:
+> `C:\Users\Administrator\Downloads\dbg\ds2ida\DS2V1.7\DS2_V1.7_AUDIO_SUBTITLE_MAP.md`
+
+这份文件只保留当前仍能指导代码和实验的事实。旧偏移、旧 probe 史、v1.6/v2.1.17 之前的叙事只作为 git 历史，不再混入当前判断。
 
 ## 0. 目标
 
-唯一目标一直没变:
+唯一目标没变:
 
 - **只屏蔽 Dollman 的 gameplay 语音和字幕**
-- **尽量不误伤 Sam / NPC / cutscene / 其他系统**
-- **不要把“游戏能启动”误当成终点**
+- **尽量不误伤 Sam / NPC / cutscene / private-room / 其他系统**
+- **不要把“能启动”或“某一次没听到声音”误当成完成**
 
-平台稳定、热更新、日志 UX 都只是推进这个目标的手段。
+当前新增研究目标:
 
-## 1. 当前已确认事实
+- 不只知道“消费了一条 Dollman voice queue”
+- 还要尽量知道具体消费了什么内容: 资源指针、句子索引、文本 tag、sound resource id 或其他稳定身份
 
-### 1.1 当前默认运行时形态
+## 1. 当前运行时形态
 
-当前源码默认值来自 `src/core_main.c`:
+当前 game-root `DollmanMute.ini` 关键项:
 
 ```ini
 [General]
 Enabled=1
 VerboseLog=0
-EnableDollmanRadioMute=1
-EnableThrowRecallSubtitleMute=0
-ActiveSubtitleStrategy=1
-EnableSenderOnlyRuntimeMode=1
-EnableSubtitleRuntimeHooks=1
-EnableLegacyRuntimeWrapper=0
-EnableSubtitleFamilyTracking=0
-EnableSubtitleProducerProbe=0
-EnableBuilderProbe=0
-EnableSelectorProbe=1
-EnableDeepProbe=0
-EnableTalkDispatcherProbe=0
+EnableVoiceMute=1
+EnableSubtitleMute=1
 ScannerMode=0
+HookRadioDispatcher=1
+HookEchoback=1
+HookQueueStartTalk=1
+HookStartTalkUpdate=1
+HookTalkSoundWrapper=1
+HookDollmanVoiceSchedule=1
+HookDollmanVoiceClosure=1
+HookVoiceSharedHelper=1
+ToggleHotkeyVK=119
 ```
 
-这意味着当前默认口径是:
+当前常驻 hook 面:
 
-- sender-only runtime mode 开
-- legacy subtitle runtime wrapper 关
-- legacy broad Dollman audio path 关
-- subtitle sender/remove surface 开
-- selector probe 开
-- deep probe 关
-- TalkDispatcher probe 关
+| 面 | v1.7 RVA / 来源 | 当前角色 |
+|---|---:|---|
+| RadioVoiceDispatcher | `0x140C735C0` / Dollman vtable[2] | 旧 talk/starttalk 链路的 Dollman 标记面，仍保留观察与兼容价值。 |
+| Echoback enqueue/execute | `0x140388200` / `0x140387490` | 旧 deferred talk 链路。当前 random Dollman 不主要靠这里闭合。 |
+| QueueStartTalkFunction | `0x140388C20` | 旧 StartTalk 字幕/语音链路入口。 |
+| StartTalk UpdateAdvance | `0x1403876B0` | 旧 StartTalk 生命周期门。 |
+| TalkSound wrapper | `0x1403899C0` | 旧 StartTalk 声音实例替换点。 |
+| Dollman delay schedule | `0x140C74300` | 当前 random Dollman gameplay voice 的关键上游入口。 |
+| Dollman delay closure | `0x140C743B0` | 当前最硬的 random Dollman-only voice TLS 标记点。 |
+| VoiceSharedHelper | `0x140DACCD0` | 当前早期消费 random Dollman voice queue 的点。必须由 Dollman closure TLS 约束。 |
 
-### 1.2 当前默认真正常驻的 hook 面
+当前热键:
 
-从当前源码和最新 `DollmanMute.log` 看，默认常驻面是:
+- `F8` / VK `0x77` = 运行时启用/禁用整个 mod
+- 暂时不要 MessageBox，避免影响游玩和测试节奏
 
-| 面 | 当前入口 | 角色 |
-|---|---|---|
-| voice shared helper | `sub_140DAC7B0` | Player / Dollman 共用的语音提交 helper |
-| Dollman voice closure | `sub_140C73EE0` | 当前最窄的 Dollman-only 语音切点 |
-| subtitle sender | `sub_140780740` | 当前最稳的 gameplay 字幕静音面 |
-| subtitle remove sender | `sub_140780840` | 和 sender 配对，用于 key 对齐 |
-| selector dispatch | `sub_140DAF8A0` | 当前最干净的 gameplay 观测锚点 |
+## 2. 当前已确认事实
 
-默认**不会**常驻的旧路径:
+### 2.1 random Dollman voice 主链
 
-- `PostEventID` broad legacy 音频截断
-- `sub_140780690` legacy runtime wrapper
-- `TalkDispatcher`
-- producer / builder / StartTalk init 深 probe
-
-### 1.3 当前 subtitle 侧最硬的 live 结论
-
-- 当前 gameplay Dollman sender 精确 pair 已坐实:
-  - `caller_rva = 0x385C1B`
-  - `speaker_tag = 0x12B6F`
-- 当前 remove 配对 caller 是:
-  - `caller_rva = 0x385B32`
-- 当前 `LocalizedTextResource` vtable RVA 是:
-  - `0x3448D38`
-  - 旧 `0x3448E48` 已失效
-- sender 路径当前已经能稳定直接解出 `p6 / p7`
-  - `p6` = line/body
-  - `p7` = speaker
-- 当前 line identity tag 至少已知:
-  - `0x01F4` = throw / recall
-  - `0x222C` / `0x4377` = dialogue
-
-最新日志里已经出现过这类命中:
+当前 gameplay random Dollman 语音已经通过 live log 和 IDA 对齐到这条链:
 
 ```text
-SubtitleHit surface=sender caller_rva=0x385c1b speaker_tag=0x12b6f line_tag=0x1f4 family=throwRecall
-Muted subtitle surface=sender strategy=pair caller_rva=0x385c1b speaker_tag=0x12b6f line_tag=0x1f4 family=throwRecall
+DSRadioSentenceGroupThroughDollmanInstance.vtable[8] 0x140C74300
+  -> delay invoke wrapper 0x140C7EC50
+  -> DSRadioVoiceDelayClosureSibling_Candidate 0x140C743B0
+  -> VoiceSharedHelper_Candidate 0x140DACCD0
 ```
 
-这说明 subtitle 侧已经不是“盲炸 UI 尾部”，而是能在 sender 面做当前 build 对齐后的精准命中。
-
-### 1.4 当前 voice 侧最硬的静态结论
-
-当前更可信的 Dollman 语音链应记成:
+运行证据形态:
 
 ```text
-Dollman:
-  sub_140C73E30
-    -> sub_140C7E780
-    -> sub_140C73EE0
-    -> sub_140DAC7B0
-
-Player:
-  sub_140C739B0
-    -> sub_140C7E760
-    -> sub_140C73A60
-    -> sub_140DAC7B0
+[dollman-voice-schedule] ...
+[dollman-voice-closure] ...
+[voice-helper] consumed=... dollman ... event=0
 ```
 
-结论:
+解释:
 
-- `sub_140DAC7B0` 是 **Player / Dollman 共用 helper**
-- `sub_140C73EE0` 才是当前更窄的 Dollman-only closure 切点
-- blanket 拦 `sub_140DAC7B0` 风险很高
-- 当前 voice 路和 subtitle 路已经证明属于同一套 talk/controller 生态，但**还没有**证明它们共享同一个最终 identity 字段
+- `0x140C74300` 分配 0x20 的 closure parameter set。
+- 传给 `0x140C743B0` 的有效 payload 是 closure 对象的 `+0x10`。
+- payload `+0x00` 是 `DSRadioSentenceGroupThroughDollmanInstance*`。
+- payload `+0x08` 是 controller index。
+- `0x140C743B0` 从 group instance 读取:
+  - `self+0x10` -> voice controller/source object
+  - `self+0x20` -> notification queue
+  - 然后调用 `VoiceSharedHelper`。
 
-### 1.5 当前 throw/recall / equip 残余语音的 live 结论
+### 2.2 旧 voice 链路的降级
 
-- 当前 build 下，throw/recall/equip 残余语音已经通过 `PostEventID / Wwise` 被 live 坐实
-- 当前最关键的 eventId:
-  - `2995625663` = equip / 拿出 Dollman
-  - `2820786646` = throw
-  - `2978848044` = recall
-- 它们在 `F8` 窗口里会和 `SubtitleHit caller_rva=0x385C1B speaker_tag=0x12B6F line_tag=0x1F4` 紧邻出现
-- `2995625663` 的最新 live 证据更直接：
-  - 连续多段 `F8` 窗口里都出现 `Muted subtitle ... speaker_tag=0x12B6F line_tag=0x1F4`
-  - 紧接着 1 到 3ms 内出现 `[postevent] eventId=2995625663 ... blocked=0`
-  - 这证明“拿出 Dollman 还有声音”不是 subtitle pair 漂了，而是 sender-only 语音窄拦截漏了 `equip`
-- 当前抓到的 `PostEventID` caller RVA 统一落在:
-  - `0x026B6846`
-- 这个 caller 本身区分度不高；真正有价值的是 **eventId**
-- 因此对当前残余 equip/throw/recall 语音，最稳的工程切点已经不是 `DAC7B0 / DAC910`，而是这组 Wwise eventId
-- 当前源码已经切到 sender-only 下的窄拦截版本：
-  - `research-v3.27g-postevent-equip-narrow-block`
-  - sender-only 模式下拦 `equip / throw / recall` 这三个 eventId
-  - 同时保留 `F8` 窗口里的 `[postevent]` 观测
-
-### 1.6 当前更高层的语义锚点
-
-我们已经不只是 stuck 在 UI / payload 尾部。
-
-当前 gameplay 主链上层已经摸到:
-
-- `DSElevenMonthBBControllerComponent`
-- `DSElevenMonthBBControllerComponentResource`
-- `EDSElevenMonthBBReactionEvent`
-- `TargetEvent`
-- `ForceToOverride`
-- `loop_time`
-- `RUNNING_REACTION_EVENT_ST / LP / ED`
-- 一组 `EVENT_BB_*` reaction 名
-
-当前最值得记住的链不是旧偏移名，而是:
+旧文档和旧代码里常见这条链:
 
 ```text
-gameplay action
-  -> sub_140F04490
-  -> sub_140F01F90
-  -> sub_140F000B0
-  -> sub_140DAF8A0
-  -> builder / StartTalk / subtitle / voice 分叉
+0x140C73E80 / 0x140C73F30
+  -> 0x140DACCD0
 ```
 
-这条链的意义是:
+当前结论:
 
-- 我们已经摸到 reaction / family / selector 语义层
-- 不应再把主线重新缩回 `ShowSubtitle` 尾部或 `DSTalkManager` 旁路
+- 这条链仍然是 sibling/player 对照路径，有结构参考价值。
+- 但它不是当前已证明的 random Dollman gameplay mute 主路径。
+- 不能再把 `0x140C73F30` 写成当前 random Dollman 的权威 closure。
 
-## 2. 当前真正可用的工程判断
+### 2.3 VoiceSharedHelper 的边界
 
-### 2.1 subtitle 侧
+`0x140DACCD0 VoiceSharedHelper_Candidate` 是共享 helper，不能 blanket mute。
 
-当前 subtitle 路最合理的工程策略是:
+当前安全用法:
 
-- 以 `ShowSubtitle sender` 为主静音面
-- 以 `caller_rva + speaker_tag` pair 做精确主判定
-- 以 `line identity tag` 做 family 分类补充
-- 把 `remove sender` 当配对面，而不是另起一套过滤逻辑
+- 只在 `0x140C743B0` closure 设置的 Dollman TLS 内消费。
+- early return `1`，不调用原 helper。
+- 这会在 `VoiceQueueSubmit` 之前消费队列，所以 hook 点看到的 `event_id` 通常还是 `0`。
 
-为什么:
+因此:
 
-- sender 面 blast radius 最小
-- 当前 build 上它已经能直接读到 `p6/p7`
-- family 可以直接从当前 payload 的 line tag 推出，不再强依赖旧 producer TLS
+- `event=0` 不是 hook 失败。
+- 它说明我们拦得早，具体 Wwise event/request 还没生成。
+- 要知道“屏蔽了什么内容”，必须继续往上游 group instance / voice controller / resource refs 摸，而不是指望这个 hook 点直接给最终 eventId。
 
-### 2.2 voice 侧
+### 2.4 当前 runtime probe 方向
 
-当前 voice 路最合理的工程策略是:
+当前只读 probe 已加入/待游戏加载:
 
-- 优先从 `sub_140C73EE0` 这种窄 Dollman closure 下刀
-- 把 `sub_140DAC7B0` 当共享 helper 看待，只能带强约束地用
-- 不要再把旧 broad legacy 音频路径当最终答案
+- `dollman-voice-schedule`
+  - 记录 `self`
+  - `self+0x10/+0x18/+0x20`
+  - `self+0x40/+0x44`
+  - voice/playback/queue vtable
+- `dollman-voice-closure`
+  - 记录 payload、self、controller
+- `voice-helper-probe/state`
+  - 记录 voice controller 的一组低风险字段
+  - 记录 helper queue 相关状态
 
-为什么:
+第一条已有 probe 结果:
 
-- `sub_140DAC7B0` 已坐实 Player / Dollman 共用
-- 共享 helper 更适合作观测或二级约束，不适合无脑 mute
-- 语音残余很可能不是“字幕那条 sender 路自动顺手解决”的副产品
+```text
+self+0x10 == VoiceSharedHelper controller 参数
+self+0x20 == VoiceSharedHelper queue 参数
+self+0x18 == 0
+voice+0x70 == 0
+event == 0
+```
 
-### 2.3 当前最合理的主线
+这说明第一次猜测的 `self+0x18` / `voice+0x70` 还不是内容身份来源，后续要继续看 voice controller 自身字段或更晚的 guarded `VoiceQueueSubmit` request。
 
-最大的工程突破点不是“再加更深的末端 hook”，而是把 mute 逻辑重新围绕更高层的**语义阀门**组织:
+### 2.5 字幕侧当前定位
 
-- reaction event
-- family
-- selector
-- builder 输入语义
-- StartTalk 早期字段
+当前 random gameplay voice 主线不再依赖字幕 mute 成功与否来证明。
 
-字幕 sender 面现在更像:
+字幕侧仍有价值:
 
-- 已经验证过的现役出口
-- 当前 live 样本回收面
-- 用来判断上游探索是否正确的闭环面
+- 验证是否确实是 Dollman gameplay 语境
+- 收集 `speaker_tag / line_tag / caller_rva / p6 / p7`
+- 辅助区分 random、throw/recall、equip、story/private-room
 
-而不是最终该把所有逻辑都堆上的地方。
+但不能再把 `line_tag` 单独作为最终 voice mute 规则。
+
+已知风险:
+
+- `line_tag=0x1f4` 可出现在无说话人/其他玩家语音附近。
+- 某些 random 期间其他字幕消失的问题证明过，宽泛 subtitle 规则很容易误伤。
+- `p7_text="Dollman"` 有价值，但用错面或用错生命周期会扩大误伤。
 
 ## 3. 当前还没证明的事
 
-下面这些点不能偷着当成既定事实:
+这些不能偷当成既定事实:
 
-- 还没找到一个已实锤的“语音 + 字幕共用最终统一入口”
-- 还没证明 `StartTalkFunction` 里的那组 identity / key / mode 字段，原样直通到 `sub_140DAC7B0`
-- 还没证明 throw / recall 的所有残余语音都一定走当前已知 Dollman closure
-- 还没证明 `Speaker` observer 旁路已经完全排除
-- 还没证明“当前 subtitle pair 成功”就意味着整体 mute 方案已经可交付
+- 还没拿到 random Dollman 每一句的稳定内容身份。
+- 还没证明 `VoiceSharedHelper` 前的哪个字段能稳定映射到 `SentenceResource`、`DSRadioPlayInfo` 或 sound resource。
+- 还没证明所有未测到的 random 都一定走同一条 `0x140C74300 -> 0x140C743B0` 链，虽然目前这条链的命中证据很强。
+- 还没证明具体 `VoiceQueueSubmit` request 一定能反推最终 AK event id。
+- 还没证明当前只读 probe 长时间游玩完全无性能副作用。
 
-更准确的表述是:
+更准确的表述:
 
-- **我们已经证明 voice 和 subtitle 挂在同一套 talk/controller 生态上**
-- **但还没有证明它们在末端仍共享同一份判别字段**
+- **当前已经证明 random Dollman gameplay voice 有一条更早、更窄的 Dollman-only delay closure 路径。**
+- **当前还缺的是内容身份映射，而不是 mute 主路径本身。**
 
-## 4. 当前下一步应该怎么打
+## 4. 下一步打法
 
-### 4.1 上游优先
+### 4.1 主线
 
-继续往上摸，不要退回末端迷宫。
+继续沿当前已证明链路向上摸:
 
-优先级顺序:
-
-1. `DSElevenMonthBBControllerComponent`
-2. `EDSElevenMonthBBReactionEvent`
-3. `sub_140F04490 -> sub_140F000B0 -> sub_140DAF8A0`
-4. `StartTalk` 早期字段与 builder 输入
-5. `voice closure / shared helper`
-6. `ShowSubtitle sender` 作为验证闭环
-
-### 4.2 subtitle 的角色
-
-subtitle 侧现在的职责是:
-
-- 做 live 命中验证
-- 回收 `speaker / line / caller / family` 样本
-- 给上游语义判断提供“是否真的打中 Dollman gameplay”的现实校验
-
-而不是把所有问题都留到 UI 尾部解决。
-
-### 4.3 voice 的角色
-
-voice 侧当前更像主阻塞项。
-
-下一轮若继续研究，应优先回答:
-
-1. `sub_140C73EE0` 已经足够窄了吗
-2. throw / recall 残余语音是否经 `sub_140DAC7B0` 之外的旁路提交
-3. 哪一层最早把 Dollman 和 Player 语义真正分叉开
-
-## 5. 当前运行时与工具速查
-
-### 5.1 热键
-
-- `J` = throw/recall mute ON
-- `K` = throw/recall mute OFF
-- `N` = dialogue mute ON
-- `M` = dialogue mute OFF
-- `F12` = clear all runtime subtitle mutes
-- `F1..F6` = 切字幕策略
-- `F8` = 打 session 边界并开 5 秒 probe window
-- `F9` = 清空 `DollmanMute.log`
-
-### 5.2 当前 subtitle 策略
-
-- `F1 = observe`
-- `F2 = pair`
-- `F3 = callerOnly`
-- `F4 = speakerOnly`
-- `F5 = selectedFamily`
-- `F6 = pairOrSelectedFamily`
-
-当前默认主策略仍是:
-
-- `pair`
-- 也就是 `caller_rva=0x385C1B + speaker_tag=0x12B6F`
-
-### 5.3 当前最顺手的探索命令
-
-```powershell
-.\tools\exp.ps1 sessions
-.\tools\exp.ps1 summary F8-<N> -Top 4
-.\tools\exp.ps1 show F8-<N> -Samples 3
-.\tools\exp.ps1 combo F8-<N> 3 4
-.\tools\exp.ps1 watch
+```text
+VoiceSharedHelper
+  <- 0x140C743B0 closure
+  <- 0x140C7EC50 delay invoke
+  <- 0x140C74300 Dollman vtable[8] schedule
+  <- DSRadioSentenceGroupThroughDollmanInstance fields / owner resource
 ```
 
-建议:
+优先级:
 
-- 先 `F9`
-- 再 `F8`
-- 做一组单一动作
-- 最后用明确的 `F8-N` 去看，而不是偷懒盯“last”
+1. 用 read-only probe 确认 `self+0x10/+0x18/+0x20/+0x40/+0x44` 和 voice controller 字段。
+2. 把稳定字段和 `DS2_V1.7_AUDIO_SUBTITLE_MAP.md` 里的资源布局对齐:
+   - `SentenceResource+0x38/+0x48/+0x50/+0x58`
+   - `DSRadioSentenceGroupThroughDollmanResource`
+   - `DSRadioPlayInfo`
+   - Dollman/player `Voices`
+   - `ResidentSentenceGroupResource`
+3. 如果上游字段仍然不透明，再加 guarded `VoiceQueueSubmit` 诊断。
 
-## 6. DEAD_ENDS
+### 4.2 guarded VoiceQueueSubmit 原则
 
-下面这些坑已经足够明确，不要再反复掉进去。
+`0x140DACE30` 很宽，不能常规 blanket 操作。
 
-### 6.1 把旧偏移当真实函数入口
+只允许这样用:
 
-错误想法:
+- 只在 Dollman TLS 为真时记录。
+- 只做 identity capture。
+- 不把它作为第一 mute 点。
+- 不扩大到非 Dollman helper caller。
 
-- `0x00DAFAD0`
-- `0x003857E0`
-- `0x00780710`
+成功标准:
 
-现结论:
+- 一条被 mute 的 random Dollman 语音能稳定打印出资源 pointer/id、sentence index、text tag 或 sound id。
+- 多次 random 捕获之间能对上同一种身份逻辑。
+- Sam/NPC/无名玩家语音不进入同一个 mute 判定。
 
-- 它们最多只是历史 probe 点或父函数内部偏移
-- 当前讨论必须尽量落在真实函数起点和现 build 对齐后的语义面上
+## 5. 当前工程判断
 
-### 6.2 把 `0x3448E48` 当当前 `LocalizedTextResource` vtable
+当前版本相对 v2.1.17 的核心进步:
 
-错误想法:
+- 不再靠字幕后一段时间窗口去猜 voice。
+- 不再靠宽泛 PostEvent/eventId 兜 random。
+- 找到了 random Dollman gameplay voice 的早期 Dollman-only closure。
+- 语音 mute 与字幕误伤问题解耦: voice 由 closure TLS 约束，字幕另行处理。
 
-- sender 路径解不出 `p6/p7`，所以这条路没用
+当前缺点/风险:
 
-现结论:
+- 内容身份还没解出。
+- 为了研究多了只读日志字段，理论上有轻微日志/读内存开销。
+- 旧 StartTalk 链仍保留，后续可能需要精简成 release 形态。
 
-- 当前 live vtable 是 `0x3448D38`
-- 旧常量漂移才是之前 `speaker_ok=0 / line_ok=0` 的原因
+## 6. DEAD_ENDS / 不要再混用的旧结论
 
-### 6.3 把 `q2/q3` 当 Dollman 身份 ID
+### 6.1 旧 v1.6 / v2.1.17 地址
 
-错误想法:
+这些旧地址不能再直接用于当前 v1.7 dynamic-resolution 判断:
 
-- `q2/q3` 看起来稳定，所以可直接拿来做 Dollman 过滤
+- `sub_140DAC7B0`
+- `sub_140DAC910`
+- `sub_140C73EE0`
+- `sub_140C73E30`
+- `caller_rva=0x385C1B` 作为当前唯一值
 
-现结论:
+当前 v1.7 对应面已经整体漂移，必须使用 live resolve / 当前 IDA 地址。
 
-- `q2/q3` 更像通用 chatter sentinel
-- 用它做过滤会把 Sam / NPC / 非目标字幕一起炸掉
-
-### 6.4 把 `sub_140385720` / `sub_1403857E0` 当“音频字幕统一最终入口”
-
-错误想法:
-
-- 找到一个统一 dispatcher，直接一刀切就完了
-
-现结论:
-
-- 它更像 gameplay 字幕 payload packer / broadcaster 历史面
-- 这里已经太靠 subtitle 侧，不足以代表整个 voice + subtitle 统一终点
-
-### 6.5 把 `DSDollmanTalkManager` 当 gameplay chatter 主轴
-
-错误想法:
-
-- 名字写着 Dollman，所以主链一定在这
-
-现结论:
-
-- 它更像 story-demo / wakeup / private-room / lifecycle 混合系统
-- 误伤风险高，解释 gameplay chatter 的能力反而弱
-
-### 6.6 把 broad 策略当产品策略
+### 6.2 把 `0x140C73F30` 写成当前 random Dollman 主 closure
 
 错误想法:
 
-- `callerOnly`
-- `speakerOnly`
-- legacy broad audio mute
+- 旧文档里 `0x140C73F30 -> VoiceSharedHelper`，所以它就是当前 random Dollman 主路径。
 
 现结论:
 
-- 它们可以做实验和兜底
-- 不能当最终交付策略
-- 一旦当最终策略，Sam / NPC / player 行为很容易被一起带死
+- 当前已证明主路径是 `0x140C74300 -> 0x140C7EC50 -> 0x140C743B0 -> 0x140DACCD0`。
+- `0x140C73F30` 只能保留为 sibling/player 对照路径，不能当当前 random Dollman 证据。
 
-### 6.7 在当前 build 上重开 TalkDispatcher 主探针
+### 6.3 blanket mute `VoiceSharedHelper`
 
 错误想法:
 
-- 既然它历史上重要，就该常驻
+- `VoiceSharedHelper` 足够靠后，直接返回成功最省事。
 
 现结论:
 
-- 当前 build 上它仍然是隔离项
-- `EnableTalkDispatcherProbe=0` 不是保守，是明确的风险控制
+- 它是共享 helper。
+- 只有带 `0x140C743B0` Dollman closure TLS 约束时才可消费。
+- 否则极易误伤 Sam/NPC/player voice。
 
-### 6.8 把 `sub_140DAC7B0` 当可随便 blanket mute 的点
+### 6.4 把 `event=0` 当失败
 
 错误想法:
 
-- 共享 helper 足够靠后，拦这里最省事
+- `voice-helper event=0`，所以不知道 eventId 就说明没打中。
 
 现结论:
 
-- 这是 Player / Dollman 共用 helper
-- 任何不带强约束的 blanket mute 都极易误伤 player 语音链
+- 当前 mute 在 `VoiceQueueSubmit` 之前发生。
+- `event=0` 是早期消费的自然结果。
+- 内容身份应从上游对象或 guarded queue submit probe 里找。
 
-### 6.9 把 `ShowSubtitle` 末端继续当唯一主战场
+### 6.5 把单一 `line_tag` 当最终规则
 
 错误想法:
 
-- 只要 sender pair 已经能打中，就继续把所有逻辑往下堆
+- 某个 random 见过 `line_tag=0x1f4/0x357d/...`，直接列表匹配即可。
 
 现结论:
 
-- sender 面现在很有价值，但它更适合做验证闭环
-- 真正该继续突破的是 reaction / family / selector / StartTalk 早期语义
+- line tag 是运行时资源 tag，不是全局 Dollman 身份。
+- 单独使用会误伤无名玩家/Sam/NPC 或导致期间其他字幕消失。
+- 它只能作为观测字段或辅助分类。
 
-### 6.10 把 x64dbg 大范围断点当常规工作流
+### 6.6 把 private-room/story 行为混入 gameplay random
 
 错误想法:
 
-- 断点越多越接近真相
+- 只要是 Dollman 声音，都走同一套 gameplay random 逻辑。
 
 现结论:
 
-- 这会严重破坏 live 体验和节奏
-- 当前更好的默认工作流是:
-  - 静态分析
-  - sender-only runtime 日志
-  - F8 session
-  - `tools/exp.ps1`
+- private-room / story / gameplay random 必须分开验证。
+- 当前这份文档讨论的主链是 gameplay random voice。
+- 休息室正常与否不能直接证明 random mute 完成，反过来也一样。
 
-### 6.11 把 `0x140DAA410` 当成 throw/recall 语音的最终语义入口
-
-错误想法:
-
-- `sub_140DAA410` 既然能持续打出 `[voice-dispatch]`，那它就是最该拦的 live dispatcher
-- 日志里长期出现的 `mode=-1 / key=0xC0176000 / param=0` 可以直接拿来定性业务字段
-
-现结论:
-
-- `sub_140DAA410` 的真实语义更像 `DollmanVoiceDispatcher(state, dt)`：
-  - 唯一静态 caller 在 `sub_140DBCDE0`
-  - 调用前准备的是 `RCX=state`、`XMM1=dt`
-  - IDA 误判出来的“第二个整数参数”不可靠
-- `sub_140DA8D40` 已经把 `sub_140DAC910` request 布局静态坐实:
-  - `+0x00 key`
-  - `+0x08 ref/speaker`
-  - `+0x10 index`
-  - `+0x14 flag0`
-  - `+0x18 raw32_a`
-  - `+0x1C raw32_b`
-  - `+0x20/+0x21/+0x22 flag1/2/3`
-  - `+0x24 param`
-- 因此旧日志里的 `key=0xC0176000` 更像字段映射错位，不能再当真实 talk key 继续推理
-- 当前更有价值的 live 入口是:
-  - `sub_140DAC7B0`：Player / Dollman 共享 helper
-  - `sub_140DAC910`：更早的 queue submit 面，能直接看到 raw request
-- `sub_140DAC7B0` 这层如果要区分 `PlayerInstance` / `DollmanInstance`，当前最稳的信号不是 request 字段，而是 helper 自己的 caller return address:
-  - `0x00C73AEE`：Player 路
-  - `0x00C73F6D`：Dollman 路
-- `sub_140DAC910` 这一层当前最值得盯的 caller return address:
-  - `0x00DAC891`：来自 `sub_140DAC7B0`
-  - `0x00DAAB64`：`sub_140DAA410` 的 synthetic request
-  - `0x00DAC17A`：`sub_140DAA410` 的 per-entry forward
-- 这也解释了为什么 `research-v3.27d-voice-queue-retaddr` 热更后如果没有新的 `F8` session，就不会出现新的 `[voice-shared]` / `[voice-queue]` 样本：
-  - 不是 hook 失效
-  - 而是 probe window 根本没打开
-- 下一轮 live 默认动作:
-  - 保持 sender-only 字幕面不动
-  - 在 `F8` 窗口里同时看 `[voice-shared]` 和更早的 `DAC910` raw request
-  - 先判清 `throw/recall` 语音到底是 `shared-helper` caller，还是被 `DAA410` 这一层再包装/转发
-
-### 6.12 在当前 build 上继续把 throw/recall 残余语音的主线压在 `sub_140C73EE0 -> sub_140DAC7B0 -> sub_140DAC910 / sub_140DAA410`
-
-错误想法:
-
-- 既然 subtitle 命中和 Dollman gameplay 已经对上，那残余 throw/recall 语音大概率也还在这条已知 talk/queue 链里
-- 只要继续深挖 `C73EE0 / DAC7B0 / DAC910 / DAA410`，总会在这条链上找到最后那一刀
-
-现结论:
-
-- 这条线对“当前 build、当前残余 throw/recall 语音”已经足够明确地**降格成 DEAD_ENDS**
-- 证据不是静态猜测，而是 live 否定:
-  - `F8` 窗口里反复出现 `SubtitleHit / Muted subtitle`
-  - 同一窗口里是 **0 条** `[voice-shared]`
-  - **0 条** `[voice-queue]`
-  - **0 条** `Muted Dollman voice closure`
-- 这意味着当前残余语音至少**不是**下面这些已知路径:
-  - `sub_140C73EE0` 的 Dollman closure
-  - `sub_140DAC7B0` 的 shared helper
-  - `sub_140DAC910` 的 queue submit
-  - `sub_140DAA410` 包装/转发进去的那两类 request
-- 因此后续不该再把这条链当 throw/recall 残余语音的第一主线
-- 更准确的保留表述是:
-  - 这条链对**语音系统结构理解**仍然有价值
-  - 但对**当前残余 throw/recall 语音的直接突破**，优先级已经明显低于更偏 Wwise / gameplay audio emitter / 直发事件 的路线
-- 以后如果再回到这条线，只能有两个前提:
-  - 出现新的 live 证据，证明残余语音重新进入了 `[voice-*]` 面
-  - 或者研究目标改成“理解 talk/queue 结构”，而不是“解决当前残余 throw/recall 语音”
-
-## 7. 这份文件以后怎么维护
+## 7. 维护规则
 
 只接受三类内容:
 
 - 当前仍在指导代码和实验的事实
 - 当前仍成立的结构判断
-- 已经足够明确、值得写进 `DEAD_ENDS` 的坑
+- 已经足够明确、值得写进 DEAD_ENDS 的坑
 
-不要再往回加这些东西:
+不要再加:
 
-- 单次临时日志洪水
+- 单次日志洪水
 - 早已被推翻的旧偏移叙事
-- 只对某一轮调试过程有意义的长篇过程记录
-- “也许 / 可能 / 以后再看”的考古碎片
-
-旧研究史如果真有必要回看，直接查 git。
+- “也许以后看”的考古碎片
+- 未标明版本/分支/证据来源的结论

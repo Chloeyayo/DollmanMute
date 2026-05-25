@@ -39,6 +39,30 @@ typedef AkPlayingID(__cdecl *PostEventIdFn)(
     uint32_t external_source_count,
     void *external_sources,
     uint32_t playing_id);
+typedef int(__fastcall *SoundInstanceSubmitFn)(
+    AkUniqueID event_id,
+    uintptr_t sound_instance,
+    uint8_t a3,
+    uint8_t a4,
+    uintptr_t s0,
+    uintptr_t s1,
+    uintptr_t s2,
+    uintptr_t s3,
+    uintptr_t s4,
+    uintptr_t s5,
+    uintptr_t s6,
+    uintptr_t s7,
+    uintptr_t s8,
+    uintptr_t s9);
+typedef int(__fastcall *SoundInstancePlayFn)(
+    uintptr_t sound_instance,
+    uint8_t play_mode,
+    uint8_t submit_mode,
+    uint32_t fade_ms);
+typedef uintptr_t(__fastcall *AudioOwnerGetVariantResourceFn)(uintptr_t owner);
+typedef uintptr_t(__fastcall *StartTalkGetOrCreateSoundWrapperFn)(
+    uintptr_t starttalk,
+    uintptr_t out_wrapper);
 typedef uintptr_t(__fastcall *DollmanVoiceDelayScheduleFn)(
     uintptr_t instance,
     int controller_index);
@@ -99,6 +123,10 @@ static volatile LONG g_core_shutting_down = 0;
 static HANDLE g_hotkey_thread_handle = NULL;
 
 static PostEventIdFn g_real_post_event_id = NULL;
+static SoundInstanceSubmitFn g_real_sound_instance_submit = NULL;
+static SoundInstancePlayFn g_real_sound_instance_play = NULL;
+static AudioOwnerGetVariantResourceFn g_real_audio_owner_get_variant_resource = NULL;
+static StartTalkGetOrCreateSoundWrapperFn g_real_start_talk_get_or_create_sound_wrapper = NULL;
 static DollmanVoiceDelayScheduleFn g_real_dollman_voice_delay_schedule = NULL;
 static VoiceSharedHelperFn g_real_voice_shared_helper = NULL;
 static VoiceQueueSubmitFn g_real_voice_queue_submit = NULL;
@@ -149,6 +177,26 @@ static BOOL g_stf_probe_lock_inited = FALSE;
 #define STF_PROBE_CACHE_MAX 256
 static uint64_t g_stf_probe_cache[STF_PROBE_CACHE_MAX];
 static int g_stf_probe_cache_count = 0;
+#define DOLLMAN_STARTTALK_SOUND_CACHE_MAX 128
+#define DOLLMAN_STARTTALK_CACHE_TTL_MS 10000ull
+typedef struct DollmanStartTalkSoundMark {
+    uintptr_t sound;
+    uintptr_t line;
+    uintptr_t voice;
+    BOOL should_mute;
+    ULONGLONG seen_ms;
+} DollmanStartTalkSoundMark;
+typedef struct DollmanStartTalkInstanceMark {
+    uintptr_t sound_instance;
+    uintptr_t sound_resource;
+    BOOL should_mute;
+    ULONGLONG seen_ms;
+} DollmanStartTalkInstanceMark;
+static DollmanStartTalkSoundMark g_dollman_starttalk_sounds[DOLLMAN_STARTTALK_SOUND_CACHE_MAX];
+static DollmanStartTalkInstanceMark g_dollman_starttalk_instances[DOLLMAN_STARTTALK_SOUND_CACHE_MAX];
+static volatile LONG g_dollman_starttalk_sound_cursor = 0;
+static volatile LONG g_dollman_starttalk_instance_cursor = 0;
+static volatile LONG g_starttalk_bridge_sample_hits = 0;
 static volatile LONG64 g_stf_probe_window_until_ms = 0;
 static CRITICAL_SECTION g_hotkey_lock;
 static BOOL g_hotkey_lock_inited = FALSE;
@@ -189,6 +237,10 @@ static const uintptr_t k_rva_voice_queue_submit = 0x00DACE30u;
 static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DACDB1u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DAB084u;
 static const uintptr_t k_rva_voice_queue_dispatcher_forward_return = 0x00DAC69Au;
+static const uintptr_t k_rva_sound_instance_play = 0x0269D790u;
+static const uintptr_t k_rva_sound_instance_submit = 0x026B8410u;
+static const uintptr_t k_rva_audio_owner_get_variant_resource = 0x0028E6F0u;
+static const uintptr_t k_rva_start_talk_get_or_create_sound_wrapper = 0x00387FB0u;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780B40u;
 static const uintptr_t k_rva_show_subtitle = 0x00780BF0u;
 static const uintptr_t k_rva_remove_subtitle = 0x00780CF0u;
@@ -353,6 +405,11 @@ static uintptr_t get_return_address_value(void);
 static BOOL is_stf_probe_window_open(void);
 static void reset_stf_probe_cache(void);
 static BOOL stf_probe_seen_or_mark(uint64_t key);
+static void reset_dollman_starttalk_sound_cache(void);
+static void note_dollman_starttalk_sound(uintptr_t sound, uintptr_t line, uintptr_t voice, BOOL should_mute);
+static BOOL is_recent_dollman_starttalk_sound(uintptr_t ptr, BOOL should_mute, ULONGLONG now_ms, ULONGLONG *delta_ms_out);
+static void note_dollman_starttalk_instance(uintptr_t sound_instance, uintptr_t sound_resource, BOOL should_mute);
+static BOOL is_recent_dollman_starttalk_instance(uintptr_t ptr, BOOL should_mute, ULONGLONG now_ms, ULONGLONG *delta_ms_out);
 static void reset_builder_hit_counts(void);
 static void reset_strategy_stats(void);
 static void reset_hotkey_runtime_state(void);
@@ -774,6 +831,102 @@ static BOOL stf_probe_seen_or_mark(uint64_t key)
     LeaveCriticalSection(&g_stf_probe_lock);
 
     return seen;
+}
+
+static void reset_dollman_starttalk_sound_cache(void)
+{
+    ZeroMemory(g_dollman_starttalk_sounds, sizeof(g_dollman_starttalk_sounds));
+    ZeroMemory(g_dollman_starttalk_instances, sizeof(g_dollman_starttalk_instances));
+    InterlockedExchange(&g_dollman_starttalk_sound_cursor, 0);
+    InterlockedExchange(&g_dollman_starttalk_instance_cursor, 0);
+    InterlockedExchange(&g_starttalk_bridge_sample_hits, 0);
+}
+
+static void note_dollman_starttalk_sound(uintptr_t sound, uintptr_t line, uintptr_t voice, BOOL should_mute)
+{
+    LONG slot;
+
+    if (sound == 0) {
+        return;
+    }
+
+    slot = InterlockedIncrement(&g_dollman_starttalk_sound_cursor);
+    slot = (slot - 1) % DOLLMAN_STARTTALK_SOUND_CACHE_MAX;
+    g_dollman_starttalk_sounds[slot].sound = sound;
+    g_dollman_starttalk_sounds[slot].line = line;
+    g_dollman_starttalk_sounds[slot].voice = voice;
+    g_dollman_starttalk_sounds[slot].should_mute = should_mute;
+    g_dollman_starttalk_sounds[slot].seen_ms = GetTickCount64();
+}
+
+static BOOL is_recent_dollman_starttalk_sound(uintptr_t ptr, BOOL should_mute, ULONGLONG now_ms, ULONGLONG *delta_ms_out)
+{
+    int i;
+
+    if (ptr == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < DOLLMAN_STARTTALK_SOUND_CACHE_MAX; ++i) {
+        ULONGLONG seen_ms = g_dollman_starttalk_sounds[i].seen_ms;
+        if (seen_ms == 0 ||
+            g_dollman_starttalk_sounds[i].sound != ptr ||
+            g_dollman_starttalk_sounds[i].should_mute != should_mute) {
+            continue;
+        }
+        if (now_ms < seen_ms || (now_ms - seen_ms) > DOLLMAN_STARTTALK_CACHE_TTL_MS) {
+            continue;
+        }
+        if (delta_ms_out != NULL) {
+            *delta_ms_out = now_ms - seen_ms;
+        }
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void note_dollman_starttalk_instance(uintptr_t sound_instance, uintptr_t sound_resource, BOOL should_mute)
+{
+    LONG slot;
+
+    if (sound_instance == 0) {
+        return;
+    }
+
+    slot = InterlockedIncrement(&g_dollman_starttalk_instance_cursor);
+    slot = (slot - 1) % DOLLMAN_STARTTALK_SOUND_CACHE_MAX;
+    g_dollman_starttalk_instances[slot].sound_instance = sound_instance;
+    g_dollman_starttalk_instances[slot].sound_resource = sound_resource;
+    g_dollman_starttalk_instances[slot].should_mute = should_mute;
+    g_dollman_starttalk_instances[slot].seen_ms = GetTickCount64();
+}
+
+static BOOL is_recent_dollman_starttalk_instance(uintptr_t ptr, BOOL should_mute, ULONGLONG now_ms, ULONGLONG *delta_ms_out)
+{
+    int i;
+
+    if (ptr == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < DOLLMAN_STARTTALK_SOUND_CACHE_MAX; ++i) {
+        ULONGLONG seen_ms = g_dollman_starttalk_instances[i].seen_ms;
+        if (seen_ms == 0 ||
+            g_dollman_starttalk_instances[i].sound_instance != ptr ||
+            g_dollman_starttalk_instances[i].should_mute != should_mute) {
+            continue;
+        }
+        if (now_ms < seen_ms || (now_ms - seen_ms) > DOLLMAN_STARTTALK_CACHE_TTL_MS) {
+            continue;
+        }
+        if (delta_ms_out != NULL) {
+            *delta_ms_out = now_ms - seen_ms;
+        }
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva)
@@ -1377,7 +1530,7 @@ static BOOL process_subtitle_payload(
     }
 
     hit_index = InterlockedIncrement(&g_subtitle_runtime_hits);
-    if (hit_index <= 24) {
+    if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && hit_index <= 24) {
         log_line(
             "SubtitleHit surface=%s caller_rva=0x%llx speaker_ok=%d speaker_tag=0x%x line_ok=%d line_tag=0x%x family=%s builder=%s",
             surface != NULL ? surface : "?",
@@ -1624,6 +1777,573 @@ static BOOL install_rva_hook(uintptr_t rva, void *detour, void **original, const
     return install_hook(resolve_rva(rva), detour, original, label);
 }
 
+static BOOL is_known_dollman_audio_event(AkUniqueID event_id)
+{
+    return event_id == k_event_id_dollman_equip ||
+           event_id == k_event_id_dollman_throw ||
+           event_id == k_event_id_dollman_recall ||
+           event_id == k_event_id_dollman_fall_chatter;
+}
+
+static BOOL is_dollman_voice_resource(uintptr_t voice, uint32_t *speaker_tag_out, char *speaker_text, size_t speaker_text_size)
+{
+    static const unsigned int k_voice_speaker_offsets[] = {0x28u, 0x30u, 0x38u, 0x40u, 0x48u};
+    size_t i;
+
+    if (speaker_tag_out != NULL) {
+        *speaker_tag_out = 0;
+    }
+    if (speaker_text != NULL && speaker_text_size > 0) {
+        speaker_text[0] = '\0';
+    }
+
+    for (i = 0; i < sizeof(k_voice_speaker_offsets) / sizeof(k_voice_speaker_offsets[0]); ++i) {
+        uintptr_t text_ref = safe_read_ptr(voice + k_voice_speaker_offsets[i]);
+        uint32_t tag = 0;
+        char text[96];
+        BOOL ok;
+
+        ZeroMemory(text, sizeof(text));
+        ok = read_localized_text_resource(text_ref, &tag, text, sizeof(text));
+        if (!ok) {
+            continue;
+        }
+
+        if (tag == k_dollman_gameplay_speaker_tag || strcmp(text, "Dollman") == 0) {
+            if (speaker_tag_out != NULL) {
+                *speaker_tag_out = tag;
+            }
+            if (speaker_text != NULL && speaker_text_size > 0) {
+                snprintf(speaker_text, speaker_text_size, "%s", text);
+            }
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static uintptr_t __fastcall hook_start_talk_get_or_create_sound_wrapper(uintptr_t starttalk, uintptr_t out_wrapper)
+{
+    uintptr_t caller = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller > g_image_base)
+        ? (caller - g_image_base)
+        : 0;
+    uintptr_t slot = safe_read_ptr(starttalk + 0xC8);
+    uintptr_t line = safe_read_ptr(slot + 0x0);
+    uintptr_t sound = safe_read_ptr(line + 0x38);
+    uintptr_t voice_fallback = safe_read_ptr(line + 0x50);
+    uintptr_t voice_preferred = safe_read_ptr(line + 0x58);
+    uint32_t starttalk_flags = safe_read_u32(starttalk + 0x68);
+    uint32_t dollman_speaker_tag = 0;
+    char dollman_speaker_text[96];
+    uint32_t fallback_speaker_tag = 0;
+    uint32_t preferred_speaker_tag = 0;
+    char fallback_speaker_text[96];
+    char preferred_speaker_text[96];
+    BOOL fallback_is_dollman;
+    BOOL preferred_is_dollman;
+    BOOL interesting;
+    uintptr_t selected_voice = 0;
+    LONG sample_hit = InterlockedIncrement(&g_starttalk_bridge_sample_hits);
+
+    ZeroMemory(dollman_speaker_text, sizeof(dollman_speaker_text));
+    ZeroMemory(fallback_speaker_text, sizeof(fallback_speaker_text));
+    ZeroMemory(preferred_speaker_text, sizeof(preferred_speaker_text));
+
+    fallback_is_dollman = is_dollman_voice_resource(
+        voice_fallback,
+        &fallback_speaker_tag,
+        fallback_speaker_text,
+        sizeof(fallback_speaker_text));
+    preferred_is_dollman = is_dollman_voice_resource(
+        voice_preferred,
+        &preferred_speaker_tag,
+        preferred_speaker_text,
+        sizeof(preferred_speaker_text));
+    interesting = fallback_is_dollman || preferred_is_dollman;
+
+    if (preferred_is_dollman) {
+        selected_voice = voice_preferred;
+        dollman_speaker_tag = preferred_speaker_tag;
+        snprintf(dollman_speaker_text, sizeof(dollman_speaker_text), "%s", preferred_speaker_text);
+    } else if (fallback_is_dollman) {
+        selected_voice = voice_fallback;
+        dollman_speaker_tag = fallback_speaker_tag;
+        snprintf(dollman_speaker_text, sizeof(dollman_speaker_text), "%s", fallback_speaker_text);
+    } else if (voice_preferred != 0) {
+        selected_voice = voice_preferred;
+    } else {
+        selected_voice = voice_fallback;
+    }
+
+    if (interesting) {
+        uint64_t dedupe_key =
+            ((uint64_t)starttalk >> 4) ^
+            ((uint64_t)line << 5) ^
+            ((uint64_t)sound >> 7) ^
+            ((uint64_t)selected_voice << 11) ^
+            0x5354575241505045ull;
+
+        if (fallback_is_dollman || preferred_is_dollman) {
+            BOOL should_mute = starttalk_flags == 0u;
+            uintptr_t body = safe_read_ptr(line + 0x48);
+            uint32_t body_tag = 0;
+            char body_text[160];
+            BOOL body_ok;
+
+            ZeroMemory(body_text, sizeof(body_text));
+            body_ok = read_localized_text_resource(body, &body_tag, body_text, sizeof(body_text));
+            note_dollman_starttalk_sound(sound, line, selected_voice, should_mute);
+            log_line(
+                "DollmanStartTalkCandidate mute=%d flags=0x%x caller_rva=0x%llx line=0x%llx sound=0x%llx voice=0x%llx speaker_tag=0x%x speaker_text=\"%s\" body_ok=%d body_tag=0x%x body_text=\"%s\"",
+                should_mute ? 1 : 0,
+                (unsigned int)starttalk_flags,
+                (unsigned long long)caller_rva,
+                (unsigned long long)line,
+                (unsigned long long)sound,
+                (unsigned long long)selected_voice,
+                (unsigned int)dollman_speaker_tag,
+                dollman_speaker_text,
+                body_ok ? 1 : 0,
+                (unsigned int)body_tag,
+                body_text);
+        }
+
+        if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && !stf_probe_seen_or_mark(dedupe_key)) {
+            uintptr_t body = safe_read_ptr(line + 0x48);
+            uint32_t entry_count = safe_read_u32(starttalk + 0x78);
+            uintptr_t entry_data = safe_read_ptr(starttalk + 0x80);
+            uintptr_t inline_slot = starttalk + 0x98;
+            uintptr_t slot_delta = (slot >= inline_slot && slot < starttalk + 0xC0)
+                ? (slot - inline_slot)
+                : 0;
+            uint32_t body_tag = 0;
+            char body_text[160];
+            BOOL body_ok;
+            uintptr_t selected_voice_vtbl = safe_read_ptr(selected_voice + 0x0);
+            uintptr_t selected_voice_refs[5];
+            uint32_t selected_voice_tags[5];
+            char selected_voice_texts[5][96];
+            BOOL selected_voice_oks[5];
+            static const unsigned int k_voice_offsets[] = {0x28u, 0x30u, 0x38u, 0x40u, 0x48u};
+            size_t i;
+
+            ZeroMemory(body_text, sizeof(body_text));
+            ZeroMemory(selected_voice_refs, sizeof(selected_voice_refs));
+            ZeroMemory(selected_voice_tags, sizeof(selected_voice_tags));
+            ZeroMemory(selected_voice_texts, sizeof(selected_voice_texts));
+            ZeroMemory(selected_voice_oks, sizeof(selected_voice_oks));
+            body_ok = read_localized_text_resource(body, &body_tag, body_text, sizeof(body_text));
+            if (selected_voice != 0) {
+                for (i = 0; i < sizeof(k_voice_offsets) / sizeof(k_voice_offsets[0]); ++i) {
+                    selected_voice_refs[i] = safe_read_ptr(selected_voice + k_voice_offsets[i]);
+                    selected_voice_oks[i] = read_localized_text_resource(
+                        selected_voice_refs[i],
+                        &selected_voice_tags[i],
+                        selected_voice_texts[i],
+                        sizeof(selected_voice_texts[i]));
+                }
+            }
+
+            log_line(
+                "[starttalk-sound-wrapper] sample=%ld caller_rva=0x%llx starttalk=0x%llx out=0x%llx "
+                "flags=0x%x entry_count=%u entry_data=0x%llx inline_slot=0x%llx slot_delta=0x%llx "
+                "slot=0x%llx line=0x%llx sound=0x%llx body=0x%llx body_ok=%d body_tag=0x%x body_text=\"%s\" "
+                "voice_fallback=0x%llx voice_preferred=0x%llx selected_voice=0x%llx selected_voice_vtbl=0x%llx "
+                "fallback_dollman=%d preferred_dollman=%d speaker_tag=0x%x speaker_text=\"%s\" "
+                "v28=0x%llx ok28=%d tag28=0x%x text28=\"%s\" "
+                "v30=0x%llx ok30=%d tag30=0x%x text30=\"%s\" "
+                "v38=0x%llx ok38=%d tag38=0x%x text38=\"%s\" "
+                "v40=0x%llx ok40=%d tag40=0x%x text40=\"%s\" "
+                "v48=0x%llx ok48=%d tag48=0x%x text48=\"%s\"",
+                (long)sample_hit,
+                (unsigned long long)caller_rva,
+                (unsigned long long)starttalk,
+                (unsigned long long)out_wrapper,
+                (unsigned int)starttalk_flags,
+                (unsigned int)entry_count,
+                (unsigned long long)entry_data,
+                (unsigned long long)inline_slot,
+                (unsigned long long)slot_delta,
+                (unsigned long long)slot,
+                (unsigned long long)line,
+                (unsigned long long)sound,
+                (unsigned long long)body,
+                body_ok ? 1 : 0,
+                (unsigned int)body_tag,
+                body_text,
+                (unsigned long long)voice_fallback,
+                (unsigned long long)voice_preferred,
+                (unsigned long long)selected_voice,
+                (unsigned long long)selected_voice_vtbl,
+                fallback_is_dollman ? 1 : 0,
+                preferred_is_dollman ? 1 : 0,
+                (unsigned int)dollman_speaker_tag,
+                dollman_speaker_text,
+                (unsigned long long)selected_voice_refs[0],
+                selected_voice_oks[0] ? 1 : 0,
+                (unsigned int)selected_voice_tags[0],
+                selected_voice_texts[0],
+                (unsigned long long)selected_voice_refs[1],
+                selected_voice_oks[1] ? 1 : 0,
+                (unsigned int)selected_voice_tags[1],
+                selected_voice_texts[1],
+                (unsigned long long)selected_voice_refs[2],
+                selected_voice_oks[2] ? 1 : 0,
+                (unsigned int)selected_voice_tags[2],
+                selected_voice_texts[2],
+                (unsigned long long)selected_voice_refs[3],
+                selected_voice_oks[3] ? 1 : 0,
+                (unsigned int)selected_voice_tags[3],
+                selected_voice_texts[3],
+                (unsigned long long)selected_voice_refs[4],
+                selected_voice_oks[4] ? 1 : 0,
+                (unsigned int)selected_voice_tags[4],
+                selected_voice_texts[4]);
+        }
+    }
+
+    if (g_real_start_talk_get_or_create_sound_wrapper == NULL) {
+        return out_wrapper;
+    }
+    return g_real_start_talk_get_or_create_sound_wrapper(starttalk, out_wrapper);
+}
+
+static uintptr_t __fastcall hook_audio_owner_get_variant_resource(uintptr_t owner)
+{
+    uintptr_t voice = 0;
+    AkUniqueID owner_event = safe_read_u32(owner + 0xD8);
+    uint32_t owner_tag = safe_read_u32(owner + 0x0C);
+    uint32_t owner_bc = safe_read_u32(owner + 0xBC);
+    uintptr_t caller = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller > g_image_base)
+        ? (caller - g_image_base)
+        : 0;
+    ULONGLONG now_ms = GetTickCount64();
+    ULONGLONG dollman_delta_ms = 0;
+    BOOL recent_dollman_subtitle =
+        get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
+    BOOL interesting =
+        is_known_dollman_audio_event(owner_event) ||
+        recent_dollman_subtitle;
+
+    if (g_real_audio_owner_get_variant_resource != NULL) {
+        voice = g_real_audio_owner_get_variant_resource(owner);
+    }
+
+    if (interesting) {
+        uintptr_t owner_vtbl = safe_read_ptr(owner + 0x0);
+        uintptr_t voice_vtbl = safe_read_ptr(voice + 0x0);
+        uint32_t voice_20 = safe_read_u32(voice + 0x20);
+        uint32_t voice_24 = safe_read_u32(voice + 0x24);
+        uint64_t voice_08 = safe_read_u64(voice + 0x08);
+        uint64_t voice_10 = safe_read_u64(voice + 0x10);
+        uint64_t voice_18 = safe_read_u64(voice + 0x18);
+        uint64_t voice_28 = safe_read_u64(voice + 0x28);
+        uint64_t voice_30 = safe_read_u64(voice + 0x30);
+        uint64_t voice_38 = safe_read_u64(voice + 0x38);
+        uintptr_t owner_line_170 = owner + 0x170;
+        uintptr_t owner_line_3e0 = owner + 0x3E0;
+        uint32_t owner_line_170_tag = 0;
+        uint32_t owner_line_3e0_tag = 0;
+        char owner_line_170_text[96];
+        char owner_line_3e0_text[96];
+        BOOL owner_line_170_ok;
+        BOOL owner_line_3e0_ok;
+        uint64_t dedupe_key =
+            ((uint64_t)owner_event) ^
+            ((uint64_t)owner << 7) ^
+            ((uint64_t)voice >> 3) ^
+            ((uint64_t)caller_rva << 29) ^
+            0x564F494345524553ull;
+
+        ZeroMemory(owner_line_170_text, sizeof(owner_line_170_text));
+        ZeroMemory(owner_line_3e0_text, sizeof(owner_line_3e0_text));
+        owner_line_170_ok = read_localized_text_resource(
+            owner_line_170,
+            &owner_line_170_tag,
+            owner_line_170_text,
+            sizeof(owner_line_170_text));
+        owner_line_3e0_ok = read_localized_text_resource(
+            owner_line_3e0,
+            &owner_line_3e0_tag,
+            owner_line_3e0_text,
+            sizeof(owner_line_3e0_text));
+
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            log_line(
+                "[audio-owner-voice] caller_rva=0x%llx owner=0x%llx owner_vtbl=0x%llx owner_event=%u "
+                "owner_tag=0x%x owner_bc=0x%x voice=0x%llx voice_vtbl=0x%llx "
+                "voice08=0x%llx voice10=0x%llx voice18=0x%llx voice20=0x%x voice24=0x%x "
+                "voice28=0x%llx voice30=0x%llx voice38=0x%llx "
+                "line170_ok=%d line170_tag=0x%x line170_text=\"%s\" "
+                "line3e0_ok=%d line3e0_tag=0x%x line3e0_text=\"%s\" recent_dollman=%d deltaMs=%llu",
+                (unsigned long long)caller_rva,
+                (unsigned long long)owner,
+                (unsigned long long)owner_vtbl,
+                (unsigned int)owner_event,
+                (unsigned int)owner_tag,
+                (unsigned int)owner_bc,
+                (unsigned long long)voice,
+                (unsigned long long)voice_vtbl,
+                (unsigned long long)voice_08,
+                (unsigned long long)voice_10,
+                (unsigned long long)voice_18,
+                (unsigned int)voice_20,
+                (unsigned int)voice_24,
+                (unsigned long long)voice_28,
+                (unsigned long long)voice_30,
+                (unsigned long long)voice_38,
+                owner_line_170_ok ? 1 : 0,
+                (unsigned int)owner_line_170_tag,
+                owner_line_170_text,
+                owner_line_3e0_ok ? 1 : 0,
+                (unsigned int)owner_line_3e0_tag,
+                owner_line_3e0_text,
+                recent_dollman_subtitle ? 1 : 0,
+                (unsigned long long)dollman_delta_ms);
+        }
+    }
+
+    return voice;
+}
+
+static int __fastcall hook_sound_instance_play(
+    uintptr_t sound_instance,
+    uint8_t play_mode,
+    uint8_t submit_mode,
+    uint32_t fade_ms)
+{
+    uintptr_t caller = get_return_address_value();
+    uintptr_t caller_rva = (g_image_base != 0 && caller > g_image_base)
+        ? (caller - g_image_base)
+        : 0;
+    uintptr_t p178 = safe_read_ptr(sound_instance + 0x178);
+    uintptr_t p178_0 = safe_read_ptr(p178 + 0x0);
+    uint64_t p178_8 = safe_read_u64(p178 + 0x8);
+    uintptr_t owner = safe_read_ptr(p178_0 + 0x20);
+    uintptr_t owner_vtbl = safe_read_ptr(owner + 0x0);
+    uint32_t owner_tag = safe_read_u32(owner + 0x0C);
+    uint32_t owner_bc = safe_read_u32(owner + 0xBC);
+    uint32_t owner_bd = safe_read_u32(owner + 0xBC) >> 8;
+    AkUniqueID owner_event = safe_read_u32(owner + 0xD8);
+    uint32_t flags180 = safe_read_u32(sound_instance + 0x180);
+    uint32_t flags330 = safe_read_u32(sound_instance + 0x330);
+    ULONGLONG now_ms = GetTickCount64();
+    ULONGLONG dollman_delta_ms = 0;
+    ULONGLONG starttalk_sound_delta_ms = 0;
+    BOOL recent_dollman_subtitle =
+        get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
+    BOOL starttalk_sound_match =
+        is_recent_dollman_starttalk_sound(owner, TRUE, now_ms, &starttalk_sound_delta_ms) ||
+        is_recent_dollman_starttalk_sound(p178_0, TRUE, now_ms, &starttalk_sound_delta_ms);
+    BOOL interesting =
+        is_known_dollman_audio_event(owner_event) ||
+        recent_dollman_subtitle ||
+        starttalk_sound_match;
+
+    if (interesting) {
+        uint64_t dedupe_key =
+            ((uint64_t)owner_event) ^
+            ((uint64_t)sound_instance >> 3) ^
+            ((uint64_t)owner << 9) ^
+            ((uint64_t)caller_rva << 17) ^
+            0x534E44504C41594Full;
+
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            log_line(
+                "[sound-instance-play] caller_rva=0x%llx sound=0x%llx play_mode=0x%x submit_mode=0x%x fade_ms=%u "
+                "p178=0x%llx p178_0=0x%llx p178_8=0x%llx owner=0x%llx owner_vtbl=0x%llx "
+                "owner_tag=0x%x owner_bc=0x%x owner_bd=0x%x owner_event=%u flags180=0x%x flags330=0x%x "
+                "recent_dollman=%d deltaMs=%llu starttalk_sound_match=%d starttalkDeltaMs=%llu",
+                (unsigned long long)caller_rva,
+                (unsigned long long)sound_instance,
+                (unsigned int)play_mode,
+                (unsigned int)submit_mode,
+                (unsigned int)fade_ms,
+                (unsigned long long)p178,
+                (unsigned long long)p178_0,
+                (unsigned long long)p178_8,
+                (unsigned long long)owner,
+                (unsigned long long)owner_vtbl,
+                (unsigned int)owner_tag,
+                (unsigned int)owner_bc,
+                (unsigned int)(owner_bd & 0xFFu),
+                (unsigned int)owner_event,
+                (unsigned int)flags180,
+                (unsigned int)flags330,
+                recent_dollman_subtitle ? 1 : 0,
+                (unsigned long long)dollman_delta_ms,
+                starttalk_sound_match ? 1 : 0,
+                (unsigned long long)starttalk_sound_delta_ms);
+        }
+    }
+
+    return g_real_sound_instance_play(
+        sound_instance,
+        play_mode,
+        submit_mode,
+        fade_ms);
+}
+
+static int __fastcall hook_sound_instance_submit(
+    AkUniqueID event_id,
+    uintptr_t sound_instance,
+    uint8_t a3,
+    uint8_t a4,
+    uintptr_t s0,
+    uintptr_t s1,
+    uintptr_t s2,
+    uintptr_t s3,
+    uintptr_t s4,
+    uintptr_t s5,
+    uintptr_t s6,
+    uintptr_t s7,
+    uintptr_t s8,
+    uintptr_t s9)
+{
+    ULONGLONG now_ms = GetTickCount64();
+    ULONGLONG starttalk_sound_delta_ms = 0;
+    uintptr_t p178 = safe_read_ptr(sound_instance + 0x178);
+    uintptr_t p178_0 = safe_read_ptr(p178 + 0x0);
+    uintptr_t owner = safe_read_ptr(p178_0 + 0x20);
+    BOOL starttalk_sound_match =
+        is_recent_dollman_starttalk_sound(owner, TRUE, now_ms, &starttalk_sound_delta_ms) ||
+        is_recent_dollman_starttalk_sound(p178_0, TRUE, now_ms, &starttalk_sound_delta_ms);
+    BOOL starttalk_sound_bypass =
+        is_recent_dollman_starttalk_sound(owner, FALSE, now_ms, NULL) ||
+        is_recent_dollman_starttalk_sound(p178_0, FALSE, now_ms, NULL);
+
+    if (starttalk_sound_match) {
+        note_dollman_starttalk_instance(sound_instance, owner, TRUE);
+        log_line(
+            "DollmanStartTalkBound mute=1 eventId=%u soundInstance=0x%llx owner=0x%llx p178_0=0x%llx deltaMs=%llu",
+            (unsigned int)event_id,
+            (unsigned long long)sound_instance,
+            (unsigned long long)owner,
+            (unsigned long long)p178_0,
+            (unsigned long long)starttalk_sound_delta_ms);
+    } else if (starttalk_sound_bypass) {
+        note_dollman_starttalk_instance(sound_instance, owner, FALSE);
+        log_line(
+            "DollmanStartTalkBound mute=0 eventId=%u soundInstance=0x%llx owner=0x%llx p178_0=0x%llx",
+            (unsigned int)event_id,
+            (unsigned long long)sound_instance,
+            (unsigned long long)owner,
+            (unsigned long long)p178_0);
+    }
+
+    if (g_cfg.verbose_log || g_cfg.enable_deep_probe) {
+        uint32_t external_source_count = (uint32_t)s8;
+        uintptr_t ext_ptr = s9;
+        uint64_t ext0 = safe_read_u64(ext_ptr + 0x0);
+        uint64_t ext1 = safe_read_u64(ext_ptr + 0x8);
+        uint64_t ext2 = safe_read_u64(ext_ptr + 0x10);
+        uint64_t ext3 = safe_read_u64(ext_ptr + 0x18);
+        ULONGLONG dollman_delta_ms = 0;
+        BOOL recent_dollman_subtitle =
+            external_source_count == 1u &&
+            get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
+        BOOL interesting =
+            is_known_dollman_audio_event(event_id) ||
+            event_id == k_event_id_dowser_gameplay_chatter ||
+            recent_dollman_subtitle ||
+            starttalk_sound_match;
+
+        if (interesting) {
+        uintptr_t inst_vtbl = safe_read_ptr(sound_instance + 0x0);
+        uint64_t p178_8 = safe_read_u64(p178 + 0x8);
+        uintptr_t owner_vtbl = safe_read_ptr(owner + 0x0);
+        uint32_t owner_tag = safe_read_u32(owner + 0x0C);
+        uintptr_t owner_line = owner + 0x3E0;
+        uintptr_t owner_line_vtbl = safe_read_ptr(owner_line + 0x0);
+        uint32_t owner_line_tag = 0;
+        char owner_line_text[160];
+        BOOL owner_line_ok;
+        uint32_t flags60 = safe_read_u32(sound_instance + 0x60);
+        uint32_t flags184 = safe_read_u32(sound_instance + 0x184);
+        uint32_t slot_count = safe_read_u32(sound_instance + 0x250);
+        uintptr_t slot_ptr = safe_read_ptr(sound_instance + 0x258);
+        uint32_t owner_bc = safe_read_u32(owner + 0xBC);
+        uint64_t dedupe_key =
+            ((uint64_t)event_id) ^
+            ((uint64_t)sound_instance >> 3) ^
+            ((uint64_t)owner << 7) ^
+            ((uint64_t)ext0 << 11) ^
+            0x534E44494E535455ull;
+
+        ZeroMemory(owner_line_text, sizeof(owner_line_text));
+        owner_line_ok = read_localized_text_resource(
+            owner_line,
+            &owner_line_tag,
+            owner_line_text,
+            sizeof(owner_line_text));
+
+        if (!stf_probe_seen_or_mark(dedupe_key)) {
+            log_line(
+                "[sound-instance-submit] eventId=%u sound=0x%llx inst_vtbl=0x%llx a3=0x%x a4=0x%x "
+                "extCount=%u ext_ptr=0x%llx ext0=0x%llx ext1=0x%llx ext2=0x%llx ext3=0x%llx flags60=0x%x flags184=0x%x "
+                "p178=0x%llx p178_0=0x%llx p178_8=0x%llx owner=0x%llx owner_vtbl=0x%llx owner_tag=0x%x owner_bc=0x%x "
+                "owner_line=0x%llx owner_line_vtbl=0x%llx owner_line_ok=%d owner_line_tag=0x%x owner_line_text=\"%s\" "
+                "recent_dollman=%d deltaMs=%llu starttalk_sound_match=%d starttalkDeltaMs=%llu "
+                "slot_count=%u slot_ptr=0x%llx s0=0x%llx s1=0x%llx s2=0x%llx s3=0x%llx",
+                (unsigned int)event_id,
+                (unsigned long long)sound_instance,
+                (unsigned long long)inst_vtbl,
+                (unsigned int)a3,
+                (unsigned int)a4,
+                (unsigned int)external_source_count,
+                (unsigned long long)ext_ptr,
+                (unsigned long long)ext0,
+                (unsigned long long)ext1,
+                (unsigned long long)ext2,
+                (unsigned long long)ext3,
+                (unsigned int)flags60,
+                (unsigned int)flags184,
+                (unsigned long long)p178,
+                (unsigned long long)p178_0,
+                (unsigned long long)p178_8,
+                (unsigned long long)owner,
+                (unsigned long long)owner_vtbl,
+                (unsigned int)owner_tag,
+                (unsigned int)owner_bc,
+                (unsigned long long)owner_line,
+                (unsigned long long)owner_line_vtbl,
+                owner_line_ok ? 1 : 0,
+                (unsigned int)owner_line_tag,
+                owner_line_text,
+                recent_dollman_subtitle ? 1 : 0,
+                (unsigned long long)dollman_delta_ms,
+                starttalk_sound_match ? 1 : 0,
+                (unsigned long long)starttalk_sound_delta_ms,
+                (unsigned int)slot_count,
+                (unsigned long long)slot_ptr,
+                (unsigned long long)s0,
+                (unsigned long long)s1,
+                (unsigned long long)s2,
+                (unsigned long long)s3);
+        }
+        }
+    }
+
+    return g_real_sound_instance_submit(
+        event_id,
+        sound_instance,
+        a3,
+        a4,
+        s0,
+        s1,
+        s2,
+        s3,
+        s4,
+        s5,
+        s6,
+        s7,
+        s8,
+        s9);
+}
+
 static BOOL patch_pointer_slot(
     uintptr_t slot_rva,
     void *replacement,
@@ -1718,48 +2438,65 @@ static AkPlayingID __cdecl hook_post_event_id(
          is_sender_only_dollman_radio_mute_enabled());
     BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
     BOOL blocked_sender_only = FALSE;
-    BOOL blocked_recent_subtitle = FALSE;
+    BOOL blocked_starttalk_speaker = FALSE;
+    BOOL bypass_starttalk_speaker = FALSE;
     BOOL blocked = FALSE;
     BOOL dowser_event_match = FALSE;
     BOOL dowser_ext_match = FALSE;
     BOOL dowser_recent = FALSE;
     const char *block_mode = "none";
-    uintptr_t caller_ra = get_return_address_value();
-    uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
-        ? (caller_ra - g_image_base)
-        : 0;
     uintptr_t ext_ptr = (uintptr_t)external_sources;
     uint64_t ext0 = safe_read_u64(ext_ptr + 0x0);
-    uint64_t ext1 = safe_read_u64(ext_ptr + 0x8);
-    uint64_t ext2 = safe_read_u64(ext_ptr + 0x10);
-    uint64_t ext3 = safe_read_u64(ext_ptr + 0x18);
     uint64_t dedupe_key = 0;
     ULONGLONG dowser_delta_ms = 0;
-    ULONGLONG dollman_delta_ms = 0;
+    ULONGLONG starttalk_delta_ms = 0;
     ULONGLONG now_ms = GetTickCount64();
 
+    bypass_starttalk_speaker =
+        g_cfg.enabled &&
+        is_sender_only_dollman_radio_mute_enabled() &&
+        external_source_count == 1u &&
+        is_recent_dollman_starttalk_instance(
+            (uintptr_t)game_object_id,
+            FALSE,
+            now_ms,
+            NULL);
+    blocked_starttalk_speaker =
+        g_cfg.enabled &&
+        is_sender_only_dollman_radio_mute_enabled() &&
+        external_source_count == 1u &&
+        !bypass_starttalk_speaker &&
+        is_recent_dollman_starttalk_instance(
+            (uintptr_t)game_object_id,
+            TRUE,
+            now_ms,
+            &starttalk_delta_ms);
     blocked_sender_only =
         g_cfg.enabled &&
+        !blocked_starttalk_speaker &&
+        !bypass_starttalk_speaker &&
         should_block_sender_only_event_id(
             event_id,
             external_source_count,
             ext0);
-    blocked_recent_subtitle =
-        g_cfg.enabled &&
-        is_sender_only_dollman_radio_mute_enabled() &&
-        external_source_count == 1u &&
-        !blocked_sender_only &&
-        get_recent_dollman_muted_subtitle_delta_ms(now_ms, &dollman_delta_ms);
-    blocked = blocked_legacy || blocked_sender_only || blocked_recent_subtitle;
+    blocked = blocked_legacy || blocked_sender_only || blocked_starttalk_speaker;
     if (blocked_sender_only) {
         block_mode = "sender-only-narrow";
-    } else if (blocked_recent_subtitle) {
-        block_mode = "sender-only-recent-subtitle";
+    } else if (blocked_starttalk_speaker) {
+        block_mode = "sender-only-starttalk-speaker";
     } else if (blocked_legacy) {
         block_mode = "legacy";
     }
 
     if (probe_enabled) {
+        uintptr_t caller_ra = get_return_address_value();
+        uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
+            ? (caller_ra - g_image_base)
+            : 0;
+        uint64_t ext1 = safe_read_u64(ext_ptr + 0x8);
+        uint64_t ext2 = safe_read_u64(ext_ptr + 0x10);
+        uint64_t ext3 = safe_read_u64(ext_ptr + 0x18);
+
         dedupe_key = ((uint64_t)event_id) ^
                      (((uint64_t)caller_rva) << 32) ^
                      (((uint64_t)(uint32_t)external_source_count) << 19) ^
@@ -1807,16 +2544,26 @@ static AkPlayingID __cdecl hook_post_event_id(
                 (unsigned long long)g_last_dowser_p7,
                 blocked ? 1 : 0);
         }
-        if (blocked_recent_subtitle) {
+        if (blocked_starttalk_speaker) {
             log_line(
-                "RecentDollmanSubtitlePostEvent caller_rva=0x%llx eventId=%u extCount=%u ext0=0x%llx ext1=0x%llx deltaMs=%llu line_tag=0x%x",
+                "StartTalkSpeakerPostEvent caller_rva=0x%llx eventId=%u extCount=%u ext0=0x%llx ext1=0x%llx deltaMs=%llu gameObject=0x%llx",
                 (unsigned long long)caller_rva,
                 (unsigned int)event_id,
                 (unsigned int)external_source_count,
                 (unsigned long long)ext0,
                 (unsigned long long)ext1,
-                (unsigned long long)dollman_delta_ms,
-                (unsigned int)g_last_dollman_muted_line_tag);
+                (unsigned long long)starttalk_delta_ms,
+                (unsigned long long)game_object_id);
+        }
+        if (bypass_starttalk_speaker) {
+            log_line(
+                "BypassStartTalkSpeakerPostEvent caller_rva=0x%llx eventId=%u extCount=%u ext0=0x%llx ext1=0x%llx gameObject=0x%llx",
+                (unsigned long long)caller_rva,
+                (unsigned int)event_id,
+                (unsigned int)external_source_count,
+                (unsigned long long)ext0,
+                (unsigned long long)ext1,
+                (unsigned long long)game_object_id);
         }
     }
 
@@ -1860,10 +2607,8 @@ static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
     uintptr_t instance,
     int controller_index)
 {
-    BOOL sender_only_block = is_sender_only_dollman_radio_mute_enabled();
-    BOOL legacy_block = is_legacy_dollman_radio_mute_enabled();
     BOOL probe_enabled =
-        (g_cfg.enable_deep_probe || sender_only_block) &&
+        g_cfg.enable_deep_probe &&
         is_stf_probe_window_open();
     uintptr_t caller_ra = get_return_address_value();
     uintptr_t caller_rva = (g_image_base != 0 && caller_ra > g_image_base)
@@ -1872,24 +2617,16 @@ static uintptr_t __fastcall hook_dollman_voice_delay_schedule(
 
     if (probe_enabled) {
         log_line(
-            "[voice-delay-schedule] tid=%lu caller_rva=0x%llx instance=%p controller=%d block=%d",
+            "[voice-delay-schedule] tid=%lu caller_rva=0x%llx instance=%p controller=%d pass_through=1",
             (unsigned long)GetCurrentThreadId(),
             (unsigned long long)caller_rva,
             (void *)instance,
-            controller_index,
-            (sender_only_block || legacy_block) ? 1 : 0);
+            controller_index);
     }
 
-    if (sender_only_block || legacy_block) {
-        log_line(
-            "Muted Dollman voice delay schedule mode=%s caller_rva=0x%llx instance=%p controller=%d",
-            sender_only_block ? "sender-only" : "legacy",
-            (unsigned long long)caller_rva,
-            (void *)instance,
-            controller_index);
+    if (g_real_dollman_voice_delay_schedule == NULL) {
         return 0;
     }
-
     return g_real_dollman_voice_delay_schedule(instance, controller_index);
 }
 
@@ -2155,16 +2892,12 @@ static uintptr_t __fastcall hook_voice_shared_helper(
 static void __fastcall hook_dollman_voice_delay_closure(void *closure_state)
 {
     log_dollman_voice_closure_probe(
-        is_sender_only_dollman_radio_mute_enabled() ? "mute" : "pass",
+        "pass",
         (uintptr_t)closure_state);
 
-    if (is_sender_only_dollman_radio_mute_enabled()) {
-        log_line(
-            "Muted Dollman voice closure state=%p",
-            closure_state);
+    if (g_real_dollman_voice_delay_closure == NULL) {
         return;
     }
-
     g_real_dollman_voice_delay_closure(closure_state);
 }
 
@@ -2324,7 +3057,7 @@ static uintptr_t __fastcall hook_remove_subtitle(uintptr_t view, const uint64_t 
                                : 0;
     LONG hit_index = InterlockedIncrement(&g_subtitle_remove_hits);
 
-    if (hit_index <= 24) {
+    if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && hit_index <= 24) {
         log_remove_subtitle_probe(caller_rva, key_pair, mode);
     }
 
@@ -3351,6 +4084,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     reset_strategy_stats();
     reset_hotkey_runtime_state();
     reset_session_probe_state();
+    reset_dollman_starttalk_sound_cache();
     reset_log_capture_state();
     seed_hotkey_state_from_config();
     g_active_subtitle_strategy = get_active_subtitle_strategy();
@@ -3363,14 +4097,9 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         !sender_only_runtime_mode &&
         g_cfg.enable_legacy_runtime_wrapper;
     need_deep_probe = g_cfg.enable_deep_probe;
-    need_voice_delay_schedule_hook =
-        effective_dollman_radio_mute ||
-        sender_only_dollman_voice_mute ||
-        need_deep_probe;
-    need_voice_dispatch_hook =
-        sender_only_dollman_voice_mute ||
-        need_deep_probe;
-    need_voice_closure_hook = sender_only_dollman_voice_mute || need_deep_probe;
+    need_voice_delay_schedule_hook = need_deep_probe;
+    need_voice_dispatch_hook = need_deep_probe;
+    need_voice_closure_hook = need_deep_probe;
 
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
@@ -3397,6 +4126,50 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         return 0;
     }
 
+    if (need_deep_probe) {
+        if (install_rva_hook(
+                k_rva_sound_instance_play,
+                hook_sound_instance_play,
+                (void **)&g_real_sound_instance_play,
+                "SoundInstancePlay.sub_140269D790")) {
+            ++hook_count;
+            log_line("Sound instance play probe active via sub_140269D790 (pass-through)");
+        }
+
+        if (install_rva_hook(
+                k_rva_audio_owner_get_variant_resource,
+                hook_audio_owner_get_variant_resource,
+                (void **)&g_real_audio_owner_get_variant_resource,
+                "AudioOwner.GetVariantResource.sub_14028E6F0")) {
+            ++hook_count;
+            log_line("Audio owner voice-resource probe active via sub_14028E6F0 (pass-through)");
+        }
+    } else {
+        log_line("Sound instance play/audio-owner probes disabled");
+    }
+
+    if (sender_only_dollman_voice_mute || need_deep_probe) {
+        if (install_rva_hook(
+                k_rva_start_talk_get_or_create_sound_wrapper,
+                hook_start_talk_get_or_create_sound_wrapper,
+                (void **)&g_real_start_talk_get_or_create_sound_wrapper,
+                "StartTalkFunction.GetOrCreateSoundWrapper.sub_140387FB0")) {
+            ++hook_count;
+            log_line("StartTalk sound-wrapper bridge probe active via sub_140387FB0 (pass-through)");
+        }
+
+        if (install_rva_hook(
+                k_rva_sound_instance_submit,
+                hook_sound_instance_submit,
+                (void **)&g_real_sound_instance_submit,
+                "SoundInstanceSubmit.sub_14026B8410")) {
+            ++hook_count;
+            log_line("Sound instance submit probe active via sub_14026B8410 (pass-through)");
+        }
+    } else {
+        log_line("Sound instance submit probe disabled");
+    }
+
     if (effective_dollman_radio_mute ||
         g_cfg.scanner_mode != SCANNER_MODE_OFF ||
         sender_only_dollman_voice_mute ||
@@ -3420,9 +4193,9 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "DollmanVoiceDelaySchedule.sub_140C73E80")) {
             ++hook_count;
             if (sender_only_dollman_voice_mute) {
-                log_line("Sender-only Dollman voice mute active via schedule.sub_140C73E80");
+                log_line("Dollman voice delay schedule probe active via sub_140C73E80 (pass-through)");
             } else if (effective_dollman_radio_mute) {
-                log_line("Legacy Dollman voice mute active via schedule.sub_140C73E80");
+                log_line("Legacy Dollman voice delay schedule probe active via sub_140C73E80 (pass-through)");
             }
         }
     } else {
@@ -3461,7 +4234,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 "DollmanVoiceDelayClosure.sub_140C73F30")) {
             ++hook_count;
             if (sender_only_dollman_voice_mute) {
-                log_line("Sender-only Dollman voice mute active via closure.sub_140C73F30");
+                log_line("Dollman voice closure probe active via sub_140C73F30 (pass-through)");
             }
         }
     } else {
@@ -3676,6 +4449,10 @@ __declspec(dllexport) void core_shutdown(void)
     }
 
     g_real_post_event_id = NULL;
+    g_real_sound_instance_submit = NULL;
+    g_real_sound_instance_play = NULL;
+    g_real_audio_owner_get_variant_resource = NULL;
+    g_real_start_talk_get_or_create_sound_wrapper = NULL;
     g_real_dollman_voice_delay_schedule = NULL;
     g_real_voice_shared_helper = NULL;
     g_real_voice_queue_submit = NULL;
@@ -3708,6 +4485,7 @@ __declspec(dllexport) void core_shutdown(void)
     g_image_base = 0;
     reset_session_probe_state();
     reset_hotkey_runtime_state();
+    reset_dollman_starttalk_sound_cache();
 
     log_line("core_shutdown complete");
 

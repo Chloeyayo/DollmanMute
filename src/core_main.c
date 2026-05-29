@@ -85,31 +85,6 @@ static uintptr_t g_image_base = 0;
 static uintptr_t g_image_size = 0;
 static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03455BD0u;
 
-static const char *classify_builder_c_msg(
-    uintptr_t msg_vtbl_rva,
-    uint64_t msg1,
-    uint64_t msg2,
-    uint64_t msg3)
-{
-    if (msg_vtbl_rva == 0x3117438) return "pass_vtbl_B";
-    if (msg_vtbl_rva != 0x3131e38) return "pass_vtbl_other";
-    if (g_image_base != 0 && (msg1 >> 32) == ((uint64_t)g_image_base >> 32)) {
-        return "pass_code_ra";
-    }
-    if (msg1 == 0 && msg3 == 0) return "pass_empty";
-    if (msg1 == 0xFFFFFF00ull) return "block_hazard";
-    if (msg2 == 0x3f99999aull) return "block_hazard_variant";
-    if (msg3 == 0xADull) return "block_pool_ad";
-    if ((msg2 & 0xFFFFFFFFull) == 0x3fc00000ull) return "block_pool_1p5";
-    if ((msg2 >> 32) == 2ull) return "block_chatter";
-    if ((msg2 & 0xFFFFFFFFull) == 0x40933333ull) return "block_chatter_4p6";
-    return "unknown";
-}
-static CRITICAL_SECTION g_identity_lock;
-static BOOL g_identity_lock_inited = FALSE;
-static uintptr_t g_identity_cache[PRODUCER_IDENTITY_CACHE_MAX];
-static int g_identity_cache_count = 0;
-static BOOL g_identity_cache_full_warned = FALSE;
 static CRITICAL_SECTION g_stf_probe_lock;
 static BOOL g_stf_probe_lock_inited = FALSE;
 #define STF_PROBE_CACHE_MAX 256
@@ -154,18 +129,15 @@ static uintptr_t g_last_dollman_muted_caller_rva = 0;
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
-/* Legacy broad audio hook names are kept for source continuity. On the current
- * v1.5 build, 0x00C73BF0 landed in a ThroughDollmanInstance teardown path, not
- * the live delay scheduler. For v1.6, the live Dollman delay scheduler is
- * 0x00C73E80 and the Dollman-only runtime voice closure is 0x00C73F30.
- * The old 0x00DAA410 "dispatcher" probe was a manager tick/update; the real
- * shared voice submit helper is 0x00DACCD0 in v1.6.
- * On v1.6 the Player-side path that calls the shared helper has been
- * refactored: it no longer flows through the v1.5 player closure (sub_140C73A60)
- * but through sub_140C743B0, where the call to sub_140DACCD0 sits at
- * 0x140C74438 (return RVA 0x00C7443D). The Dollman-side path still calls the
- * helper from sub_140C73F30; the call sits at 0x140C73FB9 (return 0x00C73FBE).
- * Verified by IDA xrefs to sub_140DACCD0 on the v1.6 image. */
+/* DS2 v1.8.81 RVAs for the StartTalk object chain. ACTIVE constants installed by
+ * core_init are listed individually where they are used (wrapper 0x388280, submit
+ * 0x26C1F60, show_subtitle 0x780FC0, remove_subtitle 0x7810C0) plus the
+ * PostEventID export and the LocalizedTextResource vtbl above. The constants in
+ * this block are RESOLVED-BUT-NOT-HOOKED deep-probe surface: verified
+ * structurally against the v1.8 image (see RESEARCH.md §11 and the v1.8 RVA
+ * memory map) and retained so re-enabling a probe does not require re-deriving
+ * offsets. They are referenced by k_rva_deep_probe_reference below so the build
+ * stays warning-free; wiring one into a hook means removing it from that list. */
 static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C78E10u;
 static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C78EC0u;
 static const uintptr_t k_rva_voice_shared_helper = 0x00DB4870u;
@@ -191,6 +163,32 @@ static const uintptr_t k_rva_start_talk_init = 0x00387980u;
 static const uintptr_t k_rva_selector_dispatch = 0x00DB7960u;
 static const uintptr_t k_rva_talk_dispatcher = 0x00385A30u;
 static const uintptr_t k_rva_gameplay_sink = 0u;
+
+/* Marks the resolved-but-not-hooked deep-probe RVAs above as intentionally
+ * retained v1.8 research data (keeps -Wall clean without discarding them). */
+static const uintptr_t *const k_rva_deep_probe_reference[] __attribute__((used)) = {
+    &k_rva_dollman_voice_delay_schedule,
+    &k_rva_dollman_voice_delay_closure,
+    &k_rva_voice_shared_helper,
+    &k_rva_voice_shared_helper_player_return,
+    &k_rva_voice_shared_helper_dollman_return,
+    &k_rva_voice_queue_submit,
+    &k_rva_voice_queue_shared_helper_return,
+    &k_rva_voice_queue_dispatcher_synth_return,
+    &k_rva_voice_queue_dispatcher_forward_return,
+    &k_rva_sound_instance_play,
+    &k_rva_audio_owner_get_variant_resource,
+    &k_rva_subtitle_runtime_wrapper,
+    &k_rva_subtitle_render,
+    &k_rva_subtitle_prepare,
+    &k_rva_subtitle_runtime_context,
+    &k_rva_game_view_game_show_subtitle_slot,
+    &k_rva_subtitle_producer,
+    &k_rva_start_talk_init,
+    &k_rva_selector_dispatch,
+    &k_rva_talk_dispatcher,
+    &k_rva_gameplay_sink,
+};
 
 /* Current build gameplay Dollman mute: observed (speaker tag, ShowSubtitle
  * caller RVA) pair for the chatter path. v1.6 live sender now lands at
@@ -286,25 +284,9 @@ static const char *k_builder_names[BUILDER_ID_COUNT] = {
     "none", "A", "B", "C", "U1", "U2"
 };
 
-static const uintptr_t k_rva_builder_a  = 0u;
-static const uintptr_t k_rva_builder_b  = 0x003506C0u;
-static const uintptr_t k_rva_builder_c  = 0x00350AD0u;
-static const uintptr_t k_rva_builder_u1 = 0x00B5CE10u;
-static const uintptr_t k_rva_builder_u2 = 0x00B5DDD0u;
 
-typedef uintptr_t (__fastcall *BuilderFn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
-typedef uintptr_t (__fastcall *SelectorDispatchFn)(uintptr_t, uintptr_t);
-typedef uintptr_t (__fastcall *TalkDispatcherFn)(uintptr_t *a1, uintptr_t *i);
 
-static void *g_real_builder_a  = NULL;
-static void *g_real_builder_b  = NULL;
-static void *g_real_builder_c  = NULL;
-static void *g_real_builder_u1 = NULL;
-static void *g_real_builder_u2 = NULL;
-static SelectorDispatchFn g_real_selector_dispatch = NULL;
-static TalkDispatcherFn g_real_talk_dispatcher = NULL;
 
-static volatile LONG g_builder_hit_counts[BUILDER_ID_COUNT] = {0};
 static DWORD g_tls_last_builder = TLS_OUT_OF_INDEXES;
 static uint32_t g_active_subtitle_strategy = SUBTITLE_STRATEGY_GAMEPLAY_PAIR;
 static SubtitleStrategyStats g_strategy_stats[SUBTITLE_STRATEGY_COUNT];
@@ -320,7 +302,6 @@ static const AkUniqueID k_blocked_event_ids[] = {
     448888368u   /* fall chatter */
 };
 
-static uintptr_t safe_deref_qword(uintptr_t addr);
 static uintptr_t safe_read_ptr(uintptr_t addr);
 static uint64_t safe_read_u64(uintptr_t addr);
 static uint32_t safe_read_u32(uintptr_t addr);
@@ -333,11 +314,6 @@ static BOOL read_localized_text_resource(
 static void log_localized_text_resource_candidate(
     const char *label,
     uintptr_t ptr);
-static void log_builder_c_post_probe(uintptr_t rcx, uintptr_t result);
-static void log_start_talk_function_snapshot(const char *phase, uintptr_t this_obj);
-static void log_dollman_voice_closure_probe(const char *phase, uintptr_t closure_state);
-static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva);
-static const char *voice_queue_probe_caller_name(uintptr_t caller_rva);
 static uintptr_t get_return_address_value(void);
 static BOOL is_stf_probe_window_open(void);
 static void reset_stf_probe_cache(void);
@@ -347,12 +323,10 @@ static void note_dollman_starttalk_sound(uintptr_t sound, uintptr_t line, uintpt
 static BOOL is_recent_dollman_starttalk_sound(uintptr_t ptr, BOOL should_mute, ULONGLONG now_ms, ULONGLONG *delta_ms_out);
 static void note_dollman_starttalk_instance(uintptr_t sound_instance, uintptr_t sound_resource, BOOL should_mute);
 static BOOL is_recent_dollman_starttalk_instance(uintptr_t ptr, BOOL should_mute, ULONGLONG now_ms, ULONGLONG *delta_ms_out);
-static void reset_builder_hit_counts(void);
 static void reset_strategy_stats(void);
 static void reset_hotkey_runtime_state(void);
 static void reset_session_probe_state(void);
 static void reset_runtime_capture_counters(void);
-static void reset_identity_probe_cache(void);
 static void reset_log_capture_state(void);
 static uint32_t get_active_subtitle_strategy(void);
 static BOOL is_dowser_gameplay_subtitle(
@@ -377,18 +351,7 @@ static void note_dollman_muted_subtitle(
 static BOOL get_recent_dollman_muted_subtitle_delta_ms(
     ULONGLONG now_ms,
     ULONGLONG *delta_ms_out);
-static void log_localized_hits_in_block(
-    uintptr_t caller_rva,
-    const char *label,
-    uintptr_t base,
-    size_t size);
-static void log_sentence_desc_probe(
-    const char *tag,
-    uintptr_t caller_rva,
-    unsigned int index,
-    uintptr_t desc);
 static void *resolve_rva(uintptr_t rva);
-static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy);
 static BOOL is_subtitle_runtime_mute_enabled(void);
 static BOOL is_sender_only_runtime_mode_enabled(void);
 static BOOL is_legacy_dollman_radio_mute_enabled(void);
@@ -398,7 +361,6 @@ static BOOL should_block_sender_only_event_id(
     uint32_t external_source_count,
     uint64_t ext0);
 static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag);
-static uint32_t read_subtitle_runtime_prepare_token(void);
 static void log_subtitle_identity_probe(
     const char *surface,
     uintptr_t caller_rva,
@@ -412,17 +374,6 @@ static BOOL process_subtitle_payload(
     const char *surface,
     uintptr_t caller_rva,
     const uint64_t *payload);
-static uintptr_t pass_through_subtitle_runtime_wrapper(
-    uintptr_t view,
-    uintptr_t arg2,
-    const char *reason);
-static void log_pair_bypass_probe(
-    uint32_t active_strategy,
-    const ShowStrategyContext *ctx,
-    uint32_t line_tag,
-    BOOL line_tag_valid,
-    BOOL pair_match,
-    BOOL preamble_match);
 
 static const char *k_default_ini =
     "; DollmanMute runtime config.\n"
@@ -680,32 +631,6 @@ static void log_verbose(const char *fmt, ...)
     va_end(args);
 }
 
-static void clear_log_file(void)
-{
-    HANDLE file;
-
-    if (g_log_path[0] == '\0') {
-        return;
-    }
-
-    if (g_log_lock_inited) {
-        EnterCriticalSection(&g_log_lock);
-    }
-    file = CreateFileA(
-        g_log_path,
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
-    if (file != INVALID_HANDLE_VALUE) {
-        CloseHandle(file);
-    }
-    if (g_log_lock_inited) {
-        LeaveCriticalSection(&g_log_lock);
-    }
-}
 
 static const char *subtitle_family_name(uint32_t family)
 {
@@ -874,26 +799,7 @@ static BOOL is_recent_dollman_starttalk_instance(uintptr_t ptr, BOOL should_mute
     return FALSE;
 }
 
-static BOOL is_voice_queue_probe_caller(uintptr_t caller_rva)
-{
-    return caller_rva == k_rva_voice_queue_shared_helper_return ||
-           caller_rva == k_rva_voice_queue_dispatcher_synth_return ||
-           caller_rva == k_rva_voice_queue_dispatcher_forward_return;
-}
 
-static const char *voice_queue_probe_caller_name(uintptr_t caller_rva)
-{
-    switch (caller_rva) {
-    case k_rva_voice_queue_shared_helper_return:
-        return "shared-helper";
-    case k_rva_voice_queue_dispatcher_synth_return:
-        return "dispatcher-synth";
-    case k_rva_voice_queue_dispatcher_forward_return:
-        return "dispatcher-forward";
-    default:
-        return "other";
-    }
-}
 
 static uintptr_t get_return_address_value(void)
 {
@@ -1089,34 +995,12 @@ static uintptr_t tls_get_current_subtitle_family(void)
     return (uintptr_t)TlsGetValue(g_tls_current_subtitle_family);
 }
 
-static void tls_set_current_subtitle_family(uintptr_t family)
-{
-    if (g_tls_current_subtitle_family == TLS_OUT_OF_INDEXES) {
-        return;
-    }
-    TlsSetValue(g_tls_current_subtitle_family, (LPVOID)family);
-}
-
 static uint32_t tls_get_last_builder(void)
 {
     if (g_tls_last_builder == TLS_OUT_OF_INDEXES) {
         return BUILDER_ID_NONE;
     }
     return (uint32_t)(uintptr_t)TlsGetValue(g_tls_last_builder);
-}
-
-static void tls_set_last_builder(uint32_t id)
-{
-    if (g_tls_last_builder == TLS_OUT_OF_INDEXES) {
-        return;
-    }
-    TlsSetValue(g_tls_last_builder, (LPVOID)(uintptr_t)id);
-}
-
-static uint32_t read_identity_hi32(uintptr_t ptr)
-{
-    uint64_t word1 = safe_read_u64(ptr + sizeof(uint64_t));
-    return (uint32_t)(word1 >> 32);
 }
 
 static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag)
@@ -1131,10 +1015,6 @@ static uint32_t classify_subtitle_family_from_identity_tag(uint32_t identity_tag
     return SUBTITLE_FAMILY_NONE;
 }
 
-static uint32_t classify_subtitle_family(uintptr_t pre_p200_field72)
-{
-    return classify_subtitle_family_from_identity_tag(read_identity_hi32(pre_p200_field72));
-}
 
 static BOOL is_gameplay_dollman_pair(
     uintptr_t caller_rva,
@@ -1152,11 +1032,6 @@ static BOOL should_mute_gameplay_throw_recall_preamble(const ShowStrategyContext
     return FALSE;
 }
 
-static BOOL subtitle_strategy_uses_family_tracking(uint32_t strategy)
-{
-    return strategy == SUBTITLE_STRATEGY_SELECTED_FAMILY ||
-           strategy == SUBTITLE_STRATEGY_PAIR_OR_SELECTED_FAMILY;
-}
 
 static BOOL is_subtitle_runtime_mute_enabled(void)
 {
@@ -1217,16 +1092,6 @@ static BOOL should_block_sender_only_event_id(
                ext0);
 }
 
-static uint32_t read_subtitle_runtime_prepare_token(void)
-{
-    uintptr_t runtime_ctx = safe_deref_qword((uintptr_t)resolve_rva(k_rva_subtitle_runtime_context));
-
-    if (runtime_ctx == 0 ||
-        IsBadReadPtr((const void *)(runtime_ctx + 48936), sizeof(uint32_t))) {
-        return 0;
-    }
-    return *(const uint32_t *)(runtime_ctx + 48936);
-}
 
 static void log_subtitle_identity_probe(
     const char *surface,
@@ -2090,63 +1955,6 @@ static int __fastcall hook_sound_instance_submit(
         s9);
 }
 
-static BOOL patch_pointer_slot(
-    uintptr_t slot_rva,
-    void *replacement,
-    void *expected_original,
-    void **original_out,
-    void ***slot_out,
-    const char *label)
-{
-    void **slot = (void **)resolve_rva(slot_rva);
-    void *original = NULL;
-    DWORD old_protect = 0;
-
-    if (slot == NULL || replacement == NULL) {
-        log_line("Skip pointer patch %s: slot or replacement missing", label != NULL ? label : "(unknown)");
-        return FALSE;
-    }
-
-    if (IsBadReadPtr(slot, sizeof(void *))) {
-        log_line("Skip pointer patch %s: slot unreadable at %p", label != NULL ? label : "(unknown)", slot);
-        return FALSE;
-    }
-
-    original = *slot;
-    if (expected_original != NULL && original != expected_original) {
-        log_line(
-            "Skip pointer patch %s: live original=%p expected=%p slot=%p",
-            label != NULL ? label : "(unknown)",
-            original,
-            expected_original,
-            slot);
-        return FALSE;
-    }
-    if (original_out != NULL) {
-        *original_out = original;
-    }
-
-    if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old_protect)) {
-        log_line("Failed to reprotect pointer slot %s: %lu", label != NULL ? label : "(unknown)", (unsigned long)GetLastError());
-        return FALSE;
-    }
-
-    *slot = replacement;
-    VirtualProtect(slot, sizeof(void *), old_protect, &old_protect);
-    FlushProcessWriteBuffers();
-
-    if (slot_out != NULL) {
-        *slot_out = slot;
-    }
-
-    log_line(
-        "Patched %s slot=%p original=%p replacement=%p",
-        label != NULL ? label : "(unknown)",
-        slot,
-        original,
-        replacement);
-    return TRUE;
-}
 
 static void restore_pointer_slot(void **slot, void *original, const char *label)
 {
@@ -2380,10 +2188,6 @@ static uintptr_t __fastcall hook_remove_subtitle(uintptr_t view, const uint64_t 
     return g_real_remove_subtitle(view, key_pair, mode);
 }
 
-static uintptr_t safe_deref_qword(uintptr_t addr)
-{
-    return (uintptr_t)safe_read_u64(addr);
-}
 
 static uintptr_t safe_read_ptr(uintptr_t addr)
 {
@@ -2546,7 +2350,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     BOOL need_show_subtitle_hook = FALSE;
     BOOL show_subtitle_hook_installed = FALSE;
     BOOL subtitle_runtime_surface_enabled = FALSE;
-    BOOL sender_only_runtime_mode = FALSE;
     BOOL effective_dollman_radio_mute = FALSE;
     BOOL sender_only_dollman_voice_mute = FALSE;
 
@@ -2593,7 +2396,6 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     seed_hotkey_state_from_config();
     g_active_subtitle_strategy = get_active_subtitle_strategy();
     subtitle_runtime_surface_enabled = g_cfg.enable_subtitle_runtime_hooks;
-    sender_only_runtime_mode = is_sender_only_runtime_mode_enabled();
     sender_only_dollman_voice_mute = is_sender_only_dollman_radio_mute_enabled();
     effective_dollman_radio_mute = is_legacy_dollman_radio_mute_enabled();
 

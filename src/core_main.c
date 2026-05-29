@@ -2422,18 +2422,18 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_start_talk_get_or_create_sound_wrapper,
                 hook_start_talk_get_or_create_sound_wrapper,
                 (void **)&g_real_start_talk_get_or_create_sound_wrapper,
-                "StartTalkFunction.GetOrCreateSoundWrapper.sub_140387FB0")) {
+                "StartTalkFunction.GetOrCreateSoundWrapper.sub_140388280")) {
             ++hook_count;
-            log_line("StartTalk sound-wrapper bridge probe active via sub_140387FB0 (pass-through)");
+            log_line("StartTalk sound-wrapper bridge probe active via sub_140388280 (pass-through)");
         }
 
         if (install_rva_hook(
                 k_rva_sound_instance_submit,
                 hook_sound_instance_submit,
                 (void **)&g_real_sound_instance_submit,
-                "SoundInstanceSubmit.sub_14026B8410")) {
+                "SoundInstanceSubmit.sub_1426C1F60")) {
             ++hook_count;
-            log_line("Sound instance submit probe active via sub_14026B8410 (pass-through)");
+            log_line("Sound instance submit probe active via sub_1426C1F60 (pass-through)");
         }
     } else {
         log_line("Sound instance submit probe disabled");
@@ -2458,7 +2458,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_show_subtitle,
                 hook_show_subtitle,
                 (void **)&g_real_show_subtitle,
-                "GameViewGame.ShowSubtitleSender.sub_140780BF0")) {
+                "GameViewGame.ShowSubtitleSender.sub_140780FC0")) {
             show_subtitle_hook_installed = TRUE;
             ++hook_count;
         } else {
@@ -2469,7 +2469,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_remove_subtitle,
                 hook_remove_subtitle,
                 (void **)&g_real_remove_subtitle,
-                "GameViewGame.RemoveSubtitleSender.sub_140780CF0")) {
+                "GameViewGame.RemoveSubtitleSender.sub_1407810C0")) {
             ++hook_count;
         } else {
             log_line("Subtitle remove sender hook unavailable on this build");

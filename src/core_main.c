@@ -27,6 +27,7 @@ typedef struct Config {
     BOOL enable_deep_probe;
     BOOL enable_talk_dispatcher_probe;
     BOOL enable_legacy_runtime_wrapper;
+    BOOL enable_dialogue_tick_mute;
     uint32_t scanner_mode;
 } Config;
 
@@ -59,6 +60,7 @@ typedef uintptr_t(__fastcall *StartTalkGetOrCreateSoundWrapperFn)(
     uintptr_t out_wrapper);
 typedef uintptr_t(__fastcall *ShowSubtitleFn)(uintptr_t view, const uint64_t *payload);
 typedef uintptr_t(__fastcall *RemoveSubtitleFn)(uintptr_t view, const uint64_t *key_pair, char mode);
+typedef uintptr_t(__fastcall *DialogueTickFn)(uintptr_t node, float dt);
 
 static HMODULE g_self_module = NULL;
 static CRITICAL_SECTION g_log_lock;
@@ -75,10 +77,11 @@ static SoundInstanceSubmitFn g_real_sound_instance_submit = NULL;
 static StartTalkGetOrCreateSoundWrapperFn g_real_start_talk_get_or_create_sound_wrapper = NULL;
 static ShowSubtitleFn g_real_show_subtitle = NULL;
 static RemoveSubtitleFn g_real_remove_subtitle = NULL;
+static DialogueTickFn g_real_dialogue_tick = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1.18-v1.8-starttalk-dev+clean";
+static const char *k_build_tag = "v2.1.21-v1.8-tick-flagsgate+show-subtitle";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -160,6 +163,13 @@ static const uintptr_t k_rva_subtitle_runtime_context = 0x0623C0B8u;
 static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x0A45E088u;
 static const uintptr_t k_rva_subtitle_producer = 0x003875D0u;
 static const uintptr_t k_rva_start_talk_init = 0x00387980u;
+/* Same function as k_rva_start_talk_init: the per-frame dialogue-node tick
+ * (sub_140387980, vtable+0x78). It is the shared upstream of both the voice
+ * wrapper (sub_140388280) and the subtitle dispatch (sub_140387BF0) inside one
+ * if-block, so hooking here lets a single point mute Dollman's voice+subtitle
+ * together. Verified live: node+0xC8->slot->line->+0x50 voice has Dollman
+ * speaker_tag 0x12B72 at tick entry. */
+static const uintptr_t k_rva_dialogue_tick = 0x00387980u;
 static const uintptr_t k_rva_selector_dispatch = 0x00DB7960u;
 static const uintptr_t k_rva_talk_dispatcher = 0x00385A30u;
 static const uintptr_t k_rva_gameplay_sink = 0u;
@@ -380,6 +390,9 @@ static const char *k_default_ini =
     "; VerboseLog=1 enables extra logging for troubleshooting.\n"
     "; EnableVoiceMute=1 mutes Dollman gameplay voice lines.\n"
     "; EnableSubtitleMute=1 mutes Dollman gameplay subtitles.\n"
+    "; EnableDialogueTickMute=1 (default) unified single-point mode: one hook on the\n"
+    ";   dialogue tick mutes Dollman voice+subtitle together, gated by starttalk_flags\n"
+    ";   so private-room/story stays audible; 0 keeps the legacy two-chain behavior.\n"
     "; Runtime hotkeys:\n"
     ";   F8 = mark a fresh probe session window in DollmanMute.log\n"
     "; ScannerMode=0 keeps scanner audio unchanged.\n"
@@ -391,6 +404,7 @@ static const char *k_default_ini =
     "VerboseLog=0\n"
     "EnableVoiceMute=1\n"
     "EnableSubtitleMute=1\n"
+    "EnableDialogueTickMute=1\n"
     "ScannerMode=0\n";
 
 static void join_path(char *buffer, size_t buffer_size, const char *dir, const char *file_name)
@@ -521,6 +535,7 @@ static void load_config(void)
     g_cfg.enable_selector_probe = FALSE;
     g_cfg.enable_deep_probe = FALSE;
     g_cfg.enable_talk_dispatcher_probe = FALSE;
+    g_cfg.enable_dialogue_tick_mute = TRUE;
     g_cfg.scanner_mode = SCANNER_MODE_OFF;
 
     ensure_default_ini();
@@ -537,6 +552,11 @@ static void load_config(void)
         "EnableSubtitleMute",
         "EnableSubtitleRuntimeHooks",
         g_cfg.enable_subtitle_runtime_hooks);
+    g_cfg.enable_dialogue_tick_mute = read_ini_bool_compat(
+        "General",
+        "EnableDialogueTickMute",
+        NULL,
+        g_cfg.enable_dialogue_tick_mute);
     {
         int scanner_mode_value = read_ini_int_compat(
             "General",
@@ -1318,7 +1338,7 @@ static BOOL process_subtitle_payload(
     }
 
     hit_index = InterlockedIncrement(&g_subtitle_runtime_hits);
-    if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && hit_index <= 24) {
+    if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && hit_index <= 1000) {
         log_line(
             "SubtitleHit surface=%s caller_rva=0x%llx speaker_ok=%d speaker_tag=0x%x line_ok=%d line_tag=0x%x family=%s builder=%s",
             surface != NULL ? surface : "?",
@@ -1609,6 +1629,85 @@ static BOOL is_dollman_voice_resource(uintptr_t voice, uint32_t *speaker_tag_out
     }
 
     return FALSE;
+}
+
+/* Walk node -> +0xC8 slot -> +0x00 line -> +0x50/+0x58 voice and decide whether
+ * this dialogue node belongs to Dollman. All dereferences are null-guarded;
+ * runs every frame for every active node, so it stays cheap and never writes. */
+static BOOL is_dollman_dialogue_node(uintptr_t node)
+{
+    uintptr_t slot;
+    uintptr_t line;
+    uintptr_t voice_fallback;
+    uintptr_t voice_preferred;
+
+    if (node == 0) {
+        return FALSE;
+    }
+    slot = safe_read_ptr(node + 0xC8);
+    if (slot == 0) {
+        return FALSE;
+    }
+    line = safe_read_ptr(slot + 0x0);
+    if (line == 0) {
+        return FALSE;
+    }
+    voice_fallback = safe_read_ptr(line + 0x50);
+    if (voice_fallback != 0 &&
+        is_dollman_voice_resource(voice_fallback, NULL, NULL, 0)) {
+        return TRUE;
+    }
+    voice_preferred = safe_read_ptr(line + 0x58);
+    if (voice_preferred != 0 &&
+        is_dollman_voice_resource(voice_preferred, NULL, NULL, 0)) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static uintptr_t __fastcall hook_dialogue_tick(uintptr_t node, float dt)
+{
+    if (g_cfg.enabled &&
+        g_cfg.enable_dialogue_tick_mute &&
+        is_dollman_dialogue_node(node)) {
+        /* Mirror the StartTalk wrapper gate (hook_start_talk_get_or_create_sound_wrapper,
+         * the `starttalk_flags == 0` check): the dialogue-tick node is the same
+         * StartTalk-family object (shares the +0xC8 slot and +0x68 flags layout), so we
+         * reuse the same rule instead of muting every Dollman node unconditionally:
+         *   flags == 0  -> ambient / gameplay chatter                  -> mute (skip real tick)
+         *   flags != 0  -> scripted StartTalk (private-room / story)    -> stay audible
+         * Confirmed on DS2 v1.8 live log: rest-room nodes carry flags=0x63, gameplay flags=0.
+         * See RESEARCH.md 4.1 ("starttalk_flags == 0 当前视为可 mute; 非 0 flags 走 bypass"). */
+        uint32_t starttalk_flags = safe_read_u32(node + 0x68);
+        BOOL mute = (starttalk_flags == 0u);
+
+        /* This hook runs every frame for the active node, so logging unconditionally
+         * would refill DollmanMute.log at ~55 lines/sec (the old per-frame [tick-diag]
+         * line bloated it to 32 MB). Dedupe to one verbose line per (node, flags)
+         * transition; the statics reset naturally on the DLL reload / re-init. */
+        if (g_cfg.verbose_log) {
+            static uintptr_t s_last_node = 0;
+            static uint32_t s_last_flags = 0xFFFFFFFFu;
+            if (node != s_last_node || starttalk_flags != s_last_flags) {
+                s_last_node = node;
+                s_last_flags = starttalk_flags;
+                log_verbose("[dialogue-tick] %s Dollman node=0x%llx flags=0x%x",
+                            mute ? "muted" : "bypass",
+                            (unsigned long long)node,
+                            (unsigned int)starttalk_flags);
+            }
+        }
+
+        if (mute) {
+            return 0;
+        }
+        /* nonzero starttalk_flags -> scripted Dollman -> fall through to real tick (audible) */
+    }
+
+    if (g_real_dialogue_tick == NULL) {
+        return 0;
+    }
+    return g_real_dialogue_tick(node, dt);
 }
 
 static uintptr_t __fastcall hook_start_talk_get_or_create_sound_wrapper(uintptr_t starttalk, uintptr_t out_wrapper)
@@ -2181,7 +2280,7 @@ static uintptr_t __fastcall hook_remove_subtitle(uintptr_t view, const uint64_t 
                                : 0;
     LONG hit_index = InterlockedIncrement(&g_subtitle_remove_hits);
 
-    if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && hit_index <= 24) {
+    if ((g_cfg.verbose_log || g_cfg.enable_deep_probe) && hit_index <= 1000) {
         log_remove_subtitle_probe(caller_rva, key_pair, mode);
     }
 
@@ -2415,6 +2514,55 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
         log_line("MH_Initialize failed: %d", (int)status);
         return 0;
+    }
+
+    if (g_cfg.enabled && g_cfg.enable_dialogue_tick_mute) {
+        /* Unified-voice mode: one hook on the per-frame dialogue tick
+         * (sub_140387980) mutes Dollman's *voice* by skipping the whole tick for
+         * Dollman nodes, replacing the wrapper/submit/postevent voice chain.
+         * Subtitles, however, are multi-source: gameplay StartTalk subtitles ride
+         * the tick's subtitle branch (so the tick already suppresses them), but
+         * rest-room / scripted Dollman subtitles reach ShowSubtitle through a
+         * different upstream that the tick never sees. So we KEEP the proven
+         * ShowSubtitle/Remove hooks as the subtitle convergence point for full
+         * coverage. The two never double-handle: a tick-muted node's subtitle
+         * branch never runs, so ShowSubtitle only sees the sources the tick missed. */
+        if (install_rva_hook(
+                k_rva_dialogue_tick,
+                hook_dialogue_tick,
+                (void **)&g_real_dialogue_tick,
+                "DialogueNodeTick.sub_140387980")) {
+            ++hook_count;
+            log_line("Dialogue-tick voice mute active via sub_140387980 (replaces voice chain)");
+        } else {
+            log_line("Dialogue-tick unified hook unavailable on this build");
+        }
+
+        if (install_rva_hook(
+                k_rva_show_subtitle,
+                hook_show_subtitle,
+                (void **)&g_real_show_subtitle,
+                "GameViewGame.ShowSubtitleSender.sub_140780FC0")) {
+            ++hook_count;
+            log_line("ShowSubtitle subtitle hook active (full-source subtitle coverage incl. rest-room)");
+        } else {
+            log_line("ShowSubtitle hook unavailable on this build");
+        }
+
+        if (install_rva_hook(
+                k_rva_remove_subtitle,
+                hook_remove_subtitle,
+                (void **)&g_real_remove_subtitle,
+                "GameViewGame.RemoveSubtitleSender.sub_1407810C0")) {
+            ++hook_count;
+        }
+
+        log_line("DollmanMute init complete: hooks=%d (dialogue-tick voice + ShowSubtitle subtitle mode)", hook_count);
+        g_hotkey_thread_handle = CreateThread(NULL, 0, hotkey_thread_proc, NULL, 0, NULL);
+        if (g_hotkey_thread_handle != NULL) {
+            log_line("Hotkeys active: F8=session mark");
+        }
+        return 1;
     }
 
     if (sender_only_dollman_voice_mute) {

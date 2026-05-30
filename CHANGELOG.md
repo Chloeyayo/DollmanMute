@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.1.21 — v1.8 dialogue-tick flags gate
+
+- Ported the StartTalk `starttalk_flags` gate onto the per-frame dialogue-tick mute hook: the unified single-point mode (`EnableDialogueTickMute`) now mutes only gameplay Dollman chatter (`starttalk_flags == 0`) and leaves private-room / story dialogue (`starttalk_flags != 0`) audible. Verified in-game on DS2 v1.8 (rest-room `flags=0x63` stays audible, gameplay `flags=0` muted).
+- Made the unified dialogue-tick mode the default (`EnableDialogueTickMute=1`).
+- Replaced the per-frame `[tick-diag]` diagnostic line with a deduped, one-line-per-event log so `DollmanMute.log` no longer bloats.
+
 ## v2.1.6 hat/refpack hotfix
 
 - Fixed a possible Magellan private-room story-rest softlock by no longer using the Dollman voice delay schedule/closure functions as mute points. Those functions are now pass-through only when probed, because the game also uses that path for talk/voice completion notifications.

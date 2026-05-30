@@ -81,7 +81,7 @@ static DialogueTickFn g_real_dialogue_tick = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v2.1.21-v1.8-tick-flagsgate+show-subtitle";
+static const char *k_build_tag = "v3.0-v1.8-tick-flagsgate+show-subtitle";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;

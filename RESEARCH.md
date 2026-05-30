@@ -402,6 +402,59 @@ Select-String -Path "C:\Program Files (x86)\Steam\steamapps\common\DEATH STRANDI
 - 字幕 sender 是强验证面和字幕产品面。
 - 声音必须有自己的 StartTalk/SoundInstance/PostEvent 链。
 
+## 10.6 “字幕通道压制”误伤的真因（v1.8 x64dbg 活体确认，2026-05-30）
+
+用户报告：mod 静音 Dollman 后，Dollman 说话期间 Sam / 寻水师等字幕被压住不显示。
+
+关键判定（用户已亲测）：
+
+- **删掉 mod 后该现象依旧** → 这是**游戏引擎原生行为**，不是 mod 误伤。引擎在“某说话人对话节点 active 期间”会压住其他来源的并发字幕（单字幕通道）。
+- mod 把 Dollman 声音+字幕静音后，引擎仍认为“Dollman 在说话”，于是继续压 Sam。玩家因为听不到/看不到 Dollman，就把这段原生压制误读成“mod 误伤 Sam”。
+
+日志层面已排除 mod 主动误伤：全 session 只有 2 条 `actual=1`（都 speaker_tag=0x12B72=Dollman）、2 条 `Blocked PostEventID`（都 Dollman eventId）；Sam(0x122ab)/寻水师(0xe409) 字幕全程 `actual=0`、音频全程 `Seen`，无一被拦。
+
+### 对话节点 tick 机制（已活体钉死）
+
+- **tick 函数 = `sub_140387980`（v1.8 RVA 0x387980）**，是**单个对话节点每帧的 tick**；安静无人说话时不被调用，有对话才进。
+- 调用方式：**虚函数 `vtable + 0x78`**，由上层**对话节点遍历循环**（v1.8 RVA 0x3166C0 附近）驱动：遍历“活跃对话节点列表”（`rdi` 游标→`r14` 尾），对每个节点 `call [vtable+0x78]`。Dollman、Sam 等所有说话人各占一个节点。这解释了为何 IDA 显示 `sub_140387980` 无 caller（纯虚调用）。
+
+### 对话节点字段语义（v1.8 活体，节点基址随会话变）
+
+| 偏移 | 含义 | 备注 |
+|---|---|---|
+| +0x00 | vtable | 观察到 `ds2+0x4D1878` 一类，节点类 |
+| +0x78 | **总字幕行数** | 样本见 1 和 4 |
+| +0xC0 bit0 | active 标志（1=活跃） | |
+| +0xC0 bit1 | 置位→走结束分支 0x7BD2（其实是函数 epilogue，纯返回） | |
+| +0xC4 | **当前字幕行索引** | |
+| +0xC8 | slot 链 →line→sound/voice/speaker（与 §4.1 一致） | 身份判定用 |
+| +0xD0 | float，**不是对话主计时器** | active Dollman 节点上实测=0，清零无效，已证伪 |
+| +0xD8 | 状态对象指针（cl 标志来源） | 见下 |
+
+### 已证伪 / 未收敛
+
+- **+0xD0 不是“对话存活计时器”**：Dollman 正在说话、节点 active=1 时 +0xD0=0；tick 计时器段 `[rbx+0xD0]-=dt; max(0); jb` 在 0 时不触发结束。最初“清 +0xD0 让字幕提前结束”的假设**作废**。
+- **写 +0xC4 行索引 = 总行数（越过末行）→ 游戏画面无变化**。+0xC4 是被动显示索引，被引擎每帧重算覆盖，不是控制开关。
+- tick 实际控制流：入口→active 检查→+0xD0 段(不结束)→`test cl,cl`（cl 来自 +0xD8 对象虚函数 `[vtable+0x58]`，v1.8 RVA 0x389A30）→ 跳 0x7B5D 维持分支→因某栈标志 `[rsp+0x61]` 非0 **早退**，大量帧是空转。
+- 真正的“说话中”状态判定深藏在 **节点+0xD8 对象 → 其+0x10 对象 → +0x180 bit0** + 多层虚函数，**4 层仍未收敛**，从内存层强改性价比低、易崩、难在 mod 里稳定复现。
+
+### 结论与方向
+
+- “让 Dollman 字幕提前结束”从对话状态机内部强改：**不可行/不收敛**，不作为产品路线。
+- B 方向（字幕 hook 侧补显被压字幕）也已评估并放弃，原因见下。
+
+### 最终产品决策（2026-05-30）：不修，接受引擎原生行为
+
+- 日志证据进一步厘清：Dollman 说话期 Sam 字幕（speaker_tag=0x122ab）**有 `SubtitleHit` 且 `actual=0`**，即它确实走到了 mod 的 ShowSubtitle hook、mod 也放行了 → 压制发生在 **`g_real_show_subtitle` 内部或下游渲染层**，不是 mod 拦的。
+- 既然“Dollman 说话时压住其他人字幕”是**引擎原生单字幕通道行为**（删 mod 后照旧），让 mod 去补显属于“超越原版、改引擎 UI 行为”，可能引入字幕重叠/错乱新问题。
+- 结论：**mod 职责边界 = 静音 Dollman 的声音+字幕；“Dollman 说话时 Sam 字幕排队”是引擎的事，不归 mod 管，不修。**
+
+### 顺带订正：ShowSubtitle hook 真实地址（v1.8）
+
+- mod 实际 hook 的字幕函数是 **`k_rva_show_subtitle = 0x780FC0`**（活体 `ds2_base+0x780FC0`，E9 已装、工作正常），remove = `0x7810C0`。
+- `k_rva_subtitle_runtime_wrapper = 0x780F10` 是另一个**未启用**的 wrapper 常量，不要混淆（早前排查 hook 状态时一度看错成 0x780F10）。
+- 计算活体地址注意：v1.8 base=0x7FF616390000，`+0x780FC0` = `0x7FF616B10FC0`（曾漏加 0x400000 算错过）。
+
 ## 11. 下一步
 
 优先做三件事:

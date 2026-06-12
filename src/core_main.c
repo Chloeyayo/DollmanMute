@@ -81,12 +81,12 @@ static DialogueTickFn g_real_dialogue_tick = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v3.0-v1.8-tick-flagsgate+show-subtitle";
+static const char *k_build_tag = "v3.1-v1.9-tick-flagsgate+show-subtitle+legacy-submit";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
 static uintptr_t g_image_size = 0;
-static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03455BD0u;
+static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03455C70u;
 
 static CRITICAL_SECTION g_stf_probe_lock;
 static BOOL g_stf_probe_lock_inited = FALSE;
@@ -132,15 +132,13 @@ static uintptr_t g_last_dollman_muted_caller_rva = 0;
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
-/* DS2 v1.8.81 RVAs for the StartTalk object chain. ACTIVE constants installed by
- * core_init are listed individually where they are used (wrapper 0x388280, submit
- * 0x26C1F60, show_subtitle 0x780FC0, remove_subtitle 0x7810C0) plus the
- * PostEventID export and the LocalizedTextResource vtbl above. The constants in
- * this block are RESOLVED-BUT-NOT-HOOKED deep-probe surface: verified
- * structurally against the v1.8 image (see RESEARCH.md §11 and the v1.8 RVA
- * memory map) and retained so re-enabling a probe does not require re-deriving
- * offsets. They are referenced by k_rva_deep_probe_reference below so the build
- * stays warning-free; wiring one into a hook means removing it from that list. */
+/* DS2 v1.9 active RVAs for the StartTalk object chain. ACTIVE constants installed
+ * by core_init are wrapper 0x388380, dialogue_tick 0x387A80, legacy
+ * sound_instance_submit 0x26C1B40, show_subtitle 0x781320, remove_subtitle
+ * 0x781420, plus the PostEventID export and the LocalizedTextResource vtbl
+ * above. The older resolved-but-not-hooked deep-probe
+ * RVAs below remain v1.8 research references unless explicitly refreshed here;
+ * they are not product hook points. */
 static const uintptr_t k_rva_dollman_voice_delay_schedule = 0x00C78E10u;
 static const uintptr_t k_rva_dollman_voice_delay_closure = 0x00C78EC0u;
 static const uintptr_t k_rva_voice_shared_helper = 0x00DB4870u;
@@ -151,31 +149,31 @@ static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DB4951u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DB2C24u;
 static const uintptr_t k_rva_voice_queue_dispatcher_forward_return = 0x00DB423Au;
 static const uintptr_t k_rva_sound_instance_play = 0x026A72E0u;
-static const uintptr_t k_rva_sound_instance_submit = 0x026C1F60u;
+static const uintptr_t k_rva_sound_instance_submit = 0x026C1B40u;
 static const uintptr_t k_rva_audio_owner_get_variant_resource = 0x0028EA30u;
-static const uintptr_t k_rva_start_talk_get_or_create_sound_wrapper = 0x00388280u;
+static const uintptr_t k_rva_start_talk_get_or_create_sound_wrapper = 0x00388380u;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780F10u;
-static const uintptr_t k_rva_show_subtitle = 0x00780FC0u;
-static const uintptr_t k_rva_remove_subtitle = 0x007810C0u;
+static const uintptr_t k_rva_show_subtitle = 0x00781320u;
+static const uintptr_t k_rva_remove_subtitle = 0x00781420u;
 static const uintptr_t k_rva_subtitle_render = 0x00781120u;
 static const uintptr_t k_rva_subtitle_prepare = 0x0025ACC0u;
 static const uintptr_t k_rva_subtitle_runtime_context = 0x0623C0B8u;
 static const uintptr_t k_rva_game_view_game_show_subtitle_slot = 0x0A45E088u;
 static const uintptr_t k_rva_subtitle_producer = 0x003875D0u;
-static const uintptr_t k_rva_start_talk_init = 0x00387980u;
-/* Same function as k_rva_start_talk_init: the per-frame dialogue-node tick
- * (sub_140387980, vtable+0x78). It is the shared upstream of both the voice
- * wrapper (sub_140388280) and the subtitle dispatch (sub_140387BF0) inside one
+static const uintptr_t k_rva_start_talk_init = 0x003879A0u;
+/* Per-frame dialogue-node tick (sub_140387A80, StartTalkFunction vtable+0x78).
+ * It is the shared upstream of both the voice
+ * wrapper (sub_140388380) and the subtitle dispatch (sub_140387CF0) inside one
  * if-block, so hooking here lets a single point mute Dollman's voice+subtitle
  * together. Verified live: node+0xC8->slot->line->+0x50 voice has Dollman
  * speaker_tag 0x12B72 at tick entry. */
-static const uintptr_t k_rva_dialogue_tick = 0x00387980u;
+static const uintptr_t k_rva_dialogue_tick = 0x00387A80u;
 static const uintptr_t k_rva_selector_dispatch = 0x00DB7960u;
 static const uintptr_t k_rva_talk_dispatcher = 0x00385A30u;
 static const uintptr_t k_rva_gameplay_sink = 0u;
 
 /* Marks the resolved-but-not-hooked deep-probe RVAs above as intentionally
- * retained v1.8 research data (keeps -Wall clean without discarding them). */
+ * retained historical research data (keeps -Wall clean without discarding them). */
 static const uintptr_t *const k_rva_deep_probe_reference[] __attribute__((used)) = {
     &k_rva_dollman_voice_delay_schedule,
     &k_rva_dollman_voice_delay_closure,
@@ -201,10 +199,10 @@ static const uintptr_t *const k_rva_deep_probe_reference[] __attribute__((used))
 };
 
 /* Current build gameplay Dollman mute: observed (speaker tag, ShowSubtitle
- * caller RVA) pair for the chatter path. v1.6 live sender now lands at
- * 0x385C5B. */
+ * caller RVA) pair for the chatter path. v1.9 StartTalk sender call returns at
+ * 0x38602B after GameViewGame vtable+0x40. */
 static const uint32_t k_dollman_gameplay_speaker_tag = 0x12b72u;
-static const uintptr_t k_dollman_gameplay_caller_rva = 0x385f2bu;
+static const uintptr_t k_dollman_gameplay_caller_rva = 0x38602bu;
 static const uint32_t k_dowser_gameplay_speaker_tag = 0x0e406u;
 static const uint32_t k_dowser_gameplay_line_tag = 0x0e404u;
 
@@ -268,8 +266,8 @@ static const uint32_t k_identity_tag_dialogue_a = 0x222Cu;
 static const uint32_t k_identity_tag_dialogue_b = 0x4377u;
 static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COUNT] = {
     { "observe", "never mute; log-only baseline", VK_F1 },
-    { "pair", "mute only when caller 0x385F2B and speaker tag 0x12B72 both match", VK_F2 },
-    { "callerOnly", "mute everything from caller 0x385F2B", VK_F3 },
+    { "pair", "mute only when caller 0x38602B and speaker tag 0x12B72 both match", VK_F2 },
+    { "callerOnly", "mute everything from caller 0x38602B", VK_F3 },
     { "speakerOnly", "mute everything with speaker tag 0x12B72", VK_F4 },
     { "selectedFamily", "mute only the subtitle families enabled by config defaults", VK_F5 },
     { "pairOrSelectedFamily", "mute when the gameplay pair matches or the config-selected family matches", VK_F6 }
@@ -391,7 +389,7 @@ static const char *k_default_ini =
     "; EnableVoiceMute=1 mutes Dollman gameplay voice lines.\n"
     "; EnableSubtitleMute=1 mutes Dollman gameplay subtitles.\n"
     "; EnableDialogueTickMute=1 (default) unified single-point mode: one hook on the\n"
-    ";   dialogue tick mutes Dollman voice+subtitle together, gated by starttalk_flags\n"
+    ";   dialogue tick (sub_140387A80) mutes Dollman voice+subtitle together, gated by starttalk_flags\n"
     ";   so private-room/story stays audible; 0 keeps the legacy two-chain behavior.\n"
     "; Runtime hotkeys:\n"
     ";   F8 = mark a fresh probe session window in DollmanMute.log\n"
@@ -1676,7 +1674,7 @@ static uintptr_t __fastcall hook_dialogue_tick(uintptr_t node, float dt)
          * reuse the same rule instead of muting every Dollman node unconditionally:
          *   flags == 0  -> ambient / gameplay chatter                  -> mute (skip real tick)
          *   flags != 0  -> scripted StartTalk (private-room / story)    -> stay audible
-         * Confirmed on DS2 v1.8 live log: rest-room nodes carry flags=0x63, gameplay flags=0.
+         * Confirmed live: rest-room nodes carry flags=0x63, gameplay flags=0.
          * See RESEARCH.md 4.1 ("starttalk_flags == 0 当前视为可 mute; 非 0 flags 走 bypass"). */
         uint32_t starttalk_flags = safe_read_u32(node + 0x68);
         BOOL mute = (starttalk_flags == 0u);
@@ -2518,7 +2516,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
 
     if (g_cfg.enabled && g_cfg.enable_dialogue_tick_mute) {
         /* Unified-voice mode: one hook on the per-frame dialogue tick
-         * (sub_140387980) mutes Dollman's *voice* by skipping the whole tick for
+         * (sub_140387A80) mutes Dollman's *voice* by skipping the whole tick for
          * Dollman nodes, replacing the wrapper/submit/postevent voice chain.
          * Subtitles, however, are multi-source: gameplay StartTalk subtitles ride
          * the tick's subtitle branch (so the tick already suppresses them), but
@@ -2531,9 +2529,9 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_dialogue_tick,
                 hook_dialogue_tick,
                 (void **)&g_real_dialogue_tick,
-                "DialogueNodeTick.sub_140387980")) {
+                "DialogueNodeTick.sub_140387A80")) {
             ++hook_count;
-            log_line("Dialogue-tick voice mute active via sub_140387980 (replaces voice chain)");
+            log_line("Dialogue-tick voice mute active via sub_140387A80 (replaces voice chain)");
         } else {
             log_line("Dialogue-tick unified hook unavailable on this build");
         }
@@ -2542,7 +2540,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_show_subtitle,
                 hook_show_subtitle,
                 (void **)&g_real_show_subtitle,
-                "GameViewGame.ShowSubtitleSender.sub_140780FC0")) {
+                "GameViewGame.ShowSubtitleSender.sub_140781320")) {
             ++hook_count;
             log_line("ShowSubtitle subtitle hook active (full-source subtitle coverage incl. rest-room)");
         } else {
@@ -2553,7 +2551,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_remove_subtitle,
                 hook_remove_subtitle,
                 (void **)&g_real_remove_subtitle,
-                "GameViewGame.RemoveSubtitleSender.sub_1407810C0")) {
+                "GameViewGame.RemoveSubtitleSender.sub_140781420")) {
             ++hook_count;
         }
 
@@ -2570,18 +2568,18 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_start_talk_get_or_create_sound_wrapper,
                 hook_start_talk_get_or_create_sound_wrapper,
                 (void **)&g_real_start_talk_get_or_create_sound_wrapper,
-                "StartTalkFunction.GetOrCreateSoundWrapper.sub_140388280")) {
+                "StartTalkFunction.GetOrCreateSoundWrapper.sub_140388380")) {
             ++hook_count;
-            log_line("StartTalk sound-wrapper bridge probe active via sub_140388280 (pass-through)");
+            log_line("StartTalk sound-wrapper bridge probe active via sub_140388380 (pass-through)");
         }
 
         if (install_rva_hook(
                 k_rva_sound_instance_submit,
                 hook_sound_instance_submit,
                 (void **)&g_real_sound_instance_submit,
-                "SoundInstanceSubmit.sub_1426C1F60")) {
+                "SoundInstanceSubmit.sub_1426C1B40")) {
             ++hook_count;
-            log_line("Sound instance submit probe active via sub_1426C1F60 (pass-through)");
+            log_line("Sound instance submit probe active via sub_1426C1B40 (pass-through)");
         }
     } else {
         log_line("Sound instance submit probe disabled");
@@ -2606,7 +2604,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_show_subtitle,
                 hook_show_subtitle,
                 (void **)&g_real_show_subtitle,
-                "GameViewGame.ShowSubtitleSender.sub_140780FC0")) {
+                "GameViewGame.ShowSubtitleSender.sub_140781320")) {
             show_subtitle_hook_installed = TRUE;
             ++hook_count;
         } else {
@@ -2617,7 +2615,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_remove_subtitle,
                 hook_remove_subtitle,
                 (void **)&g_real_remove_subtitle,
-                "GameViewGame.RemoveSubtitleSender.sub_1407810C0")) {
+                "GameViewGame.RemoveSubtitleSender.sub_140781420")) {
             ++hook_count;
         } else {
             log_line("Subtitle remove sender hook unavailable on this build");
@@ -2639,7 +2637,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
 
     log_line("DollmanMute init complete: hooks=%u", hook_count);
 
-    return 0;
+    return hook_count > 0 ? 1 : 0;
 }
 
 __declspec(dllexport) void core_shutdown(void)

@@ -1,5 +1,11 @@
 # Changelog
 
+## v3.1 — DS2 v1.9 RVA port
+
+- Ported the v3.0 dialogue-tick + ShowSubtitle hook set to DS2 v1.9: `sub_140387A80`, `sub_140781320`, and `sub_140781420`.
+- Updated the gameplay subtitle caller pair to the v1.9 StartTalk sender return (`caller_rva=0x38602B`) and refreshed the `LocalizedTextResource` vtable (`0x3455C70`).
+- Re-resolved the legacy/fallback `SoundInstanceSubmit` hook for v1.9 at `sub_1426C1B40` (`RVA 0x26C1B40`) so `EnableDialogueTickMute=0` can keep the v3.0 StartTalk sound-instance bridge available.
+
 ## v3.0 — v1.8 dialogue-tick flags gate
 
 - Ported the StartTalk `starttalk_flags` gate onto the per-frame dialogue-tick mute hook: the unified single-point mode (`EnableDialogueTickMute`) now mutes only gameplay Dollman chatter (`starttalk_flags == 0`) and leaves private-room / story dialogue (`starttalk_flags != 0`) audible. Verified in-game on DS2 v1.8 (rest-room `flags=0x63` stays audible, gameplay `flags=0` muted).
@@ -24,6 +30,6 @@
 
 ## Beta Notes
 
-- This is a beta release.
+- This release supports DS2 game version `v1.9`.
 - If you notice missed lines, false positives, or any other bug that affects gameplay, please let me know. Including `DollmanMute.log` from the game root is strongly recommended.
-- The current beta supports game version `v1.6`. Future game updates may cause crashes; if that happens, please roll back to mod `v1.2`.
+- Future game updates may require another RVA refresh.

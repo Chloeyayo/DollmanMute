@@ -470,7 +470,29 @@ Select-String -Path "C:\Program Files (x86)\Steam\steamapps\common\DEATH STRANDI
 - SoundInstance owner 链是否存在更稳定的 source/speaker 对象。
 - DS2 小更新后 `0x385c5b`、StartTalk wrapper、SoundInstanceSubmit、PostEvent caller 是否漂移。
 
-## 12. 维护原则
+## 12. DS2 v1.9 RVA port（2026-06-12）
+
+IDA 目标：`DS2V1.9\DS2.exe.i64`，base `0x140000000`，SHA256 `36d2412a69b55af54e91e4264536d751a32856f5c987ebbbc80dd11022abcb94`。
+
+v3.0 默认产品路径已迁移并用 IDA/Hex-Rays 交叉确认：
+
+| 用途 | v1.9 RVA | 证据 |
+|---|---:|---|
+| dialogue tick | `0x387A80` | `StartTalkFunction` vtable `+0x78`，函数内调用 `sub_140388380` 和 `sub_140387CF0` |
+| StartTalk wrapper | `0x388380` | tick 内直接调用；签名仍是 `(starttalk, out_wrapper)` |
+| SoundInstanceSubmit legacy bridge | `0x26C1B40` | v1.8 `sub_1426C1F60` 等价函数；同 `0x3D7` 大小、同 14 参数形状、同 `sound_instance+0x178/+0x248/+0x250/+0x258/+0x260` 字段、同 `AK::SoundEngine::PostEvent` 调用 |
+| ShowSubtitle sender/full payload | `0x781320` | `GameViewGame` vtable `+0x40`，复制完整 payload 后转 `sub_14078AC50` |
+| RemoveSubtitle sender | `0x781420` | `GameViewGame` vtable `+0x48`，复制 key pair + mode |
+| `LocalizedTextResource` vtable | `0x3455C70` | RTTI `??_R4LocalizedTextResource@@6B@` 的虚表 |
+| gameplay subtitle caller | `0x38602B` | StartTalk sender `call [rax+0x40]` 后返回地址 |
+
+处理策略：
+
+- 默认 `EnableDialogueTickMute=1` 路径只依赖 tick + ShowSubtitle + RemoveSubtitle。
+- v1.9 的 legacy `SoundInstanceSubmit` 同签名 hook 点已重新闭环为 `sub_1426C1B40`；仅在 `EnableDialogueTickMute=0` 的 legacy/fallback 路径安装。
+- `speaker_tag=0x12B72` 沿用 v1.8 live 证据；若 v1.9 实机漏挡/误挡，优先从 `SubtitleHit` 和 `DollmanStartTalkCandidate` 日志重新确认 speaker tag。
+
+## 13. 维护原则
 
 以后这份文件只接受:
 

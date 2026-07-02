@@ -81,12 +81,12 @@ static DialogueTickFn g_real_dialogue_tick = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v3.1-v1.9-tick-flagsgate+show-subtitle+legacy-submit";
+static const char *k_build_tag = "v3.2.1-v1.10-tick-flagsgate+show-subtitle+legacy-submit";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
 static uintptr_t g_image_size = 0;
-static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03455C70u;
+static const uintptr_t k_rva_localized_text_resource_vtbl = 0x03455CC0u;
 
 static CRITICAL_SECTION g_stf_probe_lock;
 static BOOL g_stf_probe_lock_inited = FALSE;
@@ -132,9 +132,9 @@ static uintptr_t g_last_dollman_muted_caller_rva = 0;
 static const char *k_export_post_event_id =
     "?PostEvent@SoundEngine@AK@@YAII_KIP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXIPEAUAkExternalSourceInfo@@I@Z";
 
-/* DS2 v1.9 active RVAs for the StartTalk object chain. ACTIVE constants installed
+/* DS2 v1.10 active RVAs for the StartTalk object chain. ACTIVE constants installed
  * by core_init are wrapper 0x388380, dialogue_tick 0x387A80, legacy
- * sound_instance_submit 0x26C1B40, show_subtitle 0x781320, remove_subtitle
+ * sound_instance_submit 0x26C1FD0, show_subtitle 0x781320, remove_subtitle
  * 0x781420, plus the PostEventID export and the LocalizedTextResource vtbl
  * above. The older resolved-but-not-hooked deep-probe
  * RVAs below remain v1.8 research references unless explicitly refreshed here;
@@ -149,7 +149,7 @@ static const uintptr_t k_rva_voice_queue_shared_helper_return = 0x00DB4951u;
 static const uintptr_t k_rva_voice_queue_dispatcher_synth_return = 0x00DB2C24u;
 static const uintptr_t k_rva_voice_queue_dispatcher_forward_return = 0x00DB423Au;
 static const uintptr_t k_rva_sound_instance_play = 0x026A72E0u;
-static const uintptr_t k_rva_sound_instance_submit = 0x026C1B40u;
+static const uintptr_t k_rva_sound_instance_submit = 0x026C1FD0u;
 static const uintptr_t k_rva_audio_owner_get_variant_resource = 0x0028EA30u;
 static const uintptr_t k_rva_start_talk_get_or_create_sound_wrapper = 0x00388380u;
 static const uintptr_t k_rva_subtitle_runtime_wrapper = 0x00780F10u;
@@ -199,7 +199,7 @@ static const uintptr_t *const k_rva_deep_probe_reference[] __attribute__((used))
 };
 
 /* Current build gameplay Dollman mute: observed (speaker tag, ShowSubtitle
- * caller RVA) pair for the chatter path. v1.9 StartTalk sender call returns at
+ * caller RVA) pair for the chatter path. v1.10 StartTalk sender call returns at
  * 0x38602B after GameViewGame vtable+0x40. */
 static const uint32_t k_dollman_gameplay_speaker_tag = 0x12b72u;
 static const uintptr_t k_dollman_gameplay_caller_rva = 0x38602bu;
@@ -2577,9 +2577,9 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
                 k_rva_sound_instance_submit,
                 hook_sound_instance_submit,
                 (void **)&g_real_sound_instance_submit,
-                "SoundInstanceSubmit.sub_1426C1B40")) {
+                "SoundInstanceSubmit.sub_1426C1FD0")) {
             ++hook_count;
-            log_line("Sound instance submit probe active via sub_1426C1B40 (pass-through)");
+            log_line("Sound instance submit probe active via sub_1426C1FD0 (pass-through)");
         }
     } else {
         log_line("Sound instance submit probe disabled");

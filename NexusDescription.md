@@ -6,12 +6,13 @@ BI*CH SHUT THE F UP
 
 ## Description
 
-**v3.1 notice:** supports game version `v1.9`.
+**v3.2.1 notice:** supports game version `v1.10`.
 
 Brief changelog:
 
-- DS2 v1.9 RVA port for the v3.0 dialogue-tick mute path
-- Re-resolved the legacy/fallback StartTalk sound-instance bridge for v1.9
+- DS2 v1.10 runtime vtable hotfix for subtitle/voice identity decoding
+- DS2 v1.10 compatibility refresh for the dialogue-tick mute path
+- Re-resolved the legacy/fallback StartTalk sound-instance bridge for v1.10
 - Private-room story-rest hotfix
 - Added Dollman subtitle muting
 - Known Dollman gameplay voice mute coverage

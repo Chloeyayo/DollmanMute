@@ -1,7 +1,7 @@
 # DollmanMute 研究笔记
 
-> 最后更新: 2026-05-25
-> 当前源码 build tag: `v2.1.17`
+> 最后更新: 2026-07-03
+> 当前源码 build tag: `v3.2.1-v1.10-tick-flagsgate+show-subtitle+legacy-submit`
 > 当前文件只记录仍会指导代码、验证和调试决策的事实。旧偏移、旧日志洪水、已推翻路线不再作为“当前结论”出现。
 
 ## 0. 目标
@@ -491,6 +491,28 @@ v3.0 默认产品路径已迁移并用 IDA/Hex-Rays 交叉确认：
 - 默认 `EnableDialogueTickMute=1` 路径只依赖 tick + ShowSubtitle + RemoveSubtitle。
 - v1.9 的 legacy `SoundInstanceSubmit` 同签名 hook 点已重新闭环为 `sub_1426C1B40`；仅在 `EnableDialogueTickMute=0` 的 legacy/fallback 路径安装。
 - `speaker_tag=0x12B72` 沿用 v1.8 live 证据；若 v1.9 实机漏挡/误挡，优先从 `SubtitleHit` 和 `DollmanStartTalkCandidate` 日志重新确认 speaker tag。
+
+## 12.1 DS2 v1.10 compatibility refresh（2026-07-03）
+
+IDA 目标：`DS2V1.10\DS2.exe.i64`，base `0x140000000`。
+
+v1.10 默认产品路径交叉确认：
+
+| 用途 | v1.10 RVA | 证据 |
+|---|---:|---|
+| dialogue tick | `0x387A80` | 函数形态未变，仍直接调用 `sub_140388380` 和 `sub_140387CF0` |
+| StartTalk wrapper | `0x388380` | tick 内直接调用；签名仍是 `(starttalk, out_wrapper)` |
+| SoundInstanceSubmit legacy bridge | `0x26C1FD0` | v1.9 `0x26C1B40` 的函数签名在 v1.10 中命中；同 14 参数形状、同 `sound_instance+0x178/+0x248/+0x250/+0x258/+0x260` 字段、同 `AK::SoundEngine::PostEvent` 调用 |
+| ShowSubtitle sender/full payload | `0x781320` | 函数形态未变，复制完整 payload 后转 `sub_14078AC50` |
+| RemoveSubtitle sender | `0x781420` | 函数形态未变，复制 key pair + mode 后转 `sub_14078AC50` |
+| `LocalizedTextResource` runtime vtable | `0x3455CC0` | live `SubtitleCandidate` payloads use `vtbl_rva=0x3455CC0` while carrying `hi32=0x12B72` / `preview="偶人"` |
+| gameplay subtitle caller | `0x38602B` | StartTalk sender `call [rax+0x40]` 后返回地址仍不变 |
+
+处理策略：
+
+- 默认 `EnableDialogueTickMute=1` 路径的三处 hook 地址未漂移。
+- v1.10 只需要刷新 `LocalizedTextResource` runtime vtable 与 legacy `SoundInstanceSubmit`。
+- 注意：IDA 中 `sub_142701650` 写入的 `off_143455C60` 是相关 constructor 路径，不是当前 ShowSubtitle payload 里的运行时文本资源 vtable；日志已证实产品判定应使用 `0x3455CC0`。
 
 ## 13. 维护原则
 

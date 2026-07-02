@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.2.1 — DS2 v1.10 runtime vtable hotfix
+
+- Corrected the v1.10 runtime `LocalizedTextResource` vtable to `0x3455CC0`. The initial v3.2 build used a related constructor vtable at `0x3455C60`, which made `speaker_ok=0` even when the payload clearly contained `speaker_tag=0x12B72` / `偶人`.
+
+## v3.2 — DS2 v1.10 compatibility refresh
+
+- Verified the default dialogue-tick + ShowSubtitle hook set on DS2 v1.10: `sub_140387A80`, `sub_140781320`, and `sub_140781420` are unchanged from v1.9.
+- Refreshed the `LocalizedTextResource` vtable for v1.10 so subtitle speaker/tag decoding remains valid.
+- Re-resolved the legacy/fallback `SoundInstanceSubmit` hook for v1.10 at `sub_1426C1FD0` (`RVA 0x26C1FD0`) so `EnableDialogueTickMute=0` still uses the correct StartTalk sound-instance bridge.
+
 ## v3.1 — DS2 v1.9 RVA port
 
 - Ported the v3.0 dialogue-tick + ShowSubtitle hook set to DS2 v1.9: `sub_140387A80`, `sub_140781320`, and `sub_140781420`.
@@ -30,6 +40,6 @@
 
 ## Beta Notes
 
-- This release supports DS2 game version `v1.9`.
+- This release supports DS2 game version `v1.10`.
 - If you notice missed lines, false positives, or any other bug that affects gameplay, please let me know. Including `DollmanMute.log` from the game root is strongly recommended.
 - Future game updates may require another RVA refresh.

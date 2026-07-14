@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.3.0 — Player sign audio mute
+
+- Added a mute for player sign (road-sign) jingles/cheers on DS2 v1.10. All sign audio flows through `AK::SoundEngine::PostEvent(ID)`; the mute combines a curated sign-marker event list (~20 ids, each verified sign-exclusive via time-aligned F8 capture windows) with a session-scoped object classifier: any gameObject that ever emits a marker event has all of its subsequent posts blocked (`mode=sign-marker` / `mode=sign-object`). This covers the cheer "chorus" (one trigger fans out 15+ distinct per-type events across neighboring signs), which no per-event blocklist could enumerate.
+- New ini key `EnableSignMute` (default **0/off** — experimental, not yet extensively tested) and a runtime hotkey `F7` that toggles the sign mute for A/B listening; classification keeps learning while toggled off.
+- Deliberately NOT markers: `4154749010` (posts on a session-global object — marking it would mute the shared bus) and a WwiseSimpleSoundInstance-vtable structural classifier (tried and reverted: Simple vs Graph instances separate one-shot voice-style audio from graph-driven audio, not signs from the world — it muted Sam/NPC dialogue and leaked signs).
+- Confirmed-collateral event ids (world ambience emitters) are documented in `src/core_main.c` and must not be re-added to the marker list.
+- Fixed the PostEventID hook (which carries both scanner mute and sign mute) never being installed when `EnableDialogueTickMute=1` (the default), because that init path returned early. This had silently disabled `ScannerMode` under the default voice mode since v3.0; both scanner and sign muting now work in dialogue-tick mode.
+
 ## v3.2.1 — DS2 v1.10 runtime vtable hotfix
 
 - Corrected the v1.10 runtime `LocalizedTextResource` vtable to `0x3455CC0`. The initial v3.2 build used a related constructor vtable at `0x3455C60`, which made `speaker_ok=0` even when the payload clearly contained `speaker_tag=0x12B72` / `偶人`.

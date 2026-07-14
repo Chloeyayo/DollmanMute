@@ -28,6 +28,7 @@ typedef struct Config {
     BOOL enable_talk_dispatcher_probe;
     BOOL enable_legacy_runtime_wrapper;
     BOOL enable_dialogue_tick_mute;
+    BOOL enable_sign_mute;
     uint32_t scanner_mode;
 } Config;
 
@@ -81,7 +82,7 @@ static DialogueTickFn g_real_dialogue_tick = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v3.2.1-v1.10-tick-flagsgate+show-subtitle+legacy-submit";
+static const char *k_build_tag = "v3.3.0-v1.10-tick-flagsgate+show-subtitle+legacy-submit+sign-mute";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -212,6 +213,118 @@ static const AkUniqueID k_scanner_event_id_3 = 2611919341u;
 static const AkUniqueID k_event_id_dowser_gameplay_chatter = 2134002697u;
 static const uint64_t k_dowser_ext0_sample = 0x47f324c09ull;
 static const AkUniqueID k_event_id_dollman_fall_chatter = 448888368u;
+/* Sign proximity jingle: fired once per sign trigger via PostEventID
+ * (caller_rva=0x26c2226), confirmed by 3/3 time-aligned F8 rounds 2026-07-14.
+ * 4154749010 was a false candidate (fires ~200ms later on a constant global
+ * gameObject, blocking it did not silence the jingle). */
+static const AkUniqueID k_event_id_sign_jingle = 4145920034u;
+
+/* Sign mute = event-id markers + learned object table (2026-07-15 final).
+ * A structural WwiseSimpleSoundInstance-vtable classifier was tried and
+ * REVERTED: Simple (0x344D7F8) vs Graph (0x344D258) separates one-shot
+ * voice-style instances from graph-driven ones, NOT sign vs world - Sam/NPC
+ * dialogue rides Simple (got muted) while audible sign events ride Graph
+ * (leaked). The earlier clean sample split was selection bias. */
+
+/* Sign-marker events: observed ONLY at sign-trigger moments across multiple
+ * F8 windows. Any object that ever emits a marker event is classified as a
+ * sign object, and ALL posts on classified objects are blocked. NOTE:
+ * 4154749010 is deliberately NOT a marker (posts on a session-global object). */
+static const AkUniqueID k_sign_marker_event_ids[] = {
+    /* tier 1 - confirmed sign-exclusive */
+    4145920034u, /* smile jingle */
+    1075710636u, /* periodic on cheer-sign objects (pre-marks them) */
+    1978400882u,
+    3757601819u,
+    2599990357u,
+    2417186760u,
+    68155755u,
+    1461847308u,
+    /* tier 2 - multi-window sign-trigger one-shots */
+    483974099u,
+    1986506869u,
+    2394382850u,
+    3414479536u,
+    2614223962u,
+    /* tier 3 - bell/heart */
+    2052455431u, /* bell */
+    2572925481u, /* heart */
+    /* tier 4 - congrats */
+    4057808979u,
+    2930625147u,
+    1538294193u,
+    838419128u,
+    /* REMOVED (ambient collateral, block-stats confirmed): 1151736770,
+     * 1017515883/5, 2852661159, 2829147694, 3540071294, 336272841,
+     * 4206846812, 202185242, 695583231, 619916792, 92269130, 3906549065,
+     * 1671162700, 694842247, 2283972710, 417957110, 4268017148, 2627812244,
+     * 3112952932, 2314283546, 1304435119, 1178835774, 1592328287,
+     * 2765786335, 1197881676. */
+};
+
+/* Lock-free grow-only set of classified sign gameObjects (session-lifetime). */
+static volatile LONG64 g_sign_objects[4096];
+
+static BOOL is_sign_marker_event(AkUniqueID event_id)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(k_sign_marker_event_ids) / sizeof(k_sign_marker_event_ids[0]); ++i) {
+        if (k_sign_marker_event_ids[i] == event_id) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static uint32_t sign_object_hash(uint64_t obj)
+{
+    return (uint32_t)(obj ^ (obj >> 17) ^ (obj >> 41));
+}
+
+static void sign_object_mark(uint64_t obj)
+{
+    uint32_t h = sign_object_hash(obj);
+    int probe;
+
+    if (obj == 0) {
+        return;
+    }
+    for (probe = 0; probe < 16; ++probe) {
+        uint32_t idx = (h + (uint32_t)probe) & 4095u;
+        LONG64 cur = g_sign_objects[idx];
+        if ((uint64_t)cur == obj) {
+            return;
+        }
+        if (cur == 0 &&
+            InterlockedCompareExchange64(&g_sign_objects[idx], (LONG64)obj, 0) == 0) {
+            return;
+        }
+    }
+    /* table crowded: object simply stays unclassified */
+}
+
+static BOOL sign_object_is_marked(uint64_t obj)
+{
+    uint32_t h = sign_object_hash(obj);
+    int probe;
+
+    if (obj == 0) {
+        return FALSE;
+    }
+    for (probe = 0; probe < 16; ++probe) {
+        uint32_t idx = (h + (uint32_t)probe) & 4095u;
+        LONG64 cur = g_sign_objects[idx];
+        if ((uint64_t)cur == obj) {
+            return TRUE;
+        }
+        if (cur == 0) {
+            return FALSE;
+        }
+    }
+    return FALSE;
+}
+
 static const uint64_t k_dollman_fall_chatter_ext0_sample = 0x41ac17e30ull;
 
 enum {
@@ -238,7 +351,8 @@ enum {
 
 enum {
     HOTKEY_CONTROL_SESSION_MARK = 0u,
-    HOTKEY_CONTROL_COUNT = 1u
+    HOTKEY_CONTROL_SIGN_TOGGLE = 1u,
+    HOTKEY_CONTROL_COUNT = 2u
 };
 
 typedef struct ShowStrategyContext {
@@ -272,7 +386,16 @@ static const SubtitleStrategyMeta k_subtitle_strategy_meta[SUBTITLE_STRATEGY_COU
     { "selectedFamily", "mute only the subtitle families enabled by config defaults", VK_F5 },
     { "pairOrSelectedFamily", "mute when the gameplay pair matches or the config-selected family matches", VK_F6 }
 };
-static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = { VK_F8 };
+static const int k_hotkey_control_vks[HOTKEY_CONTROL_COUNT] = { VK_F8, VK_F7 };
+
+/* Runtime toggle for the sign mute (F7). Markers keep learning while off so
+ * toggling back on restores full coverage instantly. */
+static volatile LONG g_sign_mute_enabled = 1;
+
+/* Set when core_init took the unified dialogue-tick branch. In that mode the
+ * tick already owns Dollman voice, so the PostEventID hook (installed there
+ * only for scanner + sign) must NOT also run the sender-only voice blocks. */
+static volatile LONG g_dialogue_tick_mode_active = 0;
 static const AkUniqueID k_event_id_dollman_equip = 2995625663u;
 static const AkUniqueID k_event_id_dollman_throw = 2820786646u;
 static const AkUniqueID k_event_id_dollman_recall = 2978848044u;
@@ -391,8 +514,11 @@ static const char *k_default_ini =
     "; EnableDialogueTickMute=1 (default) unified single-point mode: one hook on the\n"
     ";   dialogue tick (sub_140387A80) mutes Dollman voice+subtitle together, gated by starttalk_flags\n"
     ";   so private-room/story stays audible; 0 keeps the legacy two-chain behavior.\n"
+    "; EnableSignMute=1 mutes player sign (road sign) jingles/cheers.\n"
+    ";   Default 0 (off) - experimental, not yet extensively tested.\n"
     "; Runtime hotkeys:\n"
     ";   F8 = mark a fresh probe session window in DollmanMute.log\n"
+    ";   F7 = toggle the sign mute at runtime (for A/B listening)\n"
     "; ScannerMode=0 keeps scanner audio unchanged.\n"
     "; ScannerMode=1 reduces scanner intensity.\n"
     "; ScannerMode=2 fully mutes scanner audio.\n"
@@ -403,6 +529,7 @@ static const char *k_default_ini =
     "EnableVoiceMute=1\n"
     "EnableSubtitleMute=1\n"
     "EnableDialogueTickMute=1\n"
+    "EnableSignMute=0\n"
     "ScannerMode=0\n";
 
 static void join_path(char *buffer, size_t buffer_size, const char *dir, const char *file_name)
@@ -534,6 +661,7 @@ static void load_config(void)
     g_cfg.enable_deep_probe = FALSE;
     g_cfg.enable_talk_dispatcher_probe = FALSE;
     g_cfg.enable_dialogue_tick_mute = TRUE;
+    g_cfg.enable_sign_mute = FALSE;
     g_cfg.scanner_mode = SCANNER_MODE_OFF;
 
     ensure_default_ini();
@@ -555,6 +683,12 @@ static void load_config(void)
         "EnableDialogueTickMute",
         NULL,
         g_cfg.enable_dialogue_tick_mute);
+    g_cfg.enable_sign_mute = read_ini_bool_compat(
+        "General",
+        "EnableSignMute",
+        NULL,
+        g_cfg.enable_sign_mute);
+    InterlockedExchange(&g_sign_mute_enabled, g_cfg.enable_sign_mute ? 1 : 0);
     {
         int scanner_mode_value = read_ini_int_compat(
             "General",
@@ -1459,6 +1593,7 @@ static BOOL process_subtitle_payload(
     return actual_mute;
 }
 
+
 static void update_hotkey_mute_state(void)
 {
     BOOL key_control_down[HOTKEY_CONTROL_COUNT];
@@ -1475,6 +1610,12 @@ static void update_hotkey_mute_state(void)
         InterlockedExchange64(&g_stf_probe_window_until_ms, (LONG64)until_ms);
         reset_log_capture_state();
         log_line("=== session boundary F8 count=%ld ===", (long)counter);
+    }
+
+    if (key_control_down[HOTKEY_CONTROL_SIGN_TOGGLE] &&
+        !g_hotkey_control_prev[HOTKEY_CONTROL_SIGN_TOGGLE]) {
+        LONG now_on = InterlockedXor(&g_sign_mute_enabled, 1) ^ 1;
+        log_line("[sign-mute] F7 toggled: %s", now_on ? "ON" : "OFF");
     }
 
     for (i = 0; i < HOTKEY_CONTROL_COUNT; ++i) {
@@ -2088,6 +2229,8 @@ static AkPlayingID __cdecl hook_post_event_id(
          g_cfg.enable_deep_probe ||
          is_sender_only_dollman_radio_mute_enabled());
     BOOL blocked_legacy = g_cfg.enabled && should_block_event_id(event_id);
+    BOOL blocked_sign_marker = FALSE;
+    BOOL blocked_sign_object = FALSE;
     BOOL blocked_sender_only = FALSE;
     BOOL blocked_starttalk_speaker = FALSE;
     BOOL bypass_starttalk_speaker = FALSE;
@@ -2102,8 +2245,10 @@ static AkPlayingID __cdecl hook_post_event_id(
     ULONGLONG dowser_delta_ms = 0;
     ULONGLONG starttalk_delta_ms = 0;
     ULONGLONG now_ms = GetTickCount64();
+    BOOL tick_mode = InterlockedCompareExchange(&g_dialogue_tick_mode_active, 0, 0) != 0;
 
     bypass_starttalk_speaker =
+        !tick_mode &&
         g_cfg.enabled &&
         is_sender_only_dollman_radio_mute_enabled() &&
         external_source_count == 1u &&
@@ -2113,6 +2258,7 @@ static AkPlayingID __cdecl hook_post_event_id(
             now_ms,
             NULL);
     blocked_starttalk_speaker =
+        !tick_mode &&
         g_cfg.enabled &&
         is_sender_only_dollman_radio_mute_enabled() &&
         external_source_count == 1u &&
@@ -2123,6 +2269,7 @@ static AkPlayingID __cdecl hook_post_event_id(
             now_ms,
             &starttalk_delta_ms);
     blocked_sender_only =
+        !tick_mode &&
         g_cfg.enabled &&
         !blocked_starttalk_speaker &&
         !bypass_starttalk_speaker &&
@@ -2130,8 +2277,26 @@ static AkPlayingID __cdecl hook_post_event_id(
             event_id,
             external_source_count,
             ext0);
-    blocked = blocked_legacy || blocked_sender_only || blocked_starttalk_speaker;
-    if (blocked_sender_only) {
+    /* Sign-object classifier: marker events block AND classify their
+     * gameObject; classified objects have all further posts blocked.
+     * F7 toggles blocking; classification keeps learning while off. */
+    if (g_cfg.enabled && game_object_id != 0) {
+        BOOL sign_mute_on = InterlockedCompareExchange(&g_sign_mute_enabled, 0, 0) != 0;
+        if (is_sign_marker_event(event_id)) {
+            sign_object_mark((uint64_t)game_object_id);
+            blocked_sign_marker = sign_mute_on;
+        } else if (sign_mute_on && sign_object_is_marked((uint64_t)game_object_id)) {
+            blocked_sign_object = TRUE;
+        }
+    }
+
+    blocked = blocked_legacy || blocked_sender_only || blocked_starttalk_speaker ||
+              blocked_sign_marker || blocked_sign_object;
+    if (blocked_sign_marker) {
+        block_mode = "sign-marker";
+    } else if (blocked_sign_object) {
+        block_mode = "sign-object";
+    } else if (blocked_sender_only) {
         block_mode = "sender-only-narrow";
     } else if (blocked_starttalk_speaker) {
         block_mode = "sender-only-starttalk-speaker";
@@ -2499,11 +2664,12 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
     log_line("DollmanMute build: %s", k_build_tag);
     log_line("DollmanMute image_base=0x%llx image_size=0x%llx", (unsigned long long)g_image_base, (unsigned long long)g_image_size);
     log_line(
-        "DollmanMute init start: enabled=%d verbose=%d voiceMute=%d subtitleMute=%d scannerMode=%u",
+        "DollmanMute init start: enabled=%d verbose=%d voiceMute=%d subtitleMute=%d signMute=%d scannerMode=%u",
         g_cfg.enabled,
         g_cfg.verbose_log,
         g_cfg.enable_dollman_radio_mute,
         subtitle_runtime_surface_enabled,
+        g_cfg.enable_sign_mute,
         (unsigned int)g_cfg.scanner_mode);
 
     need_show_subtitle_hook = subtitle_runtime_surface_enabled;
@@ -2555,10 +2721,25 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
             ++hook_count;
         }
 
+        /* Scanner and sign muting both live in the PostEventID hook, which the
+         * dialogue-tick voice path does not otherwise need. Install it here too
+         * (marking tick mode so the hook skips the sender-only voice blocks the
+         * tick already handles). Without this, ScannerMode and EnableSignMute /
+         * F7 have no effect whenever EnableDialogueTickMute=1 (the default). */
+        InterlockedExchange(&g_dialogue_tick_mode_active, 1);
+        if (install_export_hook(
+                k_export_post_event_id,
+                hook_post_event_id,
+                (void **)&g_real_post_event_id,
+                "PostEventID")) {
+            ++hook_count;
+            log_line("PostEventID hook active for scanner + sign mute (dialogue-tick mode)");
+        }
+
         log_line("DollmanMute init complete: hooks=%d (dialogue-tick voice + ShowSubtitle subtitle mode)", hook_count);
         g_hotkey_thread_handle = CreateThread(NULL, 0, hotkey_thread_proc, NULL, 0, NULL);
         if (g_hotkey_thread_handle != NULL) {
-            log_line("Hotkeys active: F8=session mark");
+            log_line("Hotkeys active: F8=session mark, F7=sign-mute toggle");
         }
         return 1;
     }
@@ -2630,7 +2811,7 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
 
     g_hotkey_thread_handle = CreateThread(NULL, 0, hotkey_thread_proc, NULL, 0, NULL);
     if (g_hotkey_thread_handle != NULL) {
-        log_line("Hotkeys active: F8=session mark");
+        log_line("Hotkeys active: F8=session mark, F7=sign-mute toggle");
     } else {
         log_line("Failed to start hotkey thread");
     }

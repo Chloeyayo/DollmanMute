@@ -1,5 +1,11 @@
 # Changelog
 
+## v3.3.2 — Sign-only PostEvent install fix
+
+- Fixed the non-dialogue-tick init path so `AK::SoundEngine::PostEvent(ID)` stays installed whenever `Enabled=1`. Previously that path only installed the hook when voice mute or scanner mute was already on, which silently broke **sign-only** configs (`EnableVoiceMute=0` / `EnableSubtitleMute=0` / `EnableDialogueTickMute=0` / `EnableSignMute=1` / `ScannerMode=0`) — matching a Nexus report where sign mute never worked while scanner mute still did.
+- Same change keeps `F7` usable when every mute feature starts off: the sign-mute toggle no longer depends on another feature having already pulled the hook in.
+- Verified in-game: old public DLL under the sign-only config reported `hooks=0`; the fix reports `Hooked PostEventID` / `hooks=1`, and sign mute works with Dollman + scanner left off.
+
 ## v3.3.0 — Player sign audio mute
 
 - Added a mute for player sign (road-sign) jingles/cheers on DS2 v1.10. All sign audio flows through `AK::SoundEngine::PostEvent(ID)`; the mute combines a curated sign-marker event list (~20 ids, each verified sign-exclusive via time-aligned F8 capture windows) with a session-scoped object classifier: any gameObject that ever emits a marker event has all of its subsequent posts blocked (`mode=sign-marker` / `mode=sign-object`). This covers the cheer "chorus" (one trigger fans out 15+ distinct per-type events across neighboring signs), which no per-event blocklist could enumerate.

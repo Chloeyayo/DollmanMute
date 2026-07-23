@@ -82,7 +82,7 @@ static DialogueTickFn g_real_dialogue_tick = NULL;
 static void **g_show_subtitle_vtable_slot = NULL;
 static void *g_show_subtitle_vtable_original = NULL;
 
-static const char *k_build_tag = "v3.3.0-v1.10-tick-flagsgate+show-subtitle+legacy-submit+sign-mute";
+static const char *k_build_tag = "v3.3.2-v1.10-sign-only-postevent-fix";
 
 #define PRODUCER_IDENTITY_CACHE_MAX 4096
 static uintptr_t g_image_base = 0;
@@ -2766,9 +2766,10 @@ __declspec(dllexport) int core_init(const ProxyContext *ctx)
         log_line("Sound instance submit probe disabled");
     }
 
-    if (effective_dollman_radio_mute ||
-        g_cfg.scanner_mode != SCANNER_MODE_OFF ||
-        sender_only_dollman_voice_mute) {
+    /* PostEventID carries scanner and sign muting. Keep it installed whenever
+     * the mod is enabled even if every ini feature starts off, because F7 can
+     * enable sign muting at runtime. */
+    if (g_cfg.enabled) {
         if (install_export_hook(
                 k_export_post_event_id,
                 hook_post_event_id,
